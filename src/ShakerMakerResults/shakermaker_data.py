@@ -171,11 +171,21 @@ class ShakerMakerData:
                         'resultant': float(np.sqrt(e_d**2+n_d**2+z_d**2).max()),
                     }
 
-        print("----------------------------------------")
-        print(f"{filename} loaded ({'DRM' if self.is_drm else 'Station'})")
-        print(f"  nodes={n_nodes}  dt={dt_orig}s  "
-              f"spacing={h_x:.1f}m x {h_y:.1f}m x {h_z:.1f}m")
-        print(f"  time steps={n_time_data}  GF steps={n_time_gf}")
+        print("=" * 60)
+        print(f"FILE : {filename}")
+        is_surface = self.is_drm and not np.any(self.internal)
+        type_str   = 'SurfaceGrid' if is_surface else ('DRM' if self.is_drm else 'Station')
+        print(f"TYPE : {type_str}")
+        print(f"NODES: {n_nodes}  |  QA: {'yes' if self.xyz_qa is not None else 'no'}")
+        if self.xyz_qa is not None:
+            print(f"QA position: {self.xyz_qa[0] * 1000} m")
+        print(f"SPACING : {h_x:.1f}m x {h_y:.1f}m x {h_z:.1f}m  |  model: {self.model_name}")
+        print(f"TIME    : dt={dt_orig}s  |  steps={n_time_data}  "
+              f"|  t=[{tstart:.3f}, {tstart + n_time_data*dt_orig:.3f}]s")
+        print(f"GF      : steps={n_time_gf}"
+              + (f"  |  nsources={self._nsources_db}" if self._gf_loaded else "  |  not loaded"))
+        print(f"INTERNAL: {self.internal.sum()}  |  EXTERNAL: {(~self.internal).sum()}")
+        print("=" * 60)
 
     # ------------------------------------------------------------------
     # GF database — OP pipeline
@@ -315,8 +325,11 @@ class ShakerMakerData:
         if not self._gf_loaded:
             raise RuntimeError(
                 "GFs not loaded. Call load_gf_database('file.h5') first.")
-
         if self._use_pair_to_slot:
+            if subfault_id >= self._nsources_db:
+                raise ValueError(
+                    f"subfault_id={subfault_id} out of range. "
+                    f"This file has nsources={self._nsources_db}.")
             flat = node_id * self._nsources_db + subfault_id
             return int(self._pair_to_slot[flat])
         else:
@@ -328,7 +341,6 @@ class ShakerMakerData:
                                 zrec / self._delta_v_rec]])
             _, si = self._ktree.query(q)
             return int(si[0])
-
     # ------------------------------------------------------------------
     # Data access
     # ------------------------------------------------------------------
@@ -809,7 +821,10 @@ class ShakerMakerData:
         print("="*60)
         return fig, ax
 
-    def plot_gf_connections(self, node_id, xyz_origin=None, label_nodes=False):
+    def plot_gf_connections(self, 
+                            node_id, 
+                            xyz_origin=None, 
+                            label_nodes=False):
         """Visualise donor–recipient GF connections for a single node."""
         if not self._gf_loaded:
             print("No GFs. Call load_gf_database() first."); return
