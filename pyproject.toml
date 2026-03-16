@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "drm"
-version = "0.1.0"
-description = "DRM (Domain Reduction Method) data reader and visualization toolkit"
+name = "ShakerMakerResults"
+version = "1.0"
+description = "ShakerMaker results reader and visualization toolkit"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -20,8 +20,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ppalacios92/DRM_DATA"
-Repository = "https://github.com/ppalacios92/DRM_DATA"
+Homepage = "https://github.com/ppalacios92/ShakerMakerResults"
+Repository = "https://github.com/ppalacios92/ShakerMakerResults"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,16 +1,16 @@
-# DRM_DATA
+# ShakerMakerResults
 
-A Python-based tool for reading, analyzing, and visualizing Domain Reduction Method (DRM) data stored in HDF5 format.
+A Python-based tool for reading, analyzing, and visualizing ShakerMaker simulation results stored in HDF5 format. Supports both DRM (Domain Reduction Method) and station outputs.
 
 ---
 
 ## Features
 
-- Read DRM data from HDF5 files
-- Extract node coordinates, Green's functions, and response spectra
-- Visualize DRM domains in 3D
+- Read ShakerMaker results from HDF5 files (DRM and station outputs)
+- Extract node coordinates, velocity, acceleration and displacement
+- Visualize domains in 3D
 - Plot time histories and Fourier spectra
-- Compare multiple DRM models
+- Compare multiple models
 - Compute Newmark response spectra
 
 ---
@@ -24,8 +24,8 @@ A Python-based tool for reading, analyzing, and visualizing Domain Reduction Met
 
 ## Installation
 ```bash
-git clone https://github.com/ppalacios92/DRM_DATA.git
-cd DRM_DATA
+git clone https://github.com/ppalacios92/ShakerMakerResults.git
+cd ShakerMakerResults
 pip install -e .
 ```
 
@@ -33,12 +33,13 @@ pip install -e .
 
 ## Repository Structure
 ```bash
-DRM_DATA/
-├── drm_data/
-│   ├── __init__.py
-│   ├── drm.py
-│   ├── plotting.py
-│   └── newmark.py
+ShakerMakerResults/
+├── src/
+│   └── shakermaker_results/
+│       ├── __init__.py
+│       ├── shakermaker_data.py
+│       ├── plotting.py
+│       └── newmark.py
 ├── pyproject.toml
 ├── README.md
 └── LICENSE
@@ -61,12 +62,12 @@ GitHub: @ppalacios92
 
 ## How to Cite
 ```bibtex
-@misc{palacios2025drmdata,
+@misc{palacios2025shakermakerresults,
   author       = {Patricio Palacios B.},
-  title        = {DRM_DATA: A Python-based DRM data reader and visualization tool},
+  title        = {ShakerMakerResults: A Python-based ShakerMaker results reader and visualization tool},
   year         = {2025},
   publisher    = {GitHub},
-  howpublished = {\url{https://github.com/ppalacios92/DRM_DATA}}
+  howpublished = {\url{https://github.com/ppalacios92/ShakerMakerResults}}
 }
 ```
 
