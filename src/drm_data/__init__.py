@@ -6,6 +6,7 @@ __version__ = "0.1.0"
 __author__ = "Patricio Palacios B."
 
 from .drm import DRM
+from .station import StationRead
 from .newmark import NewmarkSpectrumAnalyzer
 from .plotting import (
     plot_models_response,
@@ -19,6 +20,7 @@ from .plotting import (
 
 __all__ = [
     "DRM",
+    "StationRead",
     "NewmarkSpectrumAnalyzer",
     "plot_models_response",
     "plot_models_gf",

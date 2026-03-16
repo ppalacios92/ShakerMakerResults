@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "drm_data"
+name = "drm"
 version = "0.1.0"
 description = "DRM (Domain Reduction Method) data reader and visualization toolkit"
 readme = "README.md"
@@ -13,7 +13,6 @@ authors = [
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "numpy",
     "h5py",
     "matplotlib",
     "scipy",
@@ -25,4 +24,4 @@ Homepage = "https://github.com/ppalacios92/DRM_DATA"
 Repository = "https://github.com/ppalacios92/DRM_DATA"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]

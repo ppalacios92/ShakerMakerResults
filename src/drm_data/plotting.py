@@ -4,6 +4,7 @@ import h5py
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from .newmark import NewmarkSpectrumAnalyzer
+
 # ================================================================
 # INDEPENDENT FUNCTIONS 
 def plot_models_response(models, 
@@ -72,7 +73,7 @@ def plot_models_response(models,
     plt.ylabel('Amplitude')
     plt.xlim(xlim)
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    # plt.legend()
     
     plt.subplot(3, 1, 2)
     plt.title(f'X - {ylabel}', fontweight='bold')
@@ -80,7 +81,7 @@ def plot_models_response(models,
     plt.ylabel('Amplitude')
     plt.xlim(xlim)
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    # plt.legend()
     
     plt.subplot(3, 1, 3)
     plt.title(f'Y - {ylabel}', fontweight='bold')
@@ -88,8 +89,9 @@ def plot_models_response(models,
     plt.ylabel('Amplitude')
     plt.xlim(xlim)
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    # plt.legend()
     
+    plt.legend(loc='lower center', bbox_to_anchor=(0.5, -1), ncol=2)
     plt.tight_layout()
     plt.show()
 
@@ -267,21 +269,41 @@ def compare_models_node_response(models,
     ----------
     models : list of DRM
         List of DRM objects to compare
-    node_id : list of lists
-        Node IDs for each model [[n1], [n2], ...]
+    node_id : int, str, or list
+        Node ID(s) for all models. Can be:
+        - Single value applied to all models: 0, 'QA'
+        - List per model: [[0], ['QA'], [5]]
     data_type : str
         'accel', 'vel', or 'disp'
     reference_index : int
         Index of reference (trusted) model
-    
-    Returns
-    -------
-    dict
-        Comparison results
     """
     
+    def resolve_node_id(node_id, model_index, n_models):
+        """Extract node index for a given model from flexible node_id input."""
+        # Single value for all models
+        if not isinstance(node_id, list):
+            return node_id
+        # List of lists: [[0], ['QA'], ...]
+        if isinstance(node_id[0], list):
+            return node_id[model_index][0]
+        # Flat list with one entry per model: [0, 'QA', 5]
+        if len(node_id) == n_models:
+            return node_id[model_index]
+        # Flat list with single value: [0] or ['QA']
+        return node_id[0]
+
+    def get_data(drm, node_idx, data_type):
+        """Load data handling QA and regular nodes."""
+        if node_idx == 'QA' or node_idx == 'qa':
+            return drm.get_qa_data(data_type)
+        elif isinstance(node_idx, int) and node_idx < len(drm.xyz):
+            return drm.get_node_data(node_idx, data_type)
+        else:
+            return drm.get_qa_data(data_type)
+
     def compute_metrics(sig_ref, sig_test):
-        """Calculate comparison metrics between reference and test signal"""
+        """Calculate comparison metrics between reference and test signal."""
         diff = sig_ref - sig_test
         
         # GoF (Goodness of Fit)
@@ -300,7 +322,7 @@ def compare_models_node_response(models,
         rmse = np.sqrt(np.mean(diff**2))
         
         return gof, peak_err, corr, rmse
-    
+
     n_models = len(models)
     model_names = [drm.model_name for drm in models]
     components = ['Z', 'E', 'N']
@@ -308,21 +330,13 @@ def compare_models_node_response(models,
     # Load data from all models
     data_all = []
     times_all = []
+    node_ids_used = []
     
     for i, drm in enumerate(models):
-        node_idx = node_id[i][0]
-        
-        if node_idx < len(drm.xyz):
-            data = drm.get_node_data(node_idx, data_type)
-        else:
-            data = drm.get_qa_data(data_type)
-        
-        # Components: data[0]=X, data[1]=Y, data[2]=Z
-        data_z = data[2]
-        data_e = data[0]
-        data_n = data[1]
-        
-        data_all.append([data_z, data_e, data_n])
+        node_idx = resolve_node_id(node_id, i, n_models)
+        node_ids_used.append(node_idx)
+        data = get_data(drm, node_idx, data_type)
+        data_all.append([data[2], data[0], data[1]])  # Z, E, N
         times_all.append(drm.time)
     
     # Reference data
@@ -337,7 +351,7 @@ def compare_models_node_response(models,
     print(f"COMPARISON vs Reference ({ref_name})")
     print("=" * 70)
     print(f"Data type: {data_type}")
-    print(f"Reference node: {node_id[reference_index][0]}")
+    print(f"Reference node: {node_ids_used[reference_index]}")
     print("")
     
     for i in range(n_models):
@@ -348,7 +362,7 @@ def compare_models_node_response(models,
         test_data = data_all[i]
         test_time = times_all[i]
         
-        print(f"Model: {model_name} vs Reference")
+        print(f"Model: {model_name} vs Reference | Node: {node_ids_used[i]}")
         
         model_results = {}
         
@@ -358,8 +372,8 @@ def compare_models_node_response(models,
             
             # Interpolate to common time
             t_common = np.linspace(
-                max(ref_time[0], test_time[0]), 
-                min(ref_time[-1], test_time[-1]), 
+                max(ref_time[0], test_time[0]),
+                min(ref_time[-1], test_time[-1]),
                 min(len(ref_time), len(test_time))
             )
             
@@ -381,13 +395,15 @@ def compare_models_node_response(models,
         print("")
     
     print("=" * 70)
+    return results
 
 # ================================================================
 def plot_models_newmark_spectra(models, 
                                 node_id=None,
                                 target_pos=None,
                                 xlim=[0, 5], 
-                                data_type='accel'):
+                                data_type='accel',
+                                figsize=(8, 10)):
     """
     Plot Newmark response spectra for multiple DRM models.
     
@@ -409,7 +425,7 @@ def plot_models_newmark_spectra(models,
         raise ValueError("Provide node_id or target_pos")
     
     model_names = [drm.model_name for drm in models]
-    fig, axes = plt.subplots(3, 1, figsize=(8, 10))
+    fig, axes = plt.subplots(3, 1, figsize=figsize)
     
     for i, drm in enumerate(models):
         # Determine node index
@@ -753,3 +769,640 @@ def plot_models_tensor_gf(models,
     plt.suptitle('Tensor Green Functions Comparison', fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def plot_combined_response_DRM_station(
+    models,
+    data_type='vel',
+    drm_node='QA',
+    factor=1.0,
+    xlim=None,
+    filtered=False
+):
+    """
+    Plot time history response for a mixed list of DRM and StationRead models.
+
+    Parameters
+    ----------
+    models : list
+        Mixed list of DRM and StationRead models.
+    data_type : str, default='vel'
+        'accel', 'vel', or 'disp'
+    drm_node : str or int, default='QA'
+        Node to use for DRM models. 'QA' or integer node ID.
+    factor : float, default=1.0
+        Scale factor applied to all signals.
+    xlim : list, optional
+        Time axis limits [tmin, tmax].
+    filtered : bool, default=False
+        If True, use filtered data for StationRead models.
+    """
+    ylabel_map = {'accel': 'Acceleration', 'vel': 'Velocity', 'disp': 'Displacement'}
+    drm_dtype_map = {'accel': 'accel', 'vel': 'vel', 'disp': 'disp'}
+    ylabel = ylabel_map.get(data_type, data_type)
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8))
+
+    for obj in models:
+        # ---- DRM object ----
+        if hasattr(obj, 'xyz_qa'):
+            if drm_node == 'QA' or drm_node == 'qa':
+                data = obj.get_qa_data(drm_dtype_map[data_type])
+                label = f'{obj.model_name}_QA'
+            else:
+                data = obj.get_node_data(drm_node, drm_dtype_map[data_type])
+                label = f'{obj.model_name}_N{drm_node}'
+            data_z, data_e, data_n = data[2], data[0], data[1]
+            time = obj.time
+
+        # ---- StationRead object ----
+        elif hasattr(obj, 'z_v'):
+            label = obj.name if obj.name else 'Station'
+            if data_type == 'accel':
+                data_z, data_e, data_n = obj.acceleration_filtered if filtered else obj.acceleration
+            elif data_type == 'vel':
+                data_z, data_e, data_n = obj.velocity_filtered if filtered else obj.velocity
+            elif data_type == 'disp':
+                data_z, data_e, data_n = obj.displacement_filtered if filtered else obj.displacement
+            time = obj.t
+
+        else:
+            print(f"Warning: unrecognized object type {type(obj)}, skipping.")
+            continue
+
+        axes[0].plot(time, data_z / factor, linewidth=1, label=label)
+        axes[1].plot(time, data_e / factor, linewidth=1, label=label)
+        axes[2].plot(time, data_n / factor, linewidth=1, label=label)
+
+    for ax, comp in zip(axes, ['Vertical (Z)', 'East (E)', 'North (N)']):
+        ax.set_title(f'{comp} - {ylabel}', fontweight='bold')
+        ax.set_xlabel('Time [s]')
+        ax.set_ylabel('Amplitude')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+        if xlim:
+            ax.set_xlim(xlim)
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+def compare_newmark_DRM_station(
+    models,
+    data_type='accel',
+    spectral_type='PSa',
+    drm_node='QA',
+    factor=1.0,
+    xlim=[0, 5],
+    filtered=False,
+    figsize=(6, 10),
+):
+    """
+    Plot Newmark response spectra for a mixed list of DRM and StationRead models.
+
+    Parameters
+    ----------
+    models : list
+        Mixed list of DRM and StationRead models.
+    data_type : str, default='accel'
+        Input signal type: 'accel', 'vel', or 'disp'
+    spectral_type : str, default='PSa'
+        Spectral quantity to plot: 'PSa', 'Sa', 'PSv', 'Sv', 'Sd'
+    drm_node : str or int, default='QA'
+        Node to use for DRM models. 'QA' or integer node ID.
+    xlim : list, default=[0, 5]
+        Period axis limits [Tmin, Tmax].
+    filtered : bool, default=False
+        If True, use filtered data for StationRead models.
+    figsize : tuple, default=(6, 10)
+    """
+    ylabel_map = {
+        'PSa': 'PSa (g)',
+        'Sa':  'Sa (g)',
+        'PSv': 'PSv (m/s)',
+        'Sv':  'Sv (m/s)',
+        'Sd':  'Sd (m)',
+    }
+    ylabel = ylabel_map.get(spectral_type, spectral_type)
+
+    def get_signal(obj, data_type, filtered):
+        """Extract Z, E, N signals from DRM or StationRead."""
+        if hasattr(obj, 'xyz_qa'):
+            if drm_node == 'QA' or drm_node == 'qa':
+                data = obj.get_qa_data(data_type)
+                label = f'{obj.model_name}_QA'
+            else:
+                data = obj.get_node_data(drm_node, data_type)
+                label = f'{obj.model_name}_N{drm_node}'
+            z, e, n = data[2], data[0], data[1]
+            dt = obj.time[1] - obj.time[0]
+        elif hasattr(obj, 'z_v'):
+            label = obj.name if obj.name else 'Station'
+            if data_type == 'accel':
+                z, e, n = obj.acceleration_filtered if filtered else obj.acceleration
+            elif data_type == 'vel':
+                z, e, n = obj.velocity_filtered if filtered else obj.velocity
+            else:
+                z, e, n = obj.displacement_filtered if filtered else obj.displacement
+            dt = obj.dt
+        else:
+            return None, None, None, None, None
+        return z, e, n, dt, label
+
+    fig, axes = plt.subplots(3, 1, figsize=figsize)
+
+    for obj in models:
+        z, e, n, dt, label = get_signal(obj, data_type, filtered)
+
+        if z is None:
+            print(f"Warning: unrecognized object type {type(obj)}, skipping.")
+            continue
+
+        spec_z = NewmarkSpectrumAnalyzer.compute(z/factor, dt)
+        spec_e = NewmarkSpectrumAnalyzer.compute(e/factor, dt)
+        spec_n = NewmarkSpectrumAnalyzer.compute(n/factor, dt)
+
+        T = spec_z['T']
+        val_z = spec_z[spectral_type]
+        val_e = spec_e[spectral_type]
+        val_n = spec_n[spectral_type]
+
+        axes[0].plot(T, val_z, linewidth=2, label=label)
+        axes[1].plot(T, val_e, linewidth=2, label=label)
+        axes[2].plot(T, val_n, linewidth=2, label=label)
+
+    for ax, comp in zip(axes, ['Vertical (Z)', 'East (E)', 'North (N)']):
+        ax.set_title(f'{comp} - {spectral_type} Spectrum ({data_type})', fontweight='bold')
+        ax.set_xlabel('T (s)')
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        ax.set_xlim(xlim)
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+def compare_fourier_DRM_station(
+    
+    models,
+    data_type='accel',
+    drm_node='QA',
+    xlim=None,
+    filtered=False,
+    factor=1.0,
+    figsize=(8, 10),
+):
+    """
+    Plot Fourier spectra for a mixed list of DRM and StationRead models.
+
+    Parameters
+    ----------
+    models : list
+        Mixed list of DRM and StationRead models.
+    data_type : str, default='accel'
+        'accel', 'vel', or 'disp'
+    drm_node : str or int, default='QA'
+        Node to use for DRM models. 'QA' or integer node ID.
+    xlim : list, optional
+        Frequency axis limits [fmin, fmax].
+    filtered : bool, default=False
+        If True, use filtered data for StationRead models.
+    factor : float, default=1.0
+        Scale factor applied to amplitudes.
+    """
+    dtype_map = {'accel': 'acceleration', 'vel': 'velocity', 'disp': 'displacement'}
+
+    fig = plt.figure(figsize=figsize)
+
+    for obj in models:
+        # ---- DRM object ----
+        if hasattr(obj, 'xyz_qa'):
+            if drm_node == 'QA' or drm_node == 'qa':
+                data = obj.get_qa_data(data_type)
+                label = f'{obj.model_name}_QA'
+            else:
+                data = obj.get_node_data(drm_node, data_type)
+                label = f'{obj.model_name}_N{drm_node}'
+            data_z, data_e, data_n = data[2], data[0], data[1]
+            dt = obj.time[1] - obj.time[0]
+            freqs = np.fft.rfftfreq(len(obj.time), dt)
+            z_amp = np.abs(np.fft.rfft(data_z)) * dt
+            e_amp = np.abs(np.fft.rfft(data_e)) * dt
+            n_amp = np.abs(np.fft.rfft(data_n)) * dt
+
+        # ---- StationRead object ----
+        elif hasattr(obj, 'z_v'):
+            label = obj.name if obj.name else 'Station'
+            freqs, z_amp, e_amp, n_amp = obj.get_fourier(dtype_map[data_type], filtered=filtered)
+
+        else:
+            print(f"Warning: unrecognized object type {type(obj)}, skipping.")
+            continue
+
+        plt.subplot(3, 1, 1)
+        plt.semilogx(freqs, z_amp / factor, linewidth=1, label=label)
+
+        plt.subplot(3, 1, 2)
+        plt.semilogx(freqs, e_amp / factor, linewidth=1, label=label)
+
+        plt.subplot(3, 1, 3)
+        plt.semilogx(freqs, n_amp / factor, linewidth=1, label=label)
+
+    for i, comp in enumerate(['Vertical (Z)', 'East (E)', 'North (N)'], 1):
+        plt.subplot(3, 1, i)
+        plt.title(f'{comp} - Fourier Spectrum', fontweight='bold')
+        plt.xlabel('Frequency [Hz]')
+        plt.ylabel('Amplitude')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        if xlim:
+            plt.xlim(xlim)
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+def plot_arias_DRM_station(
+    models,
+    data_type='accel',
+    drm_node='QA',
+    xlim=None,
+    figsize=(8, 10),
+):
+    """
+    Plot Arias intensity curves for a mixed list of DRM and StationRead models.
+
+    Parameters
+    ----------
+    models : list
+        Mixed list of DRM and StationRead models.
+    data_type : str, default='accel'
+        'accel', 'vel', or 'disp'
+    drm_node : str or int, default='QA'
+        Node to use for DRM models. 'QA' or integer node ID.
+    xlim : list, optional
+        Time axis limits [tmin, tmax].
+    figsize : tuple, default=(8, 10)
+    """
+    from EarthquakeSignal.core.arias_intensity import AriasIntensityAnalyzer
+
+    fig, axes = plt.subplots(3, 1, figsize=figsize)
+
+    for obj in models:
+        # ---- DRM object ----
+        if hasattr(obj, 'xyz_qa'):
+            if drm_node == 'QA' or drm_node == 'qa':
+                data = obj.get_qa_data('accel')
+                label = f'{obj.model_name}_QA'
+            else:
+                data = obj.get_node_data(drm_node, 'accel')
+                label = f'{obj.model_name}_N{drm_node}'
+            z_a, e_a, n_a = data[2], data[0], data[1]
+            dt   = obj.time[1] - obj.time[0]
+            time = obj.time
+
+        # ---- StationRead object ----
+        elif hasattr(obj, 'z_v'):
+            label = obj.name if obj.name else 'Station'
+            z_a, e_a, n_a = obj.acceleration
+            dt   = obj.dt
+            time = obj.t
+
+        else:
+            print(f"Warning: unrecognized object type {type(obj)}, skipping.")
+            continue
+
+        for ax, signal, comp in zip(axes, [z_a, e_a, n_a], ['Z', 'E', 'N']):
+            IA_pct, t_start, t_end, ia_total, _ = AriasIntensityAnalyzer.compute(signal/9.81, dt)
+            t = np.arange(len(IA_pct)) * dt
+
+            ax.plot(t, IA_pct, linewidth=1.5, label=f"{label} | Ia={ia_total:.3f} m/s")
+            ax.axvline(t_start, linestyle='--', linewidth=1, alpha=0.6)
+            ax.axvline(t_end,   linestyle='--', linewidth=1, alpha=0.6)
+
+    for ax, comp in zip(axes, ['Vertical (Z)', 'East (E)', 'North (N)']):
+        ax.axhline(5,  color='gray', linestyle=':', linewidth=1, alpha=0.7)
+        ax.axhline(95, color='gray', linestyle=':', linewidth=1, alpha=0.7)
+        ax.set_title(f'{comp} - Arias Intensity', fontweight='bold')
+        ax.set_xlabel('Time [s]')
+        ax.set_ylabel('IA (%)')
+        ax.set_ylim(0, 100)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        if xlim:
+            ax.set_xlim(xlim)
+
+    plt.tight_layout()
+    plt.show()
+
+
+    
+
+def compare_models_DRM_station(models, 
+                                 node_id, 
+                                 data_type='vel', 
+                                 reference_index=0):
+    """
+    Compare DRM models and/or StationRead objects against a reference.
+    
+    Parameters
+    ----------
+    models : list of DRM or StationRead
+        List of DRM or StationRead objects (can be mixed)
+    node_id : int, str, or list
+        Node ID(s) for DRM models. Ignored for StationRead objects.
+        Can be: 0, 'QA', [0, 'QA'], [[0], ['QA']]
+    data_type : str
+        'accel', 'vel', or 'disp'
+    reference_index : int
+        Index of reference (trusted) model
+    """
+
+    def is_station(obj):
+        return hasattr(obj, 'z_v') and not hasattr(obj, 'internal')
+
+    def resolve_node_id(node_id, model_index, n_models):
+        if not isinstance(node_id, list):
+            return node_id
+        if isinstance(node_id[0], list):
+            return node_id[model_index][0]
+        if len(node_id) == n_models:
+            return node_id[model_index]
+        return node_id[0]
+
+    def get_data_from_model(obj, node_idx, data_type):
+        """Extract [Z, E, N] arrays from DRM or StationRead."""
+        if is_station(obj):
+            # StationRead: map data_type to property
+            if data_type in ('accel', 'acceleration'):
+                z, e, n = obj.acceleration
+            elif data_type in ('vel', 'velocity'):
+                z, e, n = obj.velocity
+            else:
+                z, e, n = obj.displacement
+            return [z, e, n]
+        else:
+            # DRM object
+            if node_idx == 'QA' or node_idx == 'qa':
+                data = obj.get_qa_data(data_type)
+            elif isinstance(node_idx, int) and node_idx < len(obj.xyz):
+                data = obj.get_node_data(node_idx, data_type)
+            else:
+                data = obj.get_qa_data(data_type)
+            return [data[2], data[0], data[1]]  # Z, E, N
+
+    def get_time(obj):
+        if is_station(obj):
+            return obj.t
+        return obj.time
+
+    def get_name(obj):
+        if is_station(obj):
+            return obj.name if obj.name else "Station"
+        return obj.model_name
+
+    def compute_metrics(sig_ref, sig_test):
+        diff = sig_ref - sig_test
+        num = np.sum(diff**2)
+        den = np.sum(sig_ref**2 + sig_test**2)
+        gof = 1 - np.sqrt(num / den) if den > 0 else 0
+        max_ref = np.max(np.abs(sig_ref))
+        peak_err = (np.max(np.abs(diff)) / max_ref * 100) if max_ref > 0 else 0
+        corr = np.corrcoef(sig_ref, sig_test)[0, 1]
+        rmse = np.sqrt(np.mean(diff**2))
+        return gof, peak_err, corr, rmse
+
+    n_models = len(models)
+    model_names = [get_name(m) for m in models]
+    components = ['Z', 'E', 'N']
+
+    # Load data from all models
+    data_all = []
+    times_all = []
+    node_ids_used = []
+
+    for i, obj in enumerate(models):
+        node_idx = resolve_node_id(node_id, i, n_models)
+        node_ids_used.append('Station' if is_station(obj) else node_idx)
+        data_all.append(get_data_from_model(obj, node_idx, data_type))
+        times_all.append(get_time(obj))
+
+    # Reference data
+    ref_data = data_all[reference_index]
+    ref_time = times_all[reference_index]
+    ref_name = model_names[reference_index]
+
+    results = {}
+
+    print("=" * 70)
+    print(f"COMPARISON vs Reference ({ref_name})")
+    print("=" * 70)
+    print(f"Data type : {data_type}")
+    print(f"Reference : {ref_name} | Node: {node_ids_used[reference_index]}")
+    print("")
+
+    for i in range(n_models):
+        if i == reference_index:
+            continue
+
+        model_name = model_names[i]
+        test_data = data_all[i]
+        test_time = times_all[i]
+
+        print(f"Model: {model_name} vs Reference | Node: {node_ids_used[i]}")
+
+        model_results = {}
+
+        for ic, comp in enumerate(components):
+            sig_ref = ref_data[ic]
+            sig_test = test_data[ic]
+
+            t_common = np.linspace(
+                max(ref_time[0], test_time[0]),
+                min(ref_time[-1], test_time[-1]),
+                min(len(ref_time), len(test_time))
+            )
+
+            sig_ref_interp = np.interp(t_common, ref_time, sig_ref)
+            sig_test_interp = np.interp(t_common, test_time, sig_test)
+
+            gof, peak_err, corr, rmse = compute_metrics(sig_ref_interp, sig_test_interp)
+
+            model_results[comp] = {
+                'gof': gof,
+                'peak_err': peak_err,
+                'corr': corr,
+                'rmse': rmse
+            }
+
+            print(f"  {comp}: GoF-Goodness of Fit={gof:.4f}, PeakErr={peak_err:.2f}%, Corr-Pearson={corr:.4f}, RMSE={rmse:.6f}")
+
+        results[model_name] = model_results
+        print("")
+
+    print("=" * 70)
+    # return results
+
+    
+def compare_models_DRM_station_spectra(models, 
+                                        node_id, 
+                                        data_type='accel',
+                                        spectral_type='PSa',
+                                        reference_index=0):
+    from EarthquakeSignal.core.newmark_spectrum_analyzer import NewmarkSpectrumAnalyzer
+
+    def is_station(obj):
+        return hasattr(obj, 'z_v') and not hasattr(obj, 'internal')
+
+    def resolve_node_id(node_id, model_index, n_models):
+        if not isinstance(node_id, list):
+            return node_id
+        if isinstance(node_id[0], list):
+            return node_id[model_index][0]
+        if len(node_id) == n_models:
+            return node_id[model_index]
+        return node_id[0]
+
+    def get_name(obj):
+        if is_station(obj):
+            return obj.name if obj.name else "Station"
+        return obj.model_name
+
+    def get_spectra(obj, node_idx, data_type, spectral_type):
+        if is_station(obj):
+            return obj.get_newmark(filtered=False)
+        else:
+            if node_idx == 'QA' or node_idx == 'qa':
+                data = obj.get_qa_data(data_type)
+            elif isinstance(node_idx, int) and node_idx < len(obj.xyz):
+                data = obj.get_node_data(node_idx, data_type)
+            else:
+                data = obj.get_qa_data(data_type)
+
+            z_a, e_a, n_a = data[2], data[0], data[1]
+            dt = obj.time[1] - obj.time[0]
+
+            # Normalize only if accel (convert to g)
+            scale = 1.0 / 9.81 if data_type == 'accel' else 1.0
+
+            spec_z = NewmarkSpectrumAnalyzer.compute(z_a * scale, dt)
+            spec_e = NewmarkSpectrumAnalyzer.compute(e_a * scale, dt)
+            spec_n = NewmarkSpectrumAnalyzer.compute(n_a * scale, dt)
+
+            # spectral_type must match a key in the spectrum dict (e.g. 'PSa', 'PSv', 'Sd')
+            return {
+                'T':     spec_z['T'],
+                'PSa_z': spec_z[spectral_type],
+                'PSa_e': spec_e[spectral_type],
+                'PSa_n': spec_n[spectral_type]
+            }
+
+    def compute_metrics(sig_ref, sig_test):
+        diff = sig_ref - sig_test
+        num = np.sum(diff**2)
+        den = np.sum(sig_ref**2 + sig_test**2)
+        gof = 1 - np.sqrt(num / den) if den > 0 else 0
+        max_ref = np.max(np.abs(sig_ref))
+        peak_err = (np.max(np.abs(diff)) / max_ref * 100) if max_ref > 0 else 0
+        corr = np.corrcoef(sig_ref, sig_test)[0, 1]
+        rmse = np.sqrt(np.mean(diff**2))
+        return gof, peak_err, corr, rmse
+
+    n_models = len(models)
+    model_names = [get_name(m) for m in models]
+    components = [('Z', 'PSa_z'), ('E', 'PSa_e'), ('N', 'PSa_n')]
+
+    spectra_all   = []
+    node_ids_used = []
+
+    for i, obj in enumerate(models):
+        node_idx = resolve_node_id(node_id, i, n_models)
+        node_ids_used.append('Station' if is_station(obj) else node_idx)
+        spectra_all.append(get_spectra(obj, node_idx, data_type, spectral_type))
+
+    ref_spec  = spectra_all[reference_index]
+    ref_T     = ref_spec['T']
+    ref_name  = model_names[reference_index]
+
+    results = {}
+
+    print("=" * 70)
+    print(f"SPECTRA COMPARISON vs Reference ({ref_name})")
+    print(f"data_type={data_type} | spectral_type={spectral_type}")
+    print("=" * 70)
+    print(f"Reference : {ref_name} | Node: {node_ids_used[reference_index]}")
+    print("")
+
+    for i in range(n_models):
+        if i == reference_index:
+            continue
+
+        model_name = model_names[i]
+        test_spec  = spectra_all[i]
+        test_T     = test_spec['T']
+
+        print(f"Model: {model_name} vs Reference | Node: {node_ids_used[i]}")
+
+        model_results = {}
+
+        for comp, key in components:
+            sig_ref  = ref_spec[key]
+            sig_test = test_spec[key]
+
+            T_common = np.linspace(
+                max(ref_T[0], test_T[0]),
+                min(ref_T[-1], test_T[-1]),
+                min(len(ref_T), len(test_T))
+            )
+
+            sig_ref_interp  = np.interp(T_common, ref_T,  sig_ref)
+            sig_test_interp = np.interp(T_common, test_T, sig_test)
+
+            gof, peak_err, corr, rmse = compute_metrics(sig_ref_interp, sig_test_interp)
+
+            model_results[comp] = {
+                'gof':      gof,
+                'peak_err': peak_err,
+                'corr':     corr,
+                'rmse':     rmse
+            }
+
+            print(f"  {comp}: GoF={gof:.4f}, PeakErr={peak_err:.2f}%, Corr={corr:.4f}, RMSE={rmse:.6f}")
+
+        results[model_name] = model_results
+        print("")
+
+    print("=" * 70)
+    # return results

@@ -5,45 +5,12 @@ import os
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.interpolate import interp1d
-# from EarthquakeSignal.core.newmark_spectrum_analyzer import NewmarkSpectrumAnalyzer
 from .newmark import NewmarkSpectrumAnalyzer
 
 
+
 class DRM:
-    """
-    Class for reading and analyzing DRM data from HDF5 files.
-    
-    Parameters
-    ----------
-    filename : str
-        Path to the HDF5 file.
-    dt : float, optional
-        Time step for resampling. If None, uses original dt.
-    gf_database : str, optional
-        Path to GF database file.
-    
-    Attributes
-    ----------
-    xyz : np.ndarray
-        Node coordinates.
-    internal : np.ndarray
-        Boolean array indicating internal nodes.
-    time : np.ndarray
-        Time vector.
-    """
     def __init__(self, filename, dt=None, gf_database=None):
-        """
-        Initialize DRM object from HDF5 file.
-        
-        Parameters
-        ----------
-        filename : str
-            Path to the HDF5 file.
-        dt : float, optional
-            Time step for resampling.
-        gf_database : str, optional
-            Path to GF database file.
-        """
         with h5py.File(filename, 'r') as f:
             # Geometry
             self.xyz = f['DRM_Data/xyz'][:]
@@ -164,6 +131,7 @@ class DRM:
                 self.node_mapping = None
 
     # ----------------------------------------------------------------
+    
     def get_node_data(self, node_id, data_type='accel'):
         key = (node_id, data_type)
         
@@ -180,8 +148,11 @@ class DRM:
                 
                 data_orig = f[path][idx:idx+3, :]
             
-            # Si tiene _resample_cache, reinterpolamos
-            if hasattr(self, '_resample_cache'):
+            # Apply window mask if exists
+            if hasattr(self, '_window_mask'):
+                data_orig = data_orig[:, self._window_mask]
+            # Apply resampling if exists
+            elif hasattr(self, '_resample_cache'):
                 data_resampled = np.zeros((3, len(self.time)))
                 for i in range(3):
                     data_resampled[i] = interp1d(
@@ -190,12 +161,14 @@ class DRM:
                         kind='linear', 
                         fill_value='extrapolate'
                     )(self.time)
-                self._node_cache[key] = data_resampled
-            else:
-                self._node_cache[key] = data_orig
+                data_orig = data_resampled
+            
+            self._node_cache[key] = data_orig
         
         return self._node_cache[key]
+
     # ----------------------------------------------------------------
+    
     def get_qa_data(self, data_type='accel'):
         key = ('qa', data_type)
         
@@ -210,8 +183,11 @@ class DRM:
                 
                 data_orig = f[path][:]
             
-            # Si tiene _resample_cache, reinterpolamos
-            if hasattr(self, '_resample_cache'):
+            # Apply window mask if exists
+            if hasattr(self, '_window_mask'):
+                data_orig = data_orig[:, self._window_mask]
+            # Apply resampling if exists
+            elif hasattr(self, '_resample_cache'):
                 data_resampled = np.zeros((3, len(self.time)))
                 for i in range(3):
                     data_resampled[i] = interp1d(
@@ -220,11 +196,12 @@ class DRM:
                         kind='linear', 
                         fill_value='extrapolate'
                     )(self.time)
-                self._node_cache[key] = data_resampled
-            else:
-                self._node_cache[key] = data_orig
+                data_orig = data_resampled
+            
+            self._node_cache[key] = data_orig
         
         return self._node_cache[key]
+
     # ----------------------------------------------------------------
     def get_gf(self, node_id, subfault_id, component='z'):
         key = (node_id, subfault_id, component)
@@ -337,10 +314,7 @@ class DRM:
         return new_drm
     
     # ----------------------------------------------------------------
-    def plot_DRM(self, 
-                 xyz_origin=None, 
-                 label_nodes=False, 
-                 show_calculated=False) -> tuple:
+    def plot_DRM(self, xyz_origin=None, label_nodes=False, show_calculated=False):
         """
         Plot the DRM domain with optional visualization of nodes with calculated GFs.
         
@@ -1649,3 +1623,74 @@ class DRM:
         plt.show()
 
     # ----------------------------------------------------------------
+
+    def get_window(self, t_start, t_end):
+        """
+        Get a windowed copy of the DRM object.
+        
+        Parameters
+        ----------
+        t_start : float
+            Start time of window (seconds)
+        t_end : float
+            End time of window (seconds)
+        
+        Returns
+        -------
+        DRM
+            New DRM object with windowed data
+        """
+        new_drm = DRM.__new__(DRM)
+        
+        # Copy geometry and metadata
+        new_drm.xyz = self.xyz
+        new_drm.internal = self.internal
+        new_drm.xyz_qa = self.xyz_qa
+        new_drm.xyz_all = self.xyz_all
+        new_drm.filename = self.filename
+        new_drm.tstart = t_start
+        new_drm.name = f"{self.name} [{t_start}-{t_end}s]"
+        new_drm.freqs = self.freqs
+        new_drm.spacing = self.spacing
+        new_drm.model_name = self.model_name
+        
+        # Copy internal metadata
+        new_drm._dt_orig = self._dt_orig
+        new_drm._n_nodes = self._n_nodes
+        new_drm._n_subfaults = self._n_subfaults
+        new_drm._n_time = self._n_time
+        new_drm._n_freqs = self._n_freqs
+        
+        # Find window indices
+        mask = (self.time >= t_start) & (self.time <= t_end)
+        new_drm._window_mask = mask
+        new_drm._n_time_drm = np.sum(mask)
+        
+        # Windowed time vectors
+        new_drm.dt = self.dt
+        new_drm.time = self.time[mask]
+        new_drm.gf_time = self.gf_time  # GF time unchanged
+        
+        # Store original time for cache interpolation
+        new_drm._original_time = self.time
+        new_drm._source_drm = self  # Reference to original for data access
+        
+        # Empty caches
+        new_drm._node_cache = {}
+        new_drm._gf_cache = {}
+        new_drm._spectrum_cache = {}
+        
+        # Copy mapping if exists
+        new_drm.node_mapping = self.node_mapping if hasattr(self, 'node_mapping') else None
+        new_drm.pairs_mapping = self.pairs_mapping if hasattr(self, 'pairs_mapping') else None
+        
+        # Copy GF database info if exists
+        for attr in ['gf_db_pairs', 'gf_db_dh', 'gf_db_zrec', 'gf_db_zsrc',
+                    'gf_db_delta_h', 'gf_db_delta_v_rec', 'gf_db_delta_v_src']:
+            if hasattr(self, attr):
+                setattr(new_drm, attr, getattr(self, attr))
+        
+        print(f"Window: [{t_start}, {t_end}]s -> {new_drm._n_time_drm} samples")
+        
+        return new_drm
+

@@ -4,7 +4,7 @@ A Python-based tool for reading, analyzing, and visualizing Domain Reduction Met
 
 ---
 
-## ⚙️ Features
+## Features
 
 - Read DRM data from HDF5 files
 - Extract node coordinates, Green's functions, and response spectra
@@ -15,14 +15,14 @@ A Python-based tool for reading, analyzing, and visualizing Domain Reduction Met
 
 ---
 
-## 📦 Requirements
+## Requirements
 
 - Python 3.8+
 - numpy, h5py, matplotlib, scipy, numba
 
 ---
 
-## 🚀 Installation
+## Installation
 ```bash
 git clone https://github.com/ppalacios92/DRM_DATA.git
 cd DRM_DATA
@@ -31,7 +31,7 @@ pip install -e .
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 ```bash
 DRM_DATA/
 ├── drm_data/
@@ -52,14 +52,14 @@ This tool is provided as-is, without any guarantees of accuracy or suitability f
 
 ---
 
-## 👨‍💻 Author
+## Author
 
 Developed by Patricio Palacios B.
 GitHub: @ppalacios92
 
 ---
 
-## 📚 How to Cite
+## How to Cite
 ```bibtex
 @misc{palacios2025drmdata,
   author       = {Patricio Palacios B.},
@@ -72,10 +72,9 @@ GitHub: @ppalacios92
 
 ---
 
-## 📜 License
+## License
 
 MIT License
-```
 
 ---
 
@@ -102,3 +101,4 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
