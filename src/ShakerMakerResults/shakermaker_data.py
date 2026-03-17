@@ -174,6 +174,11 @@ class ShakerMakerData:
         print(f"  QA       : {'yes  ->  ' + str(self.xyz_qa[0] * 1000) + ' m' if self.xyz_qa is not None else 'no'}")
         print(f"  Time     : dt={dt_orig}s  |  steps={n_time_data}  |  t=[{tstart:.3f}, {tstart + n_time_data*dt_orig:.3f}]s")
         print(f"  GF       : steps={n_time_gf}" + (f"  |  nsources={self._nsources_db}" if self._gf_loaded else "  |  not loaded"))
+        with h5py.File(filename, 'r') as f:
+            if 'DRM_Metadata/program_used' in f:
+                _ver = f['DRM_Metadata/program_used'][()].decode()
+                _dat = f['DRM_Metadata/created_on'][()].decode()
+                print(f"  Version  : {_ver}  |  {_dat}")
         print(sep + '\n')
 
     # ------------------------------------------------------------------
@@ -236,74 +241,68 @@ class ShakerMakerData:
                 print("  GF mapping loaded (legacy Node_Mapping).")
 
     def load_gf_database(self, h5_path):
-        """Merge a GF database (.h5) produced by Stage 0/1 into the .h5drm file.
+        """Load GF database (.h5) produced by Stage 0/1 into memory.
 
-        Copies GF_Database_Info metadata and GF timeseries (tdata_dict →
-        GF_tdata) into the .h5drm so the file becomes self-contained.
-        After merging, GF methods are activated automatically.
+        Reads GF_Database_Info metadata and GF timeseries directly from
+        the source file without modifying any file on disk.
 
         Parameters
         ----------
         h5_path : str
             Path to the GF database file produced by Stage 0/1.
-
-        Examples
-        --------
-        >>> surf = SurfaceData("surface_400m_hollow.h5drm")
-        >>> surf.load_gf_database("gf_database_surface_400m_hollow")
-        >>> surf.plot_node_gf(node_id=0, subfault=0)
         """
-        print(f"Merging GF database: {h5_path} → {self.filename}")
+        print(f"Loading GF database: {h5_path}")
+        self._gf_h5_path = h5_path
 
-        with h5py.File(h5_path, 'r') as src, h5py.File(self.filename, 'a') as dst:
+        with h5py.File(h5_path, 'r') as f:
+            self._pairs_to_compute = f['pairs_to_compute'][:]
+            self._delta_h          = float(f['delta_h'][()])
+            self._delta_v_src      = float(f['delta_v_src'][()])
+            self._delta_v_rec      = float(f['delta_v_rec'][()])
+            self._nsources_db      = int(f['nsources'][()])
 
-            #  GF_Database_Info 
-            if 'GF_Database_Info' in dst:
-                del dst['GF_Database_Info']
-            grp = dst.create_group('GF_Database_Info')
-
-            for key in ['pairs_to_compute', 'dh_of_pairs', 'dv_of_pairs',
-                        'zsrc_of_pairs', 'zrec_of_pairs']:
-                if key in src:
-                    grp.create_dataset(key, data=src[key][:])
-
-            grp.attrs['delta_h']     = float(src['delta_h'][()])
-            grp.attrs['delta_v_src'] = float(src['delta_v_src'][()])
-            grp.attrs['delta_v_rec'] = float(src['delta_v_rec'][()])
-            grp.attrs['nstations']   = int(src['nstations'][()])
-            grp.attrs['nsources']    = int(src['nsources'][()])
-
-            if 'pair_to_slot' in src:
-                grp.create_dataset('pair_to_slot', data=src['pair_to_slot'][:])
-
-            #  GF timeseries: tdata_dict → GF_tdata 
-            if 'GF_tdata' in dst:
-                del dst['GF_tdata']
-
-            if 'tdata_dict' in src:
-                src.copy('tdata_dict', dst, name='GF_tdata')
-                n_slots = len([k for k in src['tdata_dict'].keys()
-                                if k.endswith('_tdata')])
-                print(f"  GF timeseries copied: {n_slots} slots")
+            if 'pair_to_slot' in f:
+                self._pair_to_slot     = f['pair_to_slot'][:]
+                self._use_pair_to_slot = True
             else:
-                print("  Warning: no tdata_dict found in source file")
+                dh   = f['dh_of_pairs'][:]
+                zsrc = f['zsrc_of_pairs'][:]
+                zrec = f['zrec_of_pairs'][:]
+                self._dh_slots   = dh
+                self._zsrc_slots = zsrc
+                pts = np.column_stack([dh   / self._delta_h,
+                                       zsrc / self._delta_v_src,
+                                       zrec / self._delta_v_rec])
+                self._ktree = cKDTree(pts)
+                self._use_pair_to_slot = False
 
-        print(f"Done. File updated: {self.filename}")
+            self.gf_db_pairs       = self._pairs_to_compute
+            self.gf_db_dh          = f['dh_of_pairs'][:]
+            self.gf_db_zrec        = f['zrec_of_pairs'][:]
+            self.gf_db_zsrc        = f['zsrc_of_pairs'][:]
+            self.gf_db_delta_h     = self._delta_h
+            self.gf_db_delta_v_rec = self._delta_v_rec
+            self.gf_db_delta_v_src = self._delta_v_src
 
-        # Rebuild GF state from newly written data
-        self._gf_cache = {}
-        self._gf_loaded = False
-        self._pair_to_slot = None
-        self._pairs_to_compute = None
-        self._ktree = None
-        self._try_load_gf_from_file()
+            n_slots = len([k for k in f['tdata_dict'].keys()
+                           if k.endswith('_tdata')])
 
-        # Update gf_time if needed
-        with h5py.File(self.filename, 'r') as f:
-            if 'GF_tdata/0_tdata' in f:
-                n_time_gf = f['GF_tdata/0_tdata'].shape[0]
-                self._n_time_gf = n_time_gf
-                self.gf_time    = np.arange(n_time_gf) * self._dt_orig
+        self._gf_cache  = {}
+        self._gf_loaded = True
+
+        n_time_gf = 0
+        with h5py.File(h5_path, 'r') as f:
+            if 'tdata_dict/0_tdata' in f:
+                n_time_gf = f['tdata_dict/0_tdata'].shape[0]
+        self._n_time_gf = n_time_gf
+        self.gf_time    = np.arange(n_time_gf) * self._dt_orig
+
+        unique = np.unique(self._pairs_to_compute[:, 0])
+        mode   = "O(1) pair_to_slot" if self._use_pair_to_slot else "KDTree"
+        print(f"  GF DB ({mode}): {n_slots} slots  |  {len(unique)}/{self._n_nodes} computed "
+              f"({(1-len(unique)/self._n_nodes)*100:.1f}% reduction)")
+        print(f"Done.")
+    
 
     def _get_slot(self, node_id, subfault_id):
         """Return GF slot index for (node_id, subfault_id).
@@ -386,10 +385,11 @@ class ShakerMakerData:
             self._node_cache[key] = data
         return self._node_cache[key]
 
+
     def get_gf(self, node_id, subfault_id, component='z'):
         """Return Green's function time series for a node/subfault pair.
 
-        Supports both OP pipeline (GF_tdata/{slot}_tdata) and legacy
+        Supports both OP pipeline (tdata_dict/{slot}_tdata) and legacy
         (GF/sta_N/sub_M/{z,e,n}) formats, detected automatically.
 
         Parameters
@@ -408,21 +408,24 @@ class ShakerMakerData:
                 if donor_n != node_id:
                     print(f"  Node {node_id}/sub {subfault_id} → "
                           f"slot {slot} (donor: {donor_n})")
-                with h5py.File(self.filename, 'r') as f:
-                    tdata_path = f'GF_tdata/{slot}_tdata'
+                with h5py.File(self._gf_h5_path, 'r') as f:
+                    tdata_path = f'tdata_dict/{slot}_tdata'
                     if tdata_path not in f:
                         raise KeyError(
                             f"GF not found: {tdata_path}. "
                             "Call load_gf_database() first.")
-                    tdata = f[tdata_path][:]   # (Nt, 9)
-
-                comp_map = {'z': 0, 'e': 1, 'n': 2, 'tdata': None}
-                if component == 'tdata':
-                    self._gf_cache[key] = tdata
-                elif component in comp_map:
-                    self._gf_cache[key] = tdata[:, comp_map[component]]
-                else:
-                    raise KeyError(f"Unknown component '{component}'.")
+                    if component == 'tdata':
+                        self._gf_cache[key] = f[tdata_path][:]
+                    elif component in ('z', 'e', 'n'):
+                        comp_path = f'tdata_dict/{slot}_{component}'
+                        if comp_path in f:
+                            self._gf_cache[key] = f[comp_path][:]
+                        else:
+                            # Fallback: extract column from tdata
+                            comp_map = {'z': 0, 'e': 1, 'n': 2}
+                            self._gf_cache[key] = f[tdata_path][:, comp_map[component]]
+                    else:
+                        raise KeyError(f"Unknown component '{component}'.")
 
             #  Legacy Node_Mapping 
             elif self.node_mapping is not None:
@@ -441,6 +444,7 @@ class ShakerMakerData:
                     if path not in f:
                         raise KeyError(f"GF not found: {path}")
                     self._gf_cache[key] = f[path][:]
+
             else:
                 raise RuntimeError(
                     "No GF data available. Call load_gf_database() first.")
@@ -746,12 +750,16 @@ class ShakerMakerData:
         for nid in nids:
             if nid in ('QA','qa'): print("GFs not available for QA."); continue
             for sid in sub_ids:
+                slot = self._get_slot(nid, sid)
+                with h5py.File(self._gf_h5_path, 'r') as f:
+                    t0_path = f'tdata_dict/{slot}_t0'
+                    t0 = f[t0_path][()] if t0_path in f else 0.0
                 lbl = f'N{nid}_S{sid}'
                 for k,comp in enumerate(('z','e','n'),1):
+                    gf_data = self.get_gf(nid, sid, comp)
+                    time = np.arange(len(gf_data)) * self._dt_orig + t0
                     plt.subplot(3,1,k)
-                    plt.plot(self.gf_time,self.get_gf(nid,sid,comp),linewidth=1,label=lbl)
-        gf_n = self.get_gf(nid, sid, 'n')
-        print(f"N{nid}_S{sid} north: max={np.max(np.abs(gf_n)):.6f}  len={len(gf_n)}")
+                    plt.plot(time, gf_data, linewidth=1, label=lbl)
         for k,t in enumerate(('Vertical (Z)','East (E)','North (N)'),1):
             ax = plt.subplot(3,1,k)
             ax.set_title(f'{t} — Green Function',fontweight='bold')
@@ -762,6 +770,8 @@ class ShakerMakerData:
             if xlim: ax.set_xlim(xlim)
         plt.tight_layout(); plt.show()
 
+
+    
     def plot_node_tensor_gf(self,
                             node_id=None,
                             target_pos=None,
@@ -792,12 +802,13 @@ class ShakerMakerData:
                 donor  = self._pairs_to_compute[slot,0]
                 if donor != nid:
                     print(f"Node {nid}/sub {sid} → slot {slot} (donor {donor})")
-                with h5py.File(self.filename,'r') as f:
-                    tp = f'GF_tdata/{slot}_tdata'
+                with h5py.File(self._gf_h5_path,'r') as f:
+                    tp = f'tdata_dict/{slot}_tdata'
                     if tp not in f: continue
                     tdata = f[tp][:]
-                    t0    = f[f'GF_tdata/{slot}_t0'][()] if f'GF_tdata/{slot}_t0' in f else 0.0
-                time = np.arange(tdata.shape[0])*self._dt_orig+t0
+                    t0_path = f'tdata_dict/{slot}_t0'
+                    t0 = f[t0_path][()] if t0_path in f else 0.0
+                time = np.arange(tdata.shape[0])*self._dt_orig + t0
                 lbl  = f'N{nid}_S{sid}'
                 for j in range(9):
                     axes[j//3,j%3].plot(time,tdata[:,j],linewidth=0.8,label=lbl)
