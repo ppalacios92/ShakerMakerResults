@@ -102,9 +102,13 @@ class ShakerMakerData:
         self.xyz_all = np.vstack([self.xyz, self.xyz_qa]) if self.xyz_qa is not None else self.xyz
 
         xyz_t = _rotate(self.xyz)
-        h_x = np.diff(np.sort(np.unique(np.round(xyz_t[:, 0], 6))))[0]
-        h_y = np.diff(np.sort(np.unique(np.round(xyz_t[:, 1], 6))))[0]
-        h_z = np.diff(np.sort(np.unique(np.round(xyz_t[:, 2], 6))))[0]
+        # h_x = np.diff(np.sort(np.unique(np.round(xyz_t[:, 0], 6))))[0]
+        # h_y = np.diff(np.sort(np.unique(np.round(xyz_t[:, 1], 6))))[0]
+        # h_z = np.diff(np.sort(np.unique(np.round(xyz_t[:, 2], 6))))[0]
+        def _spacing(arr): d = np.diff(np.sort(np.unique(np.round(arr, 6)))); return float(d[0]) if len(d) > 0 else 0.0
+        h_x = _spacing(xyz_t[:, 0])
+        h_y = _spacing(xyz_t[:, 1])
+        h_z = _spacing(xyz_t[:, 2])
         self.spacing    = (h_x, h_y, h_z)
         self.model_name = f"{h_x:.1f}m"
 
@@ -777,15 +781,21 @@ class ShakerMakerData:
                        s=300,label='QA',zorder=10,edgecolors='black',linewidths=2)
         ax.add_collection3d(Poly3DCollection(faces,alpha=0.15,facecolor='red',
                                              edgecolor='darkred',linewidths=1.5))
-        if label_nodes: self._label_nodes_on_ax(ax,xyz_t,bounds,label_nodes,comp_donors)
-        ax.set_xlabel("X' (m)"); ax.set_ylabel("Y' (m)"); ax.set_zlabel("Z' (m)")
+        if label_nodes: 
+            self._label_nodes_on_ax(ax,xyz_t,bounds,label_nodes,comp_donors)
+
+        ax.set_xlabel("X' (m)")
+        ax.set_ylabel("Y' (m)")
+        ax.set_zlabel("Z' (m)")
         ax.legend(); ax.grid(False); 
+
         if axis_equal is True:
             ax.axis('equal')
         plt.tight_layout(); 
         plt.show()
 
-        if xyz_qa_t is not None: print(f"QA position: {xyz_qa_t[0]}")
+        if xyz_qa_t is not None: 
+            print(f"QA position: {xyz_qa_t[0]}")
         return fig, ax
 
     def plot_node_response(self,
@@ -1193,7 +1203,7 @@ class ShakerMakerData:
                     cmap='RdBu_r', 
                     figsize=(12,8),
                     elev=30, azim=45, s=20, alpha=0.85,
-                    axis_equal=False):
+                    axis_equal=False,):
 
         """Plot a 3-D scatter snapshot of the domain at a given time."""
         it = int(np.argmin(np.abs(self.time - time)))
@@ -1215,69 +1225,105 @@ class ShakerMakerData:
             sc = ax.scatter(x[active],y[active],z[active],c=mag[active],
                             cmap=cmap,s=s,alpha=alpha,vmin=vmin,vmax=vmax)
             fig.colorbar(sc,ax=ax,shrink=0.5)
-        ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
-        ax.invert_zaxis()
+
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Z (m)')
+        ax.grid(False)
+
         if axis_equal is True:
             ax.axis('equal')
+
         ax.set_title(f'{self.name} | t={actual_t:.3f}s | {clbl}',fontweight='bold')
         ax.view_init(elev=elev,azim=azim)
         plt.tight_layout(); plt.show()
+
+
 
     def create_animation(self, time_start=0.0, time_end=None, n_frames=50,
                          component='z', data_type='vel', cmap='RdBu_r',
                          figsize=(12,8), dpi=100, fps=10,
                          elev=30, azim=45, s=20, alpha=0.85,
-                         output_dir='animation', output_video='animation.mp4'):
+                         ffmpeg_path=None, output_dir='animation', output_video='animation.mp4',
+                         axis_equal=True, vmax_from_range=False):
+
         """Create a 3-D scatter animation of the full domain."""
         import subprocess
         os.makedirs(output_dir, exist_ok=True)
         if time_end is None: time_end = self.time[-1]
-        if component.lower()=='resultant':
-            vmax=self._vmax[data_type]['resultant']; vmin=0
+
+        if vmax_from_range:
+            i0 = int(np.argmin(np.abs(self.time - time_start)))
+            i1 = int(np.argmin(np.abs(self.time - time_end)))
+            path = {'accel': f'{self._data_grp}/acceleration',
+                    'vel':   f'{self._data_grp}/velocity',
+                    'disp':  f'{self._data_grp}/displacement'}[data_type]
+            with h5py.File(self.filename, 'r') as f:
+                d = f[path][:, i0:i1+1]
+            if component.lower() == 'resultant':
+                e = d[0::3,:]; n = d[1::3,:]; zc = d[2::3,:]
+                vmax = float(np.sqrt(e**2 + n**2 + zc**2).max()); vmin = 0
+            else:
+                row = {'e': 0, 'n': 1, 'z': 2}[component.lower()]
+                vmax = float(np.abs(d[row::3,:]).max()); vmin = -vmax
         else:
-            vmax=self._vmax[data_type][component.lower()]; vmin=-vmax
+            if component.lower() == 'resultant':
+                vmax = self._vmax[data_type]['resultant']; vmin = 0
+            else:
+                vmax = self._vmax[data_type][component.lower()]; vmin = -vmax
+
         x=self.xyz[:,0]*1000; y=self.xyz[:,1]*1000; z=self.xyz[:,2]*1000
-        for i,t in enumerate(np.linspace(time_start,time_end,n_frames)):
-            it = int(np.argmin(np.abs(self.time-t)))
-            if component.lower()=='resultant':
+        for i,t in enumerate(np.linspace(time_start, time_end, n_frames)):
+            it = int(np.argmin(np.abs(self.time - t)))
+            if component.lower() == 'resultant':
                 mag = np.sqrt(self.get_surface_snapshot(it,'e',data_type)**2+
                               self.get_surface_snapshot(it,'n',data_type)**2+
                               self.get_surface_snapshot(it,'z',data_type)**2)
             else:
-                mag = self.get_surface_snapshot(it,component,data_type)
-            fig = plt.figure(figsize=figsize); ax = fig.add_subplot(111,projection='3d')
-            ax.scatter(x,y,z,c='lightgray',s=s,alpha=0.3)
-            active = np.abs(mag)>=vmax*0.01
+                mag = self.get_surface_snapshot(it, component, data_type)
+            fig = plt.figure(figsize=figsize); ax = fig.add_subplot(111, projection='3d')
+            ax.scatter(x, y, z, c='lightgray', s=s, alpha=0.3)
+            active = np.abs(mag) >= vmax * 0.01
             if active.any():
-                ax.scatter(x[active],y[active],z[active],c=mag[active],
-                           cmap=cmap,s=s,alpha=alpha,vmin=vmin,vmax=vmax)
-            sm = plt.cm.ScalarMappable(cmap=cmap,norm=plt.Normalize(vmin=vmin,vmax=vmax))
-            sm.set_array([]); fig.colorbar(sm,ax=ax,shrink=0.5)
-            ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
-            ax.invert_xaxis()
-            ax.invert_yaxis()
-            ax.invert_zaxis()
-            ax.set_title(f't = {self.time[it]:.3f} s',fontsize=14,fontweight='bold')
-            ax.view_init(elev=elev,azim=azim)
-            plt.tight_layout(); plt.savefig(f'{output_dir}/frame_{i:03d}.png',dpi=dpi); plt.close()
+                ax.scatter(x[active], y[active], z[active], c=mag[active],
+                           cmap=cmap, s=s, alpha=alpha, vmin=vmin, vmax=vmax)
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+            sm.set_array([]); fig.colorbar(sm, ax=ax, shrink=0.5)
+            ax.set_xlabel('X (m)')
+            ax.set_ylabel('Y (m)')
+            ax.set_zlabel('Z (m)')
+            ax.set_title(f't = {self.time[it]:.3f} s', fontsize=14, fontweight='bold')
+            ax.view_init(elev=elev, azim=azim)
+            ax.grid(False)
+            if axis_equal:
+                ax.set_aspect('equal')
+            plt.tight_layout()
+            plt.savefig(f'{output_dir}/frame_{i:03d}.png', dpi=dpi)
+            plt.close()
             print(f'Frame {i+1}/{n_frames}')
         try:
-            subprocess.run(['ffmpeg','-y','-framerate',str(fps),
-                            '-i',f'{output_dir}/frame_%03d.png',
-                            '-c:v','libx264','-pix_fmt','yuv420p',
-                            '-crf','18',output_video],check=True,capture_output=True)
+            ffmpeg_exe = ffmpeg_path or shutil.which('ffmpeg') or 'ffmpeg'
+            subprocess.run([ffmpeg_exe, '-y', '-framerate', str(fps),
+                            '-i', f'{output_dir}/frame_%03d.png',
+                            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                            '-crf', '18', output_video], check=True, capture_output=True)
             print(f'Video saved: {output_video}')
         except Exception as e:
             print(f'ffmpeg error — frames in {output_dir}: {e}')
+
+
 
     def create_animation_plane(self, plane='xy', plane_value=0.0,
                                 time_start=0.0, time_end=None, n_frames=50,
                                 component='z', data_type='vel', cmap='RdBu_r',
                                 figsize=(12,8), dpi=100, fps=10,
                                 elev=30, azim=45, s=50, alpha=0.85,
+                                ffmpeg_path= None,
                                 output_dir='animation_plane',
                                 output_video='animation_plane.mp4',
-                                vmax_from_range=False):
+                                vmax_from_range=False,
+                                axis_equal=True):
+
         """Create a 3-D animation of a planar slice through the domain."""
         import subprocess
         os.makedirs(output_dir, exist_ok=True)
@@ -1331,21 +1377,29 @@ class ShakerMakerData:
                            cmap=cmap,s=s,alpha=alpha,vmin=vmin,vmax=vmax)
             sm = plt.cm.ScalarMappable(cmap=cmap,norm=plt.Normalize(vmin=vmin,vmax=vmax))
             sm.set_array([]); fig.colorbar(sm,ax=ax,shrink=0.5)
-            ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
-            ax.invert_xaxis(); ax.invert_yaxis(); ax.invert_zaxis()
+
+            ax.set_xlabel('X (m)')
+            ax.set_ylabel('Y (m)')
+            ax.set_zlabel('Z (m)')
+            # ax.invert_xaxis()
+            # ax.invert_yaxis()
+            # ax.invert_zaxis()
             ax.set_title(f'{tpl} | t = {self.time[it]:.3f} s',fontsize=14,fontweight='bold')
             ax.view_init(elev=elev,azim=azim)
-            plt.tight_layout(); plt.savefig(f'{output_dir}/frame_{i:03d}.png',dpi=dpi); plt.close()
+            ax.grid(False)
+            plt.tight_layout()
+            plt.savefig(f'{output_dir}/frame_{i:03d}.png',dpi=dpi)
+            plt.close()
             print(f'Frame {i+1}/{n_frames}')
         try:
-            subprocess.run(['ffmpeg','-y','-loglevel','error','-framerate',str(fps),
-                            '-i',f'{output_dir}/frame_%03d.png',
-                            '-c:v','libx264','-pix_fmt','yuv420p','-crf','18',output_video],
-                           check=True)
+            ffmpeg_exe = ffmpeg_path or shutil.which('ffmpeg') or 'ffmpeg'
+            subprocess.run([ffmpeg_exe, '-y', '-framerate', str(fps),
+                            '-i', f'{output_dir}/frame_%03d.png',
+                            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                            '-crf', '18', output_video], check=True, capture_output=True)
             print(f'Video saved: {output_video}')
         except Exception as e:
             print(f'ffmpeg error — frames in {output_dir}: {e}')
-
 
 # # ---------------------------------------------------------------------------
 # # Semantic aliases
