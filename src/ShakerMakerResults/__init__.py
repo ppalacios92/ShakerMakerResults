@@ -39,13 +39,9 @@ from .newmark          import NewmarkSpectrumAnalyzer
 from .plotting import (
     plot_models_response,
     plot_models_gf,
-    plot_models_newmark_spectra,
-    plot_models_DRM,
+    plot_models_newmark,
     plot_models_tensor_gf,
-    plot_combined_response,
-    compare_newmark,
-    compare_fourier,
-    plot_arias,
+    plot_models_DRM,
 )
 
 from .comparison import (

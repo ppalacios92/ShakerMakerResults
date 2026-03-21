@@ -32,6 +32,7 @@ from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.interpolate import interp1d
 from scipy.spatial import cKDTree
+import shutil
 
 from .newmark import NewmarkSpectrumAnalyzer
 
@@ -170,10 +171,16 @@ class ShakerMakerData:
         is_surface = self.is_drm and not np.any(self.internal)
         type_str   = 'SurfaceGrid' if is_surface else ('DRM' if self.is_drm else 'Station')
 
+        xyz_t_print = _rotate(self.xyz)
+        Lx = xyz_t_print[:,0].max() - xyz_t_print[:,0].min()
+        Ly = xyz_t_print[:,1].max() - xyz_t_print[:,1].min()
+        Lz = xyz_t_print[:,2].max() - xyz_t_print[:,2].min()
+
         print(sep)
         print(f"ShakerMakerData  :  {filename}")
         print(f"  Type     : {type_str}")
         print(f"  Model    : {self.model_name}  |  Spacing: {h_x:.1f}m x {h_y:.1f}m x {h_z:.1f}m")
+        print(f"  Domain   : Lx={Lx:.1f}m  Ly={Ly:.1f}m  Lz={Lz:.1f}m")
         print(f"  Nodes    : {n_nodes}  |  Internal: {self.internal.sum()}  |  External: {(~self.internal).sum()}")
         print(f"  QA       : {'yes  ->  ' + str(self.xyz_qa[0] * 1000) + ' m' if self.xyz_qa is not None else 'no'}")
         print(f"  Time     : dt={dt_orig}s  |  steps={n_time_data}  |  t=[{tstart:.3f}, {tstart + n_time_data*dt_orig:.3f}]s")
@@ -837,6 +844,8 @@ class ShakerMakerData:
             if xlim: ax.set_xlim(xlim)
         plt.tight_layout(); plt.show()
 
+
+
     def plot_node_gf(self,
                      node_id=None,
                      target_pos=None,
@@ -1413,6 +1422,60 @@ class ShakerMakerData:
         except Exception as e:
             print(f'ffmpeg error — frames in {output_dir}: {e}')
 
+# -------------------------
+    def plot_node_arias(self,
+                        node_id=None,
+                        target_pos=None,
+                        xlim=None,
+                        figsize=(10, 8),
+                        factor=1.0):
+        """Plot Arias intensity curves for one or more nodes.
+
+        Parameters
+        ----------
+        node_id : int, str, or list, optional
+        target_pos : array-like (3,), optional
+        xlim : list, optional
+        figsize : tuple, default ``(10, 8)``
+        factor : float, default ``1.0``
+            Multiplier applied to acceleration before computing Arias intensity.
+        """
+        from EarthquakeSignal.core.arias_intensity import AriasIntensityAnalyzer
+
+        nids = self._collect_node_ids(node_id, target_pos)
+        dt   = self.time[1] - self.time[0]
+
+        fig, axes = plt.subplots(3, 1, figsize=figsize)
+
+        for nid in nids:
+            data, lbl = self._resolve_node(nid, 'accel')
+            for ax, sig in zip(axes, (data[0], data[1], data[2])):
+                IA_pct, t_start, t_end, ia_total, _ = AriasIntensityAnalyzer.compute(
+                    sig * factor / 9.81, dt)
+                t = np.arange(len(IA_pct)) * dt
+                line, = ax.plot(t, IA_pct, linewidth=1.5,
+                                label=f"{lbl} | Ia={ia_total:.3f} m/s")
+                ax.axvline(t_start, color=line.get_color(),
+                           linestyle='--', linewidth=1, alpha=0.5)
+                ax.axvline(t_end, color=line.get_color(),
+                           linestyle='--', linewidth=1, alpha=0.5)
+
+        for ax, comp in zip(axes, ('Vertical (Z)', 'East (E)', 'North (N)')):
+            ax.axhline(5,  color='gray', linestyle=':', linewidth=1, alpha=0.7)
+            ax.axhline(95, color='gray', linestyle=':', linewidth=1, alpha=0.7)
+            ax.set_title(f'{comp} — Arias Intensity', fontweight='bold')
+            ax.set_xlabel('Time [s]')
+            ax.set_ylabel('IA (%)')
+            ax.set_ylim(0, 100)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper left')
+            if xlim:
+                ax.set_xlim(xlim)
+
+        plt.tight_layout()
+        plt.show()
+
+    
 # # ---------------------------------------------------------------------------
 # # Semantic aliases
 # # ---------------------------------------------------------------------------
