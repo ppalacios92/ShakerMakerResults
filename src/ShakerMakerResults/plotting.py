@@ -99,44 +99,49 @@ def _get_gf_time(obj, slot):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
 def plot_models_response(models,
-                         node_ids,
+                         node_ids=None,
+                         target_pos=None,
                          data_type='vel',
                          xlim=None,
                          figsize=(10, 8),
                          factor=1.0):
     """Plot time-history response for multiple models, overlaid in one figure.
 
-    Each model contributes one curve per node listed in its sub-list of
-    ``node_ids``. All curves share the same Z / E / N subplot layout.
-
     Parameters
     ----------
     models : list of ShakerMakerData
-        Models to compare.
-    node_ids : list of list
-        One sub-list per model. Each sub-list contains the node indices
-        (int or ``'QA'``) to plot for that model.
+    node_ids : list of list, optional
+        One sub-list per model with node indices (int or ``'QA'``).
         Example: ``[['QA', 0], ['QA', 5], [217]]``
+    target_pos : list of array-like, optional
+        One position per model ``[x, y, z]`` in km. Overrides ``node_ids``.
+        Example: ``[[6,8,0], [6,8,0], [6,8,0]]``
     data_type : {'vel', 'accel', 'disp'}, default ``'vel'``
-        Signal type to retrieve.
     xlim : list of float, optional
-        Time axis limits ``[t_min, t_max]`` in seconds.
     figsize : tuple of float, default ``(10, 8)``
-        Figure size in inches.
     factor : float, default ``1.0``
-        Multiplier applied to every signal before plotting.
     """
-    if len(models) != len(node_ids):
-        raise ValueError("models and node_ids must have the same length.")
+    if node_ids is None and target_pos is None:
+        raise ValueError("Provide node_ids or target_pos.")
+    if len(models) != len(node_ids if node_ids else target_pos):
+        raise ValueError("models and node_ids / target_pos must have the same length.")
+
+    n         = len(models)
+    nids_list = node_ids   if node_ids   else [None] * n
+    tpos_list = target_pos if target_pos else [None] * n
 
     ylabel = {'accel': 'Acceleration', 'vel': 'Velocity',
               'disp': 'Displacement'}[data_type]
 
     fig, axes = plt.subplots(3, 1, figsize=figsize)
 
-    for obj, nids in zip(models, node_ids):
+    for obj, nids, tpos in zip(models, nids_list, tpos_list):
+        if tpos is not None:
+            nids = obj._collect_node_ids(target_pos=tpos, print_info=True)
+        elif nids is not None:
+            nids = obj._collect_node_ids(node_id=nids, print_info=True)
+
         for nid in nids:
             z, e, n = _get_node_data(obj, nid, data_type)
             lbl = _build_label(obj, nid)
@@ -155,10 +160,12 @@ def plot_models_response(models,
 
     plt.tight_layout()
     plt.show()
+    
 
 
 def plot_models_newmark(models,
-                        node_ids,
+                        node_ids=None,
+                        target_pos=None,
                         data_type='accel',
                         spectral_type='PSa',
                         xlim=None,
@@ -169,27 +176,27 @@ def plot_models_newmark(models,
     Parameters
     ----------
     models : list of ShakerMakerData
-        Models to compare.
-    node_ids : list of list
-        One sub-list per model. Each sub-list contains the node indices
-        (int or ``'QA'``) to compute spectra for.
-        Example: ``[['QA'], [0, 5], ['QA', 217]]``
+    node_ids : list of list, optional
+        One sub-list per model with node indices (int or ``'QA'``).
+    target_pos : list of array-like, optional
+        One position per model ``[x, y, z]`` in km. Overrides ``node_ids``.
     data_type : {'accel', 'vel', 'disp'}, default ``'accel'``
-        Signal type used as input to the spectrum computation.
     spectral_type : {'PSa', 'Sa', 'PSv', 'Sv', 'Sd'}, default ``'PSa'``
-        Spectral quantity to plot.
     xlim : list of float, optional
-        Period axis limits ``[T_min, T_max]`` in seconds. Defaults to
-        ``[0, 5]``.
     figsize : tuple of float, default ``(8, 10)``
     factor : float, default ``1.0``
-        Multiplier applied to every signal before computing spectra.
     """
-    if len(models) != len(node_ids):
-        raise ValueError("models and node_ids must have the same length.")
+    if node_ids is None and target_pos is None:
+        raise ValueError("Provide node_ids or target_pos.")
+    if len(models) != len(node_ids if node_ids else target_pos):
+        raise ValueError("models and node_ids / target_pos must have the same length.")
 
     if xlim is None:
         xlim = [0, 5]
+
+    n         = len(models)
+    nids_list = node_ids   if node_ids   else [None] * n
+    tpos_list = target_pos if target_pos else [None] * n
 
     scale  = 1.0 / 9.81 if data_type == 'accel' else 1.0
     ylabel = {'PSa': 'PSa (g)', 'Sa': 'Sa (g)', 'PSv': 'PSv (m/s)',
@@ -197,7 +204,12 @@ def plot_models_newmark(models,
 
     fig, axes = plt.subplots(3, 1, figsize=figsize)
 
-    for obj, nids in zip(models, node_ids):
+    for obj, nids, tpos in zip(models, nids_list, tpos_list):
+        if tpos is not None:
+            nids = obj._collect_node_ids(target_pos=tpos, print_info=True)
+        elif nids is not None:
+            nids = obj._collect_node_ids(node_id=nids, print_info=True)
+
         dt = obj.time[1] - obj.time[0]
         for nid in nids:
             z, e, n = _get_node_data(obj, nid, data_type)
@@ -400,6 +412,7 @@ def plot_models_domain(models,
                     show='all',
                     show_nodes=True,
                     show_cubes=True,
+                    axis_equal=True,
                     figsize=(10, 8)):
     """Plot multiple ShakerMakerData domains in one 3-D figure.
 
@@ -469,7 +482,10 @@ def plot_models_domain(models,
     if xlim: ax.set_xlim(xlim)
     if ylim: ax.set_ylim(ylim)
     if zlim: ax.set_zlim(zlim)
-    ax.legend(); ax.grid(True, alpha=0.3)
+    ax.legend()
+    ax.grid(False)
+    if axis_equal is True:
+        ax.axis('equal')
     plt.tight_layout()
     plt.show()
 

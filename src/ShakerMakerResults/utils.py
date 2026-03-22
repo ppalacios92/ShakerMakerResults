@@ -28,11 +28,15 @@ _get_name(obj)
 
 import numpy as np
 
-_R = np.column_stack([
-    np.array([0, 1, 0]),
-    np.array([1, 0, 0]),
-    np.cross(np.array([0, 1, 0]), np.array([1, 0, 0]))
-])
+# _R = np.column_stack([
+#     np.array([0, 1, 0]),
+#     np.array([1, 0, 0]),
+#     np.cross(np.array([0, 1, 0]), np.array([1, 0, 0]))
+# ])
+
+_R = np.array([[1, 0,  0],
+               [0, 1,  0],
+               [0, 0, -1]])
 
 def _rotate(xyz_km):
     """Apply the ShakerMaker display rotation and convert km to m."""

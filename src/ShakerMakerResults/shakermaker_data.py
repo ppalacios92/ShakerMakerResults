@@ -153,20 +153,47 @@ class ShakerMakerData:
             self.gf_time = np.arange(gf_orig[0], gf_orig[-1], dt)
             self._resample_cache = {'time_orig': t_orig, 'gf_time_orig': gf_orig}
 
-        # Precompute vmax for animation colour limits
-        self._vmax = {}
+        # ------------------------------------------------------------------
+        # RAM awareness — compute bytes per node and set large-file flag.
+        # Methods that need all-node data use self._large_file to decide
+        # between fast (pre-load RAM) and safe (chunk HDF5) modes.
+        # ------------------------------------------------------------------
+        import psutil as _psutil
+        self._bytes_per_node  = int(3 * n_time_data * 8)   # 3 components, float64
+        _total_data_bytes     = self._bytes_per_node * n_nodes * 3  # vel+accel+disp
+        _mem_available        = _psutil.virtual_memory().available
+        self._large_file      = _total_data_bytes > _mem_available * 0.5
+
+        # ------------------------------------------------------------------
+        # Precompute vmax for animation colour limits.
+        # Chunk-based reading — never loads more than _chunk_rows rows at a
+        # time.  Default 600 rows: 600 * n_time_data * 8 ~ 96 MB per iter.
+        # ------------------------------------------------------------------
+        self._vmax    = {}
+        _chunk_rows   = 600
         with h5py.File(filename, 'r') as f:
-            for dtype, pkey in [('accel','acceleration'),('vel','velocity'),('disp','displacement')]:
+            for dtype, pkey in [('accel', 'acceleration'),
+                                 ('vel',   'velocity'),
+                                 ('disp',  'displacement')]:
                 path = f'{data_grp}/{pkey}'
-                if path in f:
-                    d = f[path][:]
-                    e_d = d[0::3,:]; n_d = d[1::3,:]; z_d = d[2::3,:]
-                    self._vmax[dtype] = {
-                        'e': float(np.abs(e_d).max()),
-                        'n': float(np.abs(n_d).max()),
-                        'z': float(np.abs(z_d).max()),
-                        'resultant': float(np.sqrt(e_d**2+n_d**2+z_d**2).max()),
-                    }
+                if path not in f:
+                    continue
+                ds     = f[path]
+                n_rows = ds.shape[0]
+                e_max = n_max = z_max = r_max = 0.0
+                for _s in range(0, n_rows, _chunk_rows):
+                    _e  = min(_s + _chunk_rows, n_rows)
+                    d   = ds[_s:_e, :]
+                    e_d = d[0::3, :]; n_d = d[1::3, :]; z_d = d[2::3, :]
+                    e_max = max(e_max, float(np.abs(e_d).max()))
+                    n_max = max(n_max, float(np.abs(n_d).max()))
+                    z_max = max(z_max, float(np.abs(z_d).max()))
+                    r_max = max(r_max,
+                                float(np.sqrt(e_d**2 + n_d**2 + z_d**2).max()))
+                self._vmax[dtype] = {
+                    'e': e_max, 'n': n_max,
+                    'z': z_max, 'resultant': r_max,
+                }
         sep = '--' * 50
         is_surface = self.is_drm and not np.any(self.internal)
         type_str   = 'SurfaceGrid' if is_surface else ('DRM' if self.is_drm else 'Station')
@@ -194,6 +221,21 @@ class ShakerMakerData:
         mem = psutil.virtual_memory()
         print(f"  RAM      : {mem.used/1e9:.1f} GB used  |  "
               f"{mem.available/1e9:.1f} GB free  |  {mem.percent:.1f}%")
+        with h5py.File(filename, 'r') as f:
+            total_size = 0
+            print(f"  File size:")
+            for key in f[data_grp].keys():
+                ds = f[f'{data_grp}/{key}']
+                if hasattr(ds, 'shape') and len(ds.shape) > 1:
+                    size_gb = ds.nbytes / 1e9
+                    total_size += size_gb
+                    print(f"    {key:<20} {ds.shape}  {size_gb:.2f} GB")
+            print(f"    {'TOTAL':<20}              {total_size:.2f} GB")
+
+        if self._large_file:
+            print(f"  WARNING  : File data ({_total_data_bytes/1e9:.1f} GB) exceeds "
+                  f"50% of available RAM ({_mem_available/1e9:.1f} GB). "
+                  f"Surface methods will use safe chunk mode automatically.")
         print(sep + '\n')
 
     # ------------------------------------------------------------------
@@ -316,8 +358,29 @@ class ShakerMakerData:
         mode   = "O(1) pair_to_slot" if self._use_pair_to_slot else "KDTree"
         print(f"  GF DB ({mode}): {n_slots} slots  |  {len(unique)}/{self._n_nodes} computed "
               f"({(1-len(unique)/self._n_nodes)*100:.1f}% reduction)")
+
+        with h5py.File(h5_path, 'r') as f:
+            total_size = 0
+            # Detect available data types from first slot
+            slot_keys = [k for k in f['tdata_dict'].keys() if not k.endswith('_t0')]
+            data_keys = sorted(set(k.split('_', 1)[1] for k in slot_keys))
+            print(f"  GF file contents:")
+            print(f"    slots          : {n_slots}")
+            print(f"    data per slot  : {data_keys}")
+            for dk in data_keys:
+                example = f[f'tdata_dict/0_{dk}']
+                size_total = example.nbytes * n_slots / 1e9
+                total_size += size_total
+                print(f"    {dk:<20} shape={example.shape}  "
+                      f"dtype={example.dtype}  total={size_total:.2f} GB")
+            print(f"    {'TOTAL':<20}              {total_size:.2f} GB")
+
+        import psutil
+        mem = psutil.virtual_memory()
+        print(f"  RAM      : {mem.used/1e9:.1f} GB used  |  "
+              f"{mem.available/1e9:.1f} GB free  |  {mem.percent:.1f}%")
         print(f"Done.")
-    
+
 
     def _get_slot(self, node_id, subfault_id):
         """Return GF slot index for (node_id, subfault_id).
@@ -716,6 +779,57 @@ class ShakerMakerData:
         return int(self._pairs_to_compute[slot, 0])
 
 
+    # ------------------------------------------------------------------
+    # Interpolation fucntions 
+    # ------------------------------------------------------------------
+
+
+    def _interpolate_to_grid(self, x, y, z, mag, resolution=300, method='linear'):
+        """Interpolate scattered node data onto a regular 2-D grid.
+
+        Automatically detects the active plane (XY, XZ, or YZ) by finding
+        which axis has no variation. Returns the two active coordinate arrays,
+        the interpolated grid, and axis labels.
+
+        Parameters
+        ----------
+        x, y, z : np.ndarray, shape (N,)
+            Node coordinates in metres (already rotated).
+        mag : np.ndarray, shape (N,)
+            Scalar field to interpolate (velocity, acceleration, etc.).
+        resolution : int, default ``300``
+            Number of grid points along each axis.
+        method : {'linear', 'cubic', 'nearest'}, default ``'linear'``
+
+        Returns
+        -------
+        A, B : np.ndarray, shape (resolution, resolution)
+            Meshgrid of the two active axes.
+        Zi : np.ndarray, shape (resolution, resolution)
+            Interpolated field values.
+        albl, blbl : str
+            Axis labels for the two active axes.
+        """
+        from scipy.interpolate import griddata
+
+        x_range = x.max() - x.min()
+        y_range = y.max() - y.min()
+        z_range = z.max() - z.min()
+
+        if x_range < 1e-3:
+            a, b, albl, blbl = y, z, 'Y (m)', 'Z (m)'
+        elif y_range < 1e-3:
+            a, b, albl, blbl = x, z, 'X (m)', 'Z (m)'
+        else:
+            a, b, albl, blbl = x, y, 'X (m)', 'Y (m)'
+
+        ai = np.linspace(a.min(), a.max(), resolution)
+        bi = np.linspace(b.min(), b.max(), resolution)
+        Ai, Bi = np.meshgrid(ai, bi)
+        Zi = griddata((a, b), mag, (Ai, Bi), method=method)
+        return Ai, Bi, Zi, albl, blbl
+
+
 
     # ------------------------------------------------------------------
     # Plotting — single-object methods
@@ -817,36 +931,54 @@ class ShakerMakerData:
                             figsize=(10, 8),
                             factor=1.0,
                             filtered=False):
-
         """Plot time-history for one or more nodes.
 
         Parameters
         ----------
         node_id : int, str, or list, optional
-        target_pos : array-like (3,), optional
+            Single node index, ``'QA'``, or list of indices/``'QA'``.
+        target_pos : array-like (3,) or list of array-like, optional
+            Single position ``[x, y, z]`` or list of positions
+            ``[[x1,y1,z1], [x2,y2,z2], ...]`` in km.  The nearest node
+            to each position is resolved automatically.
         xlim : list, optional
         data_type : {'vel', 'accel', 'disp'}, default ``'vel'``
         figsize : tuple, default ``(10, 8)``
         factor : float, default ``1.0``
-            Scale factor applied to all signals before plotting.
         filtered : bool, default ``False``
-            Use filtered data (only applies when obj is StationData).
         """
-        nids   = self._collect_node_ids(node_id, target_pos)
-        ylabel = {'accel':'Acceleration','vel':'Velocity','disp':'Displacement'}[data_type]
+        # Resolve node IDs — handle list of positions
+        if target_pos is not None:
+            target_pos = np.asarray(target_pos)
+            if target_pos.ndim == 1:
+                # Single position [x, y, z]
+                nids = self._collect_node_ids(target_pos=target_pos)
+            else:
+                # Multiple positions [[x1,y1,z1], [x2,y2,z2], ...]
+                nids = []
+                for pos in target_pos:
+                    nids += self._collect_node_ids(target_pos=pos, print_info=True)
+        else:
+            nids = self._collect_node_ids(node_id=node_id)
+
+        ylabel = {'accel': 'Acceleration', 'vel': 'Velocity',
+                  'disp': 'Displacement'}[data_type]
         fig = plt.figure(figsize=figsize)
         for nid in nids:
             data, lbl = self._resolve_node(nid, data_type)
-            for k in range(1,4):
-                plt.subplot(3,1,k); plt.plot(self.time, data[k-1] * factor, linewidth=1, label=lbl)
-        for k,comp in enumerate(('Vertical (Z)','East (E)','North (N)'),1):
-            ax = plt.subplot(3,1,k)
-            ax.set_title(f'{comp} — {ylabel}',fontweight='bold')
+            for k in range(1, 4):
+                plt.subplot(3, 1, k)
+                plt.plot(self.time, data[k-1] * factor, linewidth=1, label=lbl)
+        for k, comp in enumerate(('Vertical (Z)', 'East (E)', 'North (N)'), 1):
+            ax = plt.subplot(3, 1, k)
+            ax.set_title(f'{comp} — {ylabel}', fontweight='bold')
             ax.set_xlabel('Time [s]'); ax.set_ylabel('Amplitude')
-            ax.grid(True,alpha=0.3); 
+            ax.grid(True, alpha=0.3)
             ax.legend(loc='upper right')
-            if xlim: ax.set_xlim(xlim)
-        plt.tight_layout(); plt.show()
+            if xlim:
+                ax.set_xlim(xlim)
+        plt.tight_layout()
+        plt.show()
 
 
 
@@ -1208,16 +1340,18 @@ class ShakerMakerData:
     # ------------------------------------------------------------------
     # Surface / animation methods  (primarily for SurfaceGrid outputs)
     # ------------------------------------------------------------------
-
+    
     def plot_surface(self, 
                     time=0.0, 
                     component='z', 
                     data_type='vel',
                     cmap='RdBu_r', 
                     figsize=(12,8),
-                    elev=30, azim=45, s=20, alpha=0.85,
-                    axis_equal=False,):
-
+                    elev=30, azim=-60, s=20, alpha=0.85,
+                    axis_equal=False,
+                    interpolate=False,
+                    interp_method='linear',
+                    interp_resolution=300):
         """Plot a 3-D scatter snapshot of the domain at a given time."""
         it = int(np.argmin(np.abs(self.time - time)))
         actual_t = self.time[it]
@@ -1230,37 +1364,57 @@ class ShakerMakerData:
             mag  = self.get_surface_snapshot(it, component, data_type)
             vmax = self._vmax[data_type][component.lower()]; vmin = -vmax
             clbl = {'z':'Vertical (Z)','e':'East (E)','n':'North (N)'}[component.lower()]
-        # x=self.xyz[:,0]*1000; y=self.xyz[:,1]*1000; z=self.xyz[:,2]*1000
 
         xyz_t = _rotate(self.xyz)
         x=xyz_t[:,0]; y=xyz_t[:,1]; z=xyz_t[:,2]
-        
-        fig = plt.figure(figsize=figsize); ax = fig.add_subplot(111,projection='3d')
-        ax.scatter(x,y,z,c='lightgray',s=s,alpha=0.3)
-        active = np.abs(mag) >= vmax*0.01
-        if active.any():
-            sc = ax.scatter(x[active],y[active],z[active],c=mag[active],
-                            cmap=cmap,s=s,alpha=alpha,vmin=vmin,vmax=vmax)
-            fig.colorbar(sc,ax=ax,shrink=0.5)
+
+        fig = plt.figure(figsize=figsize); ax = fig.add_subplot(111, projection='3d')
+        ax.scatter(x, y, z, c='lightgray', s=s, alpha=0.05)
+
+        if interpolate:
+            Ai, Bi, Zi, albl, blbl = self._interpolate_to_grid(
+                x, y, z, mag, resolution=interp_resolution, method=interp_method)
+            # Flatten interpolated grid back to scatter on 3D axes
+            Zi_flat = Zi.ravel()
+            valid   = ~np.isnan(Zi_flat)
+            # Reconstruct third coordinate (constant plane value)
+            x_range = x.max() - x.min()
+            y_range = y.max() - y.min()
+            if x_range < 1e-3:        # YZ plane
+                xs = np.full(Zi_flat.shape, x.mean())
+                ys = Ai.ravel(); zs = Bi.ravel()
+            elif y_range < 1e-3:      # XZ plane
+                xs = Ai.ravel(); ys = np.full(Zi_flat.shape, y.mean()); zs = Bi.ravel()
+            else:                     # XY plane
+                xs = Ai.ravel(); ys = Bi.ravel(); zs = np.full(Zi_flat.shape, z.mean())
+            sc = ax.scatter(xs[valid], ys[valid], zs[valid],
+                            c=Zi_flat[valid], cmap=cmap, s=s,
+                            alpha=alpha, vmin=vmin, vmax=vmax)
+        else:
+            active = np.abs(mag) >= vmax * 0.01
+            if active.any():
+                sc = ax.scatter(x[active], y[active], z[active], c=mag[active],
+                                cmap=cmap, s=s, alpha=alpha, vmin=vmin, vmax=vmax)
+
+        if 'sc' in dir():
+            fig.colorbar(sc, ax=ax, shrink=0.5)
 
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
         ax.grid(False)
-
         if axis_equal is True:
             ax.axis('equal')
-
-        ax.set_title(f'{self.name} | t={actual_t:.3f}s | {clbl}',fontweight='bold')
-        ax.view_init(elev=elev,azim=azim)
-        plt.tight_layout(); plt.show()
-
+        ax.set_title(f'{self.name} | t={actual_t:.3f}s | {clbl}', fontweight='bold')
+        ax.view_init(elev=elev, azim=azim)
+        plt.tight_layout()
+        plt.show()
 
 
     def create_animation(self, time_start=0.0, time_end=None, n_frames=50,
                          component='z', data_type='vel', cmap='RdBu_r',
                          figsize=(12,8), dpi=100, fps=10,
-                         elev=30, azim=45, s=20, alpha=0.85,
+                         elev=30, azim=-60, s=20, alpha=0.85,
                          ffmpeg_path=None, output_dir='animation', output_video='animation.mp4',
                          axis_equal=True, vmax_from_range=False):
 
@@ -1270,26 +1424,31 @@ class ShakerMakerData:
         if time_end is None: time_end = self.time[-1]
 
         if vmax_from_range:
-            i0 = int(np.argmin(np.abs(self.time - time_start)))
-            i1 = int(np.argmin(np.abs(self.time - time_end)))
+            i0   = int(np.argmin(np.abs(self.time - time_start)))
+            i1   = int(np.argmin(np.abs(self.time - time_end)))
             path = {'accel': f'{self._data_grp}/acceleration',
                     'vel':   f'{self._data_grp}/velocity',
                     'disp':  f'{self._data_grp}/displacement'}[data_type]
+            _chunk_rows = 600
+            vmax = 0.0
             with h5py.File(self.filename, 'r') as f:
-                d = f[path][:, i0:i1+1]
-            if component.lower() == 'resultant':
-                e = d[0::3,:]; n = d[1::3,:]; zc = d[2::3,:]
-                vmax = float(np.sqrt(e**2 + n**2 + zc**2).max()); vmin = 0
-            else:
-                row = {'e': 0, 'n': 1, 'z': 2}[component.lower()]
-                vmax = float(np.abs(d[row::3,:]).max()); vmin = -vmax
+                n_rows = f[path].shape[0]
+                for _s in range(0, n_rows, _chunk_rows):
+                    _e  = min(_s + _chunk_rows, n_rows)
+                    _d  = f[path][_s:_e, i0:i1+1]
+                    if component.lower() == 'resultant':
+                        _ed = _d[0::3,:]; _nd = _d[1::3,:]; _zd = _d[2::3,:]
+                        vmax = max(vmax,
+                                   float(np.sqrt(_ed**2+_nd**2+_zd**2).max()))
+                    else:
+                        _row = {'e': 0, 'n': 1, 'z': 2}[component.lower()]
+                        vmax = max(vmax, float(np.abs(_d[_row::3,:]).max()))
+            vmin = 0 if component.lower() == 'resultant' else -vmax
         else:
             if component.lower() == 'resultant':
                 vmax = self._vmax[data_type]['resultant']; vmin = 0
             else:
                 vmax = self._vmax[data_type][component.lower()]; vmin = -vmax
-
-        # x=self.xyz[:,0]*1000; y=self.xyz[:,1]*1000; z=self.xyz[:,2]*1000
 
         xyz_t = _rotate(self.xyz)
         x=xyz_t[:,0]; y=xyz_t[:,1]; z=xyz_t[:,2]
@@ -1303,7 +1462,7 @@ class ShakerMakerData:
             else:
                 mag = self.get_surface_snapshot(it, component, data_type)
             fig = plt.figure(figsize=figsize); ax = fig.add_subplot(111, projection='3d')
-            ax.scatter(x, y, z, c='lightgray', s=s, alpha=0.3)
+            ax.scatter(x, y, z, c='lightgray', s=s, alpha=0.05)
             active = np.abs(mag) >= vmax * 0.01
             if active.any():
                 ax.scatter(x[active], y[active], z[active], c=mag[active],
@@ -1338,7 +1497,7 @@ class ShakerMakerData:
                                 time_start=0.0, time_end=None, n_frames=50,
                                 component='z', data_type='vel', cmap='RdBu_r',
                                 figsize=(12,8), dpi=100, fps=10,
-                                elev=30, azim=45, s=50, alpha=0.85,
+                                elev=30, azim=-60, s=50, alpha=0.85,
                                 ffmpeg_path= None,
                                 output_dir='animation_plane',
                                 output_video='animation_plane.mp4',
@@ -1373,14 +1532,27 @@ class ShakerMakerData:
             path={'accel':f'{self._data_grp}/acceleration',
                   'vel':f'{self._data_grp}/velocity',
                   'disp':f'{self._data_grp}/displacement'}[data_type]
+            _chunk_rows = 600
+            vmax = 0.0
             with h5py.File(self.filename,'r') as f:
-                d = f[path][:,i0:i1+1]
-            if component.lower()=='resultant':
-                e=d[0::3,:][pidx]; n=d[1::3,:][pidx]; zc=d[2::3,:][pidx]
-                vmax=float(np.sqrt(e**2+n**2+zc**2).max()); vmin=0
-            else:
-                row={'e':0,'n':1,'z':2}[component.lower()]
-                vmax=float(np.abs(d[row::3,:][pidx]).max()); vmin=-vmax
+                n_rows = f[path].shape[0]
+                for _s in range(0, n_rows, _chunk_rows):
+                    _e  = min(_s + _chunk_rows, n_rows)
+                    _d  = f[path][_s:_e, i0:i1+1]
+                    _pidx_chunk = pidx[(pidx >= _s) & (pidx < _e)] - _s
+                    if len(_pidx_chunk) == 0:
+                        continue
+                    if component.lower()=='resultant':
+                        _ed=_d[0::3,:][_pidx_chunk]
+                        _nd=_d[1::3,:][_pidx_chunk]
+                        _zd=_d[2::3,:][_pidx_chunk]
+                        vmax=max(vmax,
+                                 float(np.sqrt(_ed**2+_nd**2+_zd**2).max()))
+                    else:
+                        _row={'e':0,'n':1,'z':2}[component.lower()]
+                        vmax=max(vmax,
+                                 float(np.abs(_d[_row::3,:][_pidx_chunk]).max()))
+            vmin = 0 if component.lower()=='resultant' else -vmax
         else:
             if component.lower()=='resultant':
                 vmax=self._vmax[data_type]['resultant']; vmin=0
@@ -1501,33 +1673,52 @@ class ShakerMakerData:
                              factor=1.0,
                              cmap='hot_r',
                              figsize=(12, 8),
-                             elev=30, azim=45,
+                             elev=30, azim=-60,
                              s=20, alpha=0.85,
                              axis_equal=False,
                              n_jobs=-1):
         """Plot a 3-D scatter map of spectral values at a given period T.
 
-        Full spectra (Z, E, N) are cached per data_type only. Changing
-        component, T_target, factor, spectral_type, or any plot parameter
-        is instantaneous. Only changing data_type triggers recomputation.
+        Full spectra (Z, E, N) for all spectral quantities are computed once
+        and cached per ``data_type``.  Subsequent calls with the same
+        ``data_type`` are instantaneous regardless of changes to ``T_target``,
+        ``component``, ``spectral_type``, ``factor``, or any plot parameter.
+        Only changing ``data_type`` triggers a full recomputation.
+
+        The method automatically selects the loading strategy based on
+        available RAM:
+
+        - **fast/preload** — all node data is loaded into RAM before the
+          parallel pool starts.  Used when the data fits comfortably in RAM.
+        - **safe/chunk**   — each parallel worker opens the HDF5 file and
+          reads only its own node (~0.5 MB).  Peak RAM is proportional to
+          ``n_jobs``, not to the number of nodes.  Used for large files.
+
+        Window masks (``get_window``) and resampling (``resample``) are
+        respected in both modes.
 
         Parameters
         ----------
         T_target : float, default ``0.0``
-            Target period in seconds. Use ``0.0`` for PGA.
+            Target period in seconds.  Use ``0.0`` to obtain the PGA map.
         component : {'z', 'e', 'n', 'resultant'}, default ``'z'``
+            Signal component used to compute the spectrum.  ``'resultant'``
+            averages the spectra of Z, E, and N.
         data_type : {'accel', 'vel', 'disp'}, default ``'accel'``
         spectral_type : {'PSa', 'Sa', 'PSv', 'Sv', 'Sd'}, default ``'PSa'``
         factor : float, default ``1.0``
-            Multiplier applied to spectral values before plotting.
+            Multiplier applied to every spectral value before plotting.
         cmap : str, default ``'hot_r'``
-        figsize : tuple, default ``(12, 8)``
+        figsize : tuple of float, default ``(12, 8)``
         elev, azim : float
+            3-D view angles.
         s : int, default ``20``
+            Scatter marker size.
         alpha : float, default ``0.85``
         axis_equal : bool, default ``False``
         n_jobs : int, default ``-1``
-            Number of parallel workers. ``-1`` uses all available CPUs.
+            Number of parallel workers.  ``-1`` uses all CPUs,
+            ``-2`` uses all minus one.
         """
         from joblib import Parallel, delayed
 
@@ -1536,7 +1727,8 @@ class ShakerMakerData:
         comp      = component.lower()
         cache_key = (data_type,)
 
-        # Cache check
+        # Cache check — keyed only on data_type so all spectral quantities
+        # and components are available without recomputing.
         if not hasattr(self, '_newmark_cache'):
             self._newmark_cache = {}
 
@@ -1544,21 +1736,67 @@ class ShakerMakerData:
             print(f"  Cache hit — using stored spectra for {data_type}")
             T_array, sa_full = self._newmark_cache[cache_key]
         else:
-            print(f"Computing spectra for {n} nodes using n_jobs={n_jobs}...")
-            print("  Loading data into memory...")
-            all_data = np.zeros((n, 3, len(self.time)))
-            for i in range(n):
-                all_data[i] = self.get_node_data(i, data_type)
-            print("  Data loaded. Computing spectra...")
+            import psutil as _psutil
+            mem_available = _psutil.virtual_memory().available
+            data_needed   = self._bytes_per_node * n
+            use_safe_mode = self._large_file or (data_needed > mem_available * 0.6)
 
-            def _compute_spectrum(i):
-                data  = all_data[i]   # (3, Nt)
-                specs = [NewmarkSpectrumAnalyzer.compute(data[k], dt)
-                         for k in range(3)]
-                T  = specs[0]['T']
-                sa = {qty: np.array([sp[qty] for sp in specs])   # (3, n_periods)
-                      for qty in ('PSa', 'Sa', 'PSv', 'Sv', 'Sd')}
-                return T, sa
+            print(f"Computing spectra for {n} nodes  n_jobs={n_jobs}")
+            print(f"  Mode     : {'safe/chunk' if use_safe_mode else 'fast/preload'}"
+                  f"  ({data_needed/1e9:.1f} GB needed  |  "
+                  f"{mem_available/1e9:.1f} GB available)")
+
+            # Capture everything workers need — no self references inside
+            # worker functions to avoid serialisation issues with joblib.
+            _filename       = self.filename
+            _data_grp       = self._data_grp
+            _hdf5_path      = {'accel': f'{_data_grp}/acceleration',
+                               'vel':   f'{_data_grp}/velocity',
+                               'disp':  f'{_data_grp}/displacement'}[data_type]
+            _window_mask    = getattr(self, '_window_mask',    None)
+            _resample_cache = getattr(self, '_resample_cache', None)
+            _time_len       = len(self.time)
+
+            if use_safe_mode:
+                # Each worker reads its own node directly from HDF5.
+                # Peak RAM = n_jobs * bytes_per_node (a few MB at most).
+                def _compute_spectrum(i):
+                    with h5py.File(_filename, 'r') as _f:
+                        _d = _f[_hdf5_path][3*i : 3*i+3, :]
+                    _d = _d[[2, 0, 1], :]          # reorder E,N,Z -> Z,E,N
+                    if _window_mask is not None:
+                        _d = _d[:, _window_mask]
+                    elif _resample_cache is not None:
+                        _t_orig = _resample_cache['time_orig']
+                        _rs = np.zeros((3, _time_len))
+                        for _k in range(3):
+                            _rs[_k] = interp1d(_t_orig, _d[_k],
+                                               kind='linear',
+                                               fill_value='extrapolate')(
+                                np.linspace(_t_orig[0], _t_orig[-1], _time_len))
+                        _d = _rs
+                    specs = [NewmarkSpectrumAnalyzer.compute(_d[k], dt)
+                             for k in range(3)]
+                    T  = specs[0]['T']
+                    sa = {qty: np.array([sp[qty] for sp in specs])
+                          for qty in ('PSa', 'Sa', 'PSv', 'Sv', 'Sd')}
+                    return T, sa
+            else:
+                # Pre-load all data into RAM; workers read from the array.
+                print("  Loading data into memory...")
+                all_data = np.zeros((n, 3, len(self.time)))
+                for i in range(n):
+                    all_data[i] = self.get_node_data(i, data_type)
+                print("  Data loaded. Computing spectra...")
+
+                def _compute_spectrum(i):
+                    data  = all_data[i]
+                    specs = [NewmarkSpectrumAnalyzer.compute(data[k], dt)
+                             for k in range(3)]
+                    T  = specs[0]['T']
+                    sa = {qty: np.array([sp[qty] for sp in specs])
+                          for qty in ('PSa', 'Sa', 'PSv', 'Sv', 'Sd')}
+                    return T, sa
 
             results = Parallel(n_jobs=n_jobs, verbose=5)(
                 delayed(_compute_spectrum)(i) for i in range(n))
@@ -1571,7 +1809,8 @@ class ShakerMakerData:
             self._newmark_cache[cache_key] = (T_array, sa_full)
             print(f"Done. All spectral quantities cached for {data_type}")
 
-        # Apply component, T_target, spectral_type and factor
+        # Apply component, T_target, spectral_type and factor.
+        # This is pure numpy interpolation — instantaneous.
         sp_data = sa_full[spectral_type]   # (n_nodes, 3, n_periods)
 
         if comp == 'resultant':
@@ -1588,7 +1827,7 @@ class ShakerMakerData:
         print(f"  {spectral_type}(T={T_target}s) | {comp} | factor={factor}  "
               f"Max={sa_map.max():.4f}  Min={sa_map.min():.4f}")
 
-        # Plot 
+        # Plot
         xyz_t = _rotate(self.xyz)
         x = xyz_t[:, 0]; y = xyz_t[:, 1]; z = xyz_t[:, 2]
         clbl  = {'z': 'Vertical (Z)', 'e': 'East (E)',
@@ -1596,8 +1835,9 @@ class ShakerMakerData:
 
         fig = plt.figure(figsize=figsize)
         ax  = fig.add_subplot(111, projection='3d')
+        sa_map = np.nan_to_num(sa_map, nan=0.0)
         sc  = ax.scatter(x, y, z, c=sa_map, cmap=cmap, s=s, alpha=alpha,
-                         vmin=0, vmax=sa_map.max())
+                 vmin=0, vmax=np.nanmax(sa_map))
         fig.colorbar(sc, ax=ax, shrink=0.5,
                      label=f'{spectral_type}(T={T_target}s)')
 
@@ -1618,30 +1858,42 @@ class ShakerMakerData:
                            factor=1.0,
                            cmap='hot_r',
                            figsize=(12, 8),
-                           elev=30, azim=45,
+                           elev=30, azim=-60,
                            s=20, alpha=0.85,
                            axis_equal=False,
                            n_jobs=-1):
         """Plot a 3-D scatter map of Arias intensity for every node.
 
-        Full Arias intensity is cached per data_type only. Changing
-        component, factor, or any plot parameter is instantaneous.
-        Only changing data_type triggers recomputation.
+        Arias intensity (Z, E, N) is computed once and cached per
+        ``data_type``.  Subsequent calls with the same ``data_type`` are
+        instantaneous.  Only changing ``data_type`` triggers recomputation.
+
+        The method automatically selects the loading strategy based on
+        available RAM (same logic as ``plot_surface_newmark``):
+
+        - **fast/preload** — all node data loaded into RAM before the pool.
+        - **safe/chunk**   — each worker reads only its own node from HDF5.
+
+        Window masks (``get_window``) and resampling (``resample``) are
+        respected in both modes.
 
         Parameters
         ----------
         component : {'z', 'e', 'n', 'resultant'}, default ``'z'``
+            Component to display.  ``'resultant'`` averages Z, E, N.
         data_type : {'accel', 'vel', 'disp'}, default ``'accel'``
         factor : float, default ``1.0``
-            Multiplier applied to Arias values before plotting.
+            Multiplier applied to every Arias value before plotting.
         cmap : str, default ``'hot_r'``
-        figsize : tuple, default ``(12, 8)``
+        figsize : tuple of float, default ``(12, 8)``
         elev, azim : float
+            3-D view angles.
         s : int, default ``20``
+            Scatter marker size.
         alpha : float, default ``0.85``
         axis_equal : bool, default ``False``
         n_jobs : int, default ``-1``
-            Number of parallel workers. ``-1`` uses all available CPUs.
+            Number of parallel workers.  ``-1`` uses all CPUs.
         """
         from joblib import Parallel, delayed
         from EarthquakeSignal.core.arias_intensity import AriasIntensityAnalyzer
@@ -1651,7 +1903,7 @@ class ShakerMakerData:
         comp      = component.lower()
         cache_key = (data_type, 'arias')
 
-        # Cache check
+        # Cache check — keyed on (data_type, 'arias').
         if not hasattr(self, '_newmark_cache'):
             self._newmark_cache = {}
 
@@ -1659,31 +1911,78 @@ class ShakerMakerData:
             print(f"  Cache hit — using stored Arias for {data_type}")
             ia_full = self._newmark_cache[cache_key]
         else:
-            print(f"Computing Arias intensity for {n} nodes using n_jobs={n_jobs}...")
-            print("  Loading data into memory...")
-            all_data = np.zeros((n, 3, len(self.time)))
-            for i in range(n):
-                all_data[i] = self.get_node_data(i, data_type)
-            print("  Data loaded. Computing Arias intensity...")
+            import psutil as _psutil
+            mem_available = _psutil.virtual_memory().available
+            data_needed   = self._bytes_per_node * n
+            use_safe_mode = self._large_file or (data_needed > mem_available * 0.6)
 
-            def _compute_arias(i):
-                data = all_data[i]   # (3, Nt)
-                ia   = np.zeros(3)
-                for k in range(3):
-                    _, _, _, ia_total, _ = AriasIntensityAnalyzer.compute(
-                        data[k] / 9.81, dt)
-                    ia[k] = ia_total
-                return ia   # (3,)
+            print(f"Computing Arias intensity for {n} nodes  n_jobs={n_jobs}")
+            print(f"  Mode     : {'safe/chunk' if use_safe_mode else 'fast/preload'}"
+                  f"  ({data_needed/1e9:.1f} GB needed  |  "
+                  f"{mem_available/1e9:.1f} GB available)")
+
+            # Capture state for workers — no self references.
+            _filename       = self.filename
+            _data_grp       = self._data_grp
+            _hdf5_path      = {'accel': f'{_data_grp}/acceleration',
+                               'vel':   f'{_data_grp}/velocity',
+                               'disp':  f'{_data_grp}/displacement'}[data_type]
+            _window_mask    = getattr(self, '_window_mask',    None)
+            _resample_cache = getattr(self, '_resample_cache', None)
+            _time_len       = len(self.time)
+
+            if use_safe_mode:
+                # Each worker reads its own node directly from HDF5.
+                # AriasIntensityAnalyzer imported inside worker to avoid
+                # serialisation issues with joblib LokyBackend.
+                def _compute_arias(i):
+                    from EarthquakeSignal.core.arias_intensity import \
+                        AriasIntensityAnalyzer as _AIA
+                    with h5py.File(_filename, 'r') as _f:
+                        _d = _f[_hdf5_path][3*i : 3*i+3, :]
+                    _d = _d[[2, 0, 1], :]          # reorder E,N,Z -> Z,E,N
+                    if _window_mask is not None:
+                        _d = _d[:, _window_mask]
+                    elif _resample_cache is not None:
+                        _t_orig = _resample_cache['time_orig']
+                        _rs = np.zeros((3, _time_len))
+                        for _k in range(3):
+                            _rs[_k] = interp1d(_t_orig, _d[_k],
+                                               kind='linear',
+                                               fill_value='extrapolate')(
+                                np.linspace(_t_orig[0], _t_orig[-1], _time_len))
+                        _d = _rs
+                    ia = np.zeros(3)
+                    for k in range(3):
+                        _, _, _, ia_total, _ = _AIA.compute(_d[k] / 9.81, dt)
+                        ia[k] = ia_total
+                    return ia
+            else:
+                # Pre-load all data into RAM; workers read from the array.
+                print("  Loading data into memory...")
+                all_data = np.zeros((n, 3, len(self.time)))
+                for i in range(n):
+                    all_data[i] = self.get_node_data(i, data_type)
+                print("  Data loaded. Computing Arias intensity...")
+
+                def _compute_arias(i):
+                    data = all_data[i]
+                    ia   = np.zeros(3)
+                    for k in range(3):
+                        _, _, _, ia_total, _ = AriasIntensityAnalyzer.compute(
+                            data[k] / 9.81, dt)
+                        ia[k] = ia_total
+                    return ia
 
             results = Parallel(n_jobs=n_jobs, verbose=5)(
                 delayed(_compute_arias)(i) for i in range(n))
 
-            # ia_full shape: (n_nodes, 3)  — columns: Z, E, N
+            # ia_full shape: (n_nodes, 3) — columns: Z, E, N
             ia_full = np.array(results)
             self._newmark_cache[cache_key] = ia_full
             print(f"Done. Arias intensity cached for {data_type}")
 
-        # Apply component and factor
+        # Apply component and factor — instantaneous.
         if comp == 'resultant':
             ia_map = np.mean(ia_full, axis=1) * factor
         else:
@@ -1701,9 +2000,10 @@ class ShakerMakerData:
 
         fig = plt.figure(figsize=figsize)
         ax  = fig.add_subplot(111, projection='3d')
+        ia_map = np.nan_to_num(ia_map, nan=0.0)
         sc  = ax.scatter(x, y, z, c=ia_map, cmap=cmap, s=s, alpha=alpha,
-                         vmin=0, vmax=ia_map.max())
-        fig.colorbar(sc, ax=ax, shrink=0.5, label=f'Arias Intensity [m/s] ')
+                 vmin=0, vmax=np.nanmax(ia_map))
+        fig.colorbar(sc, ax=ax, shrink=0.5, label='Arias Intensity [m/s]')
 
         ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
         ax.grid(False)
