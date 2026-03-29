@@ -165,35 +165,25 @@ class ShakerMakerData:
         self._large_file      = _total_data_bytes > _mem_available * 0.5
 
         # ------------------------------------------------------------------
-        # Precompute vmax for animation colour limits.
-        # Chunk-based reading — never loads more than _chunk_rows rows at a
-        # time.  Default 600 rows: 600 * n_time_data * 8 ~ 96 MB per iter.
+        # _vmax — lazy loading with sidecar cache.
+        # On first use (plot_surface, create_animation, etc.) _compute_vmax()
+        # is called, computes by chunks, stores in self._vmax, and writes a
+        # small JSON sidecar next to the HDF5 file so future sessions load
+        # it instantly without touching the data.
         # ------------------------------------------------------------------
-        self._vmax    = {}
-        _chunk_rows   = 600
-        with h5py.File(filename, 'r') as f:
-            for dtype, pkey in [('accel', 'acceleration'),
-                                 ('vel',   'velocity'),
-                                 ('disp',  'displacement')]:
-                path = f'{data_grp}/{pkey}'
-                if path not in f:
-                    continue
-                ds     = f[path]
-                n_rows = ds.shape[0]
-                e_max = n_max = z_max = r_max = 0.0
-                for _s in range(0, n_rows, _chunk_rows):
-                    _e  = min(_s + _chunk_rows, n_rows)
-                    d   = ds[_s:_e, :]
-                    e_d = d[0::3, :]; n_d = d[1::3, :]; z_d = d[2::3, :]
-                    e_max = max(e_max, float(np.abs(e_d).max()))
-                    n_max = max(n_max, float(np.abs(n_d).max()))
-                    z_max = max(z_max, float(np.abs(z_d).max()))
-                    r_max = max(r_max,
-                                float(np.sqrt(e_d**2 + n_d**2 + z_d**2).max()))
-                self._vmax[dtype] = {
-                    'e': e_max, 'n': n_max,
-                    'z': z_max, 'resultant': r_max,
-                }
+        self._vmax             = None   # computed on demand
+        self._vmax_cache_path  = filename + '.vmax.json'
+        self._data_grp_for_vmax = data_grp
+
+        # Try loading from sidecar cache — instantaneous
+        import json as _json
+        if os.path.exists(self._vmax_cache_path):
+            try:
+                with open(self._vmax_cache_path, 'r') as _cf:
+                    self._vmax = _json.load(_cf)
+                print(f"  vmax cache loaded from sidecar.")
+            except Exception:
+                self._vmax = None   # corrupted cache — recompute on demand
         sep = '--' * 50
         is_surface = self.is_drm and not np.any(self.internal)
         type_str   = 'SurfaceGrid' if is_surface else ('DRM' if self.is_drm else 'Station')
@@ -381,6 +371,59 @@ class ShakerMakerData:
               f"{mem.available/1e9:.1f} GB free  |  {mem.percent:.1f}%")
         print(f"Done.")
 
+
+
+    def _compute_vmax(self):
+        """Compute and cache vmax for animation colour limits.
+
+        Reads the HDF5 file in chunks to avoid loading everything into RAM.
+        Results are stored in ``self._vmax`` (in-session RAM cache) and
+        written to a small JSON sidecar file next to the HDF5 so that
+        future sessions load it instantly without touching the data.
+
+        Called automatically by ``plot_surface``, ``create_animation``, and
+        ``create_animation_plane`` the first time they need colour limits.
+        After the first call in a session, ``self._vmax`` is already set and
+        this method is never called again.
+        """
+        import json
+        data_grp    = self._data_grp_for_vmax
+        _chunk_rows = 120   # 120 * n_time_data * 8 bytes per chunk
+        print(f"  Computing vmax (chunk mode, {_chunk_rows} rows/chunk)...")
+        vmax = {}
+        with h5py.File(self.filename, 'r') as f:
+            for dtype, pkey in [('accel', 'acceleration'),
+                                 ('vel',   'velocity'),
+                                 ('disp',  'displacement')]:
+                path = f'{data_grp}/{pkey}'
+                if path not in f:
+                    continue
+                ds     = f[path]
+                n_rows = ds.shape[0]
+                e_max = n_max = z_max = r_max = 0.0
+                for _s in range(0, n_rows, _chunk_rows):
+                    _e  = min(_s + _chunk_rows, n_rows)
+                    d   = ds[_s:_e, :]
+                    e_d = d[0::3, :]; n_d = d[1::3, :]; z_d = d[2::3, :]
+                    e_max = max(e_max, float(np.abs(e_d).max()))
+                    n_max = max(n_max, float(np.abs(n_d).max()))
+                    z_max = max(z_max, float(np.abs(z_d).max()))
+                    r_max = max(r_max,
+                                float(np.sqrt(e_d**2 + n_d**2 + z_d**2).max()))
+                vmax[dtype] = {
+                    'e': e_max, 'n': n_max,
+                    'z': z_max, 'resultant': r_max,
+                }
+
+        self._vmax = vmax
+
+        # Write sidecar cache
+        try:
+            with open(self._vmax_cache_path, 'w') as cf:
+                json.dump(vmax, cf)
+            print(f"  vmax cached to: {self._vmax_cache_path}")
+        except Exception as e:
+            print(f"  vmax cache write failed (read-only filesystem?): {e}")
 
     def _get_slot(self, node_id, subfault_id):
         """Return GF slot index for (node_id, subfault_id).
@@ -1353,6 +1396,9 @@ class ShakerMakerData:
                     interp_method='linear',
                     interp_resolution=300):
         """Plot a 3-D scatter snapshot of the domain at a given time."""
+        # Ensure vmax is computed
+        if self._vmax is None:
+            self._compute_vmax()
         it = int(np.argmin(np.abs(self.time - time)))
         actual_t = self.time[it]
         if component.lower() == 'resultant':
@@ -1419,6 +1465,9 @@ class ShakerMakerData:
                          axis_equal=True, vmax_from_range=False):
 
         """Create a 3-D scatter animation of the full domain."""
+        # Ensure vmax is computed
+        if self._vmax is None:
+            self._compute_vmax()
         import subprocess
         os.makedirs(output_dir, exist_ok=True)
         if time_end is None: time_end = self.time[-1]
@@ -1505,6 +1554,9 @@ class ShakerMakerData:
                                 axis_equal=True):
 
         """Create a 3-D animation of a planar slice through the domain."""
+        # Ensure vmax is computed
+        if self._vmax is None:
+            self._compute_vmax()
         import subprocess
         os.makedirs(output_dir, exist_ok=True)
         if time_end is None: time_end = self.time[-1]
