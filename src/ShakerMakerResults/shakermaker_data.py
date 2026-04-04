@@ -121,6 +121,14 @@ class ShakerMakerData:
 
         self._node_cache = {}; self._gf_cache = {}; self._spectrum_cache = {}
 
+        # --- NEW: GF + MAP paths ---
+        self._gf_h5_path = None
+        self._gf_map_h5_path = None
+
+        # --- NEW: flags ---
+        self._has_gf = False
+        self._has_map = False
+
         # GF state — OP pipeline
         self._gf_loaded        = False
         self._pair_to_slot     = None
@@ -148,9 +156,9 @@ class ShakerMakerData:
         else:
             self.dt   = dt
             t_orig    = np.arange(n_time_data) * dt_orig + tstart
-            gf_orig   = np.arange(n_time_gf)   * dt_orig
+            gf_orig   = np.arange(n_time_gf) * dt_orig
             self.time    = np.arange(t_orig[0],  t_orig[-1],  dt)
-            self.gf_time = np.arange(gf_orig[0], gf_orig[-1], dt)
+            self.gf_time = np.arange(gf_orig[0], gf_orig[-1], dt) if len(gf_orig) > 0 else np.array([])
             self._resample_cache = {'time_orig': t_orig, 'gf_time_orig': gf_orig}
 
         # ------------------------------------------------------------------
@@ -275,10 +283,10 @@ class ShakerMakerData:
                 self.gf_db_delta_v_src = self._delta_v_src
 
                 self._gf_loaded = True
+                self._has_map   = True 
                 unique = np.unique(self._pairs_to_compute[:, 0])
                 mode   = "O(1) pair_to_slot" if self._use_pair_to_slot else "KDTree"
-                print(f"  GF DB ({mode}): {len(unique)}/{self._n_nodes} computed "
-                      f"({(1-len(unique)/self._n_nodes)*100:.1f}% reduction)")
+                print(f"  GF DB ({mode}): ...")
                 return
 
             #  Legacy: Node_Mapping 
@@ -288,89 +296,59 @@ class ShakerMakerData:
                 print("  GF mapping loaded (legacy Node_Mapping).")
 
     def load_gf_database(self, h5_path):
-        """Load GF database (.h5) produced by Stage 0/1 into memory.
-
-        Reads GF_Database_Info metadata and GF timeseries directly from
-        the source file without modifying any file on disk.
-
-        Parameters
-        ----------
-        h5_path : str
-            Path to the GF database file produced by Stage 0/1.
-        """
-        print(f"Loading GF database: {h5_path}")
+        """Load GF file (NEW OP format: /tdata shape=(n_slots,nt,9), /t0)."""
         self._gf_h5_path = h5_path
 
         with h5py.File(h5_path, 'r') as f:
+            if 'tdata' not in f:
+                raise ValueError("Unsupported GF format: expected dataset 'tdata'")
+            self._tdata_shape    = f['tdata'].shape   # (n_slots, nt, 9)
+            self._nt_gf          = self._tdata_shape[1]
+            self._t0_available   = 't0' in f
+
+        self._has_gf = True
+        print(f"  GF loaded: {self._tdata_shape[0]} slots, nt={self._nt_gf}")
+        print(f"  t0 available: {self._t0_available}")
+
+
+
+    def load_map(self, h5_path):
+        """Load mapping file (NEW OP format)."""
+        self._gf_map_h5_path = h5_path
+
+        with h5py.File(h5_path, 'r') as f:
             self._pairs_to_compute = f['pairs_to_compute'][:]
+            self._pair_to_slot     = f['pair_to_slot'][:]
+            self._dh_of_pairs      = f['dh_of_pairs'][:]
+            self._zsrc_of_pairs    = f['zsrc_of_pairs'][:]
+            self._zrec_of_pairs    = f['zrec_of_pairs'][:]
             self._delta_h          = float(f['delta_h'][()])
             self._delta_v_src      = float(f['delta_v_src'][()])
             self._delta_v_rec      = float(f['delta_v_rec'][()])
-            self._nsources_db      = int(f['nsources'][()])
+            self._nsources         = int(f['nsources'][()])
+            self._nsources_db      = int(f['nsources'][()])  # ← ADD: needed by _get_slot
 
-            if 'pair_to_slot' in f:
-                self._pair_to_slot     = f['pair_to_slot'][:]
-                self._use_pair_to_slot = True
-            else:
-                dh   = f['dh_of_pairs'][:]
-                zsrc = f['zsrc_of_pairs'][:]
-                zrec = f['zrec_of_pairs'][:]
-                self._dh_slots   = dh
-                self._zsrc_slots = zsrc
-                pts = np.column_stack([dh   / self._delta_h,
-                                       zsrc / self._delta_v_src,
-                                       zrec / self._delta_v_rec])
-                self._ktree = cKDTree(pts)
-                self._use_pair_to_slot = False
+        self._has_map          = True
+        self._use_pair_to_slot = True   # ← ADD
+        self._gf_loaded        = True   # ← ADD: _get_slot checks this
 
-            self.gf_db_pairs       = self._pairs_to_compute
-            self.gf_db_dh          = f['dh_of_pairs'][:]
-            self.gf_db_zrec        = f['zrec_of_pairs'][:]
-            self.gf_db_zsrc        = f['zsrc_of_pairs'][:]
-            self.gf_db_delta_h     = self._delta_h
-            self.gf_db_delta_v_rec = self._delta_v_rec
-            self.gf_db_delta_v_src = self._delta_v_src
 
-            n_slots = len([k for k in f['tdata_dict'].keys()
-                           if k.endswith('_tdata')])
 
-        self._gf_cache  = {}
-        self._gf_loaded = True
-
-        n_time_gf = 0
-        with h5py.File(h5_path, 'r') as f:
-            if 'tdata_dict/0_tdata' in f:
-                n_time_gf = f['tdata_dict/0_tdata'].shape[0]
-        self._n_time_gf = n_time_gf
-        self.gf_time    = np.arange(n_time_gf) * self._dt_orig
-
-        unique = np.unique(self._pairs_to_compute[:, 0])
-        mode   = "O(1) pair_to_slot" if self._use_pair_to_slot else "KDTree"
-        print(f"  GF DB ({mode}): {n_slots} slots  |  {len(unique)}/{self._n_nodes} computed "
-              f"({(1-len(unique)/self._n_nodes)*100:.1f}% reduction)")
-
-        with h5py.File(h5_path, 'r') as f:
-            total_size = 0
-            # Detect available data types from first slot
-            slot_keys = [k for k in f['tdata_dict'].keys() if not k.endswith('_t0')]
-            data_keys = sorted(set(k.split('_', 1)[1] for k in slot_keys))
-            print(f"  GF file contents:")
-            print(f"    slots          : {n_slots}")
-            print(f"    data per slot  : {data_keys}")
-            for dk in data_keys:
-                example = f[f'tdata_dict/0_{dk}']
-                size_total = example.nbytes * n_slots / 1e9
-                total_size += size_total
-                print(f"    {dk:<20} shape={example.shape}  "
-                      f"dtype={example.dtype}  total={size_total:.2f} GB")
-            print(f"    {'TOTAL':<20}              {total_size:.2f} GB")
-
-        import psutil
-        mem = psutil.virtual_memory()
-        print(f"  RAM      : {mem.used/1e9:.1f} GB used  |  "
-              f"{mem.available/1e9:.1f} GB free  |  {mem.percent:.1f}%")
-        print(f"Done.")
-
+    # def _compute_vmax(self):
+    #     import json
+    #     print(f"  Computing vmax (hardcoded)...")
+    #     vmax = {
+    #         'accel': {'e': 10.0, 'n': 10.0, 'z': 10.0, 'resultant': 10.0},
+    #         'vel':   {'e': 10.0, 'n': 10.0, 'z': 10.0, 'resultant': 10.0},
+    #         'disp':  {'e': 10.0, 'n': 10.0, 'z': 10.0, 'resultant': 10.0},
+    #     }
+    #     self._vmax = vmax
+    #     try:
+    #         with open(self._vmax_cache_path, 'w') as cf:
+    #             json.dump(vmax, cf)
+    #         print(f"  vmax cached to: {self._vmax_cache_path}")
+    #     except Exception as e:
+    #         print(f"  vmax cache write failed: {e}")
 
 
     def _compute_vmax(self):
@@ -425,15 +403,17 @@ class ShakerMakerData:
         except Exception as e:
             print(f"  vmax cache write failed (read-only filesystem?): {e}")
 
+
+
+
     def _get_slot(self, node_id, subfault_id):
         """Return GF slot index for (node_id, subfault_id).
 
         Primary: O(1) flat array via pair_to_slot[node * nsources + subfault].
         Fallback: KDTree lookup for legacy databases.
         """
-        if not self._gf_loaded:
-            raise RuntimeError(
-                "GFs not loaded. Call load_gf_database('file.h5') first.")
+        if not self._has_map:
+            raise RuntimeError("Map not loaded. Call load_map('file_map.h5') first.")
         
         # Convertir 'QA' al índice real
         if node_id in ('QA', 'qa'):
@@ -523,67 +503,31 @@ class ShakerMakerData:
 
     def get_gf(self, node_id, subfault_id, component='z'):
         """Return Green's function time series for a node/subfault pair."""
-        
-        # Normalizar node_id para QA
-        node_id_key = node_id
-        if node_id in ('QA', 'qa'):
-            node_id_key = 'QA'
-            node_id_num = self._n_nodes
-        else:
-            node_id_num = node_id
-        
-        key = (node_id_key, subfault_id, component)
+        if not self._has_gf:
+            raise RuntimeError("GF not loaded. Call load_gf_database() first.")
+        if not self._has_map:
+            raise RuntimeError("Map not loaded. Call load_map() first.")
+
+        node_id_num = self._n_nodes if node_id in ('QA', 'qa') else node_id
+        key = (node_id, subfault_id, component)
+
         if key not in self._gf_cache:
+            slot     = self._get_slot(node_id_num, subfault_id)
+            comp_map = {'z': 0, 'e': 1, 'n': 2}
 
-            # OP pipeline
-            if self._gf_loaded:
-                slot = self._get_slot(node_id_num, subfault_id)
-                donor_n, donor_s = self._pairs_to_compute[slot]
-                if donor_n != node_id_num:
-                    print(f"  Node {node_id_key}/sub {subfault_id} → "
-                          f"slot {slot} (donor: {donor_n})")
-                with h5py.File(self._gf_h5_path, 'r') as f:
-                    tdata_path = f'tdata_dict/{slot}_tdata'
-                    if tdata_path not in f:
-                        raise KeyError(
-                            f"GF not found: {tdata_path}. "
-                            "Call load_gf_database() first.")
-                    if component == 'tdata':
-                        self._gf_cache[key] = f[tdata_path][:]
-                    elif component in ('z', 'e', 'n'):
-                        comp_path = f'tdata_dict/{slot}_{component}'
-                        if comp_path in f:
-                            self._gf_cache[key] = f[comp_path][:]
-                        else:
-                            comp_map = {'z': 0, 'e': 1, 'n': 2}
-                            self._gf_cache[key] = f[tdata_path][:, comp_map[component]]
-                    else:
-                        raise KeyError(f"Unknown component '{component}'.")
+            with h5py.File(self._gf_h5_path, 'r') as f:
+                tdata = f['tdata'][slot]    # shape (nt, 9)
+                t0    = float(f['t0'][slot]) if self._t0_available else 0.0
 
-            # Legacy Node_Mapping
-            elif self.node_mapping is not None:
-                if node_id_key == 'QA':
-                    raise KeyError("QA GFs not available in legacy format.")
-                mask = ((self.node_mapping[:, 0] == node_id_num) &
-                        (self.node_mapping[:, 1] == subfault_id))
-                idx = np.where(mask)[0]
-                if not len(idx):
-                    raise KeyError(f"Node {node_id_num}, subfault {subfault_id} "
-                                   "not in mapping")
-                ipair = self.node_mapping[idx[0], 2]
-                src_n, src_s = self.pairs_mapping[ipair]
-                if src_n != node_id_num:
-                    print(f"  Node {node_id_num}/sub {subfault_id} → donor {src_n}")
-                path = f'GF/sta_{src_n}/sub_{src_s}/{component}'
-                with h5py.File(self.filename, 'r') as f:
-                    if path not in f:
-                        raise KeyError(f"GF not found: {path}")
-                    self._gf_cache[key] = f[path][:]
+            if component == 'tdata':
+                self._gf_cache[key] = tdata
+            elif component in comp_map:
+                self._gf_cache[key] = tdata[:, comp_map[component]]
             else:
-                raise RuntimeError(
-                    "No GF data available. Call load_gf_database() first.")
+                raise KeyError(f"Unknown component '{component}'. Use 'z','e','n','tdata'.")
 
         return self._gf_cache[key]
+
 
 
 
@@ -632,7 +576,9 @@ class ShakerMakerData:
         mask = (self.time >= t_start) & (self.time <= t_end)
         new._window_mask = mask; new._n_time_data = int(mask.sum())
         new.time = self.time[mask]; new.name = f"{self.name} [{t_start}-{t_end}s]"
+        # new._node_cache = {}; new._gf_cache = {}; new._spectrum_cache = {}
         new._node_cache = {}; new._gf_cache = {}; new._spectrum_cache = {}
+        new._vmax = self._vmax
         print(f"Window [{t_start}, {t_end}]s → {new._n_time_data} samples")
         return new
 
@@ -647,12 +593,13 @@ class ShakerMakerData:
         new = ShakerMakerData.__new__(ShakerMakerData)
         for a, v in self.__dict__.items(): setattr(new, a, v)
         t_orig  = np.arange(self._n_time_data) * self._dt_orig + self._tstart
-        gf_orig = np.arange(self._n_time_gf)   * self._dt_orig
-        new.dt = dt
-        new.time    = np.arange(t_orig[0],  t_orig[-1],  dt)
-        new.gf_time = np.arange(gf_orig[0], gf_orig[-1], dt)
+        gf_orig = np.arange(self._n_time_gf) * self._dt_orig
+        new.gf_time = np.arange(gf_orig[0], gf_orig[-1], dt) if len(gf_orig) > 0 else np.array([])
+
         new._resample_cache = {'time_orig': t_orig, 'gf_time_orig': gf_orig}
+        # new._node_cache = {}; new._gf_cache = {}; new._spectrum_cache = {}
         new._node_cache = {}; new._gf_cache = {}; new._spectrum_cache = {}
+        new._vmax = self._vmax
 
         sep = '--' * 50
         print(sep)
@@ -1051,8 +998,7 @@ class ShakerMakerData:
             for sid in sub_ids:
                 slot = self._get_slot(nid_num, sid)
                 with h5py.File(self._gf_h5_path, 'r') as f:
-                    t0_path = f'tdata_dict/{slot}_t0'
-                    t0 = f[t0_path][()] if t0_path in f else 0.0
+                    t0 = float(f['t0'][slot]) if self._t0_available else 0.0
                 lbl = f'{nid_label}_S{sid}'
                 for k, comp in enumerate(('z', 'e', 'n'), 1):
                     gf_data = self.get_gf(nid, sid, comp)
@@ -1104,12 +1050,8 @@ class ShakerMakerData:
                 if donor != nid_num:
                     print(f"Node {nid_label}/sub {sid} → slot {slot} (donor {donor})")
                 with h5py.File(self._gf_h5_path, 'r') as f:
-                    tp = f'tdata_dict/{slot}_tdata'
-                    if tp not in f:
-                        continue
-                    tdata = f[tp][:]
-                    t0_path = f'tdata_dict/{slot}_t0'
-                    t0 = f[t0_path][()] if t0_path in f else 0.0
+                    tdata = f['tdata'][slot]    # shape (nt, 9)
+                    t0    = float(f['t0'][slot]) if self._t0_available else 0.0
                 time = np.arange(tdata.shape[0]) * self._dt_orig + t0
                 lbl = f'{nid_label}_S{sid}'
                 for j in range(9):
@@ -2065,11 +2007,494 @@ class ShakerMakerData:
         ax.view_init(elev=elev, azim=azim)
         plt.tight_layout()
         plt.show()
-
-
     
+    
+    
+    
+
+    def write_h5drm(self, name=None):
+        from tqdm import tqdm
+
+        orig_dir  = os.path.dirname(self.filename)
+        orig_base = os.path.splitext(os.path.basename(self.filename))[0]
+        if name is None:
+            t0_str = f"{self.time[0]:.1f}".replace('.', 'p')
+            t1_str = f"{self.time[-1]:.1f}".replace('.', 'p')
+            name   = f"{orig_base}_t{t0_str}_{t1_str}.h5drm"
+        out_path = os.path.join(orig_dir, name)
+        print(f"Writing: {out_path}")
+
+        data_grp = self._data_grp
+        meta_grp = self._meta_grp
+        qa_grp   = self._qa_grp
+
+        if hasattr(self, '_window_mask'):
+            col_idx = np.where(self._window_mask)[0]
+        else:
+            col_idx = np.arange(self._n_time_data)
+        c0, c1     = int(col_idx[0]), int(col_idx[-1]) + 1
+        n_time_out = c1 - c0
+
+        with h5py.File(self.filename, 'r') as fin, \
+            h5py.File(out_path, 'w') as fout:
+
+            fin.copy(meta_grp, fout)
+            fout[f'{meta_grp}/dt'][()]     = self._dt_orig
+            fout[f'{meta_grp}/tstart'][()] = float(self.time[0])
+            fout[f'{meta_grp}/tend'][()]   = float(self.time[-1])
+
+            for key in fin.keys():
+                if key not in (data_grp, meta_grp, qa_grp or ''):
+                    fin.copy(key, fout)
+
+            orig_vel_shape = fin[f'{data_grp}/velocity'].shape
+            fout.create_group(data_grp)
+
+            ts_keys = []
+            for key in fin[data_grp].keys():
+                ds = fin[f'{data_grp}/{key}']
+                if len(ds.shape) == 2 and ds.shape[1] == orig_vel_shape[1]:
+                    ts_keys.append(key)
+                else:
+                    fout[f'{data_grp}/{key}'] = ds[:]
+
+            if qa_grp and qa_grp in fin:
+                fout.create_group(qa_grp)
+                for key in fin[qa_grp].keys():
+                    ds = fin[f'{qa_grp}/{key}']
+                    if len(ds.shape) == 2 and ds.shape[1] == orig_vel_shape[1]:
+                        fout[f'{qa_grp}/{key}'] = ds[:, c0:c1]
+                    else:
+                        fout[f'{qa_grp}/{key}'] = ds[:]
+
+            # Single-file write with progress bar
+            for key in tqdm(ts_keys, desc='write_h5drm', unit='dataset'):
+                ds = fin[f'{data_grp}/{key}']
+                fout[data_grp].create_dataset(
+                    key, data=ds[:, c0:c1],
+                    dtype=ds.dtype, chunks=True)
+
+        size_gb = os.path.getsize(out_path) / 1e9
+        print(f"Done. {size_gb:.2f} GB")
+        return out_path
+
+
+
+
 # # ---------------------------------------------------------------------------
 # # Semantic aliases
 # # ---------------------------------------------------------------------------
 # DRMData     = ShakerMakerData   # DRMBox / PointCloudDRMReceiver
 # SurfaceData = ShakerMakerData   # SurfaceGrid
+
+
+    def plot_surface_on_map(self,
+                             mapa,
+                             time=0.0,
+                             component='resultant',
+                             data_type='vel',
+                             factor=1,
+                             cmap='RdBu_r',
+                             thresh_pct=0.01,
+                             radius=3,
+                             fill_opacity=0.85,
+                             crs_utm='EPSG:32719'):
+        """Overlay a single time snapshot on an existing Folium map.
+
+        Converts node coordinates from UTM to lon/lat and adds one
+        CircleMarker per active node (|mag| >= thresh_pct * vmax).
+        The caller is responsible for displaying or saving the map.
+
+        Parameters
+        ----------
+        mapa : folium.Map
+            Pre-built map (tiles, station markers, etc. already added).
+        time : float
+            Simulation time [s] to plot.
+        component : {'z', 'e', 'n', 'resultant'}
+            Signal component.
+        data_type : {'vel', 'accel', 'disp'}
+        cmap : str
+            Matplotlib colormap name.
+        thresh_pct : float
+            Fraction of vmax below which nodes are not plotted (0.01 = 1%).
+        radius : int
+            CircleMarker radius in pixels.
+        fill_opacity : float
+        crs_utm : str
+            EPSG code of self.xyz coordinates.
+            Default 'EPSG:32719' (UTM zone 19S, central Chile).
+
+        Returns
+        -------
+        mapa : folium.Map
+            Same map object with data markers added.
+        """
+        import folium
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        import numpy as np
+        from pyproj import Transformer
+
+        # Colour limits
+        if self._vmax is None:
+            self._compute_vmax()
+        if component.lower() == 'resultant':
+            vmax = self._vmax[data_type]['resultant']
+            vmin = 0.0
+        else:
+            vmax = self._vmax[data_type][component.lower()]
+            vmin = -vmax
+
+        norm  = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        cm    = plt.get_cmap(cmap)
+
+        # Snapshot
+        it = int(np.argmin(np.abs(self.time - time)))
+        if component.lower() == 'resultant':
+            mag = np.sqrt(
+                self.get_surface_snapshot(it, 'e', data_type) ** 2 +
+                self.get_surface_snapshot(it, 'n', data_type) ** 2 +
+                self.get_surface_snapshot(it, 'z', data_type) ** 2)
+        else:
+            mag = self.get_surface_snapshot(it, component, data_type)
+        mag= mag*factor
+        # Coordinates: xyz[:,0]=Northing, xyz[:,1]=Easting (km → m)
+        transformer = Transformer.from_crs(crs_utm, 'EPSG:4326', always_xy=True)
+        lons, lats  = transformer.transform(
+            self.xyz[:, 1] * 1000.0,   # Easting
+            self.xyz[:, 0] * 1000.0)   # Northing
+
+        # Active nodes only
+        thresh = vmax * thresh_pct
+        active = np.abs(mag) >= thresh
+
+        # Helper: magnitude → hex colour
+        def _to_hex(val):
+            r, g, b, _ = cm(norm(val))
+            return '#{:02x}{:02x}{:02x}'.format(
+                int(r * 255), int(g * 255), int(b * 255))
+
+        # Add markers
+        for lon, lat, m in zip(lons[active], lats[active], mag[active]):
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=radius,
+                color=_to_hex(m),
+                fill=True,
+                fill_color=_to_hex(m),
+                fill_opacity=fill_opacity,
+                weight=0,
+            ).add_to(mapa)
+
+        print(f"t = {self.time[it]:.3f}s | active nodes: {active.sum()}/{len(mag)}")
+        return mapa
+    
+    
+    
+    def create_animation_map(self,
+                              time_start=0.0,
+                              time_end=None,
+                              n_frames=50,
+                              component='resultant',
+                              data_type='vel',
+                              factor=1.0,
+                              cmap='RdBu_r',
+                              thresh_pct=0.01,
+                              radius=4,
+                              fill_opacity=0.85,
+                              figsize=(14, 10),
+                              dpi=100,
+                              fps=10,
+                              ffmpeg_path=None,
+                              output_dir='animation_map',
+                              output_video='animation_map.mp4',
+                              crs_utm='EPSG:32719',
+                              tile_zoom=11,
+                              tile_url='https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+                              stations=None):
+        """Render a map animation overlaying node data on a tile basemap.
+
+        Downloads basemap tiles once using urllib (no extra dependencies),
+        stitches them into a mosaic, then renders one matplotlib frame per
+        time step with the data scatter on top.  Frames are assembled into
+        a video with ffmpeg.
+
+        Parameters
+        ----------
+        time_start : float
+            Start time [s].
+        time_end : float, optional
+            End time [s]. Defaults to last available time step.
+        n_frames : int
+            Total number of frames in the animation.
+        component : {'z', 'e', 'n', 'resultant'}
+            Signal component to plot.
+        data_type : {'vel', 'accel', 'disp'}
+        factor : float
+            Scale factor applied to the data before plotting.
+            Default 1.0. Use e.g. 100.0 to convert m/s → cm/s.
+        cmap : str
+            Matplotlib colormap name.
+        thresh_pct : float
+            Nodes with |mag| < thresh_pct * vmax are not plotted.
+            0.01 = only nodes above 1 % of the global maximum.
+        radius : int
+            Scatter marker size in points².
+        fill_opacity : float
+            Marker transparency (0–1).
+        figsize : tuple of float
+            Figure size in inches (width, height).
+        dpi : int
+            Frame resolution.
+        fps : int
+            Frames per second of the output video.
+        ffmpeg_path : str, optional
+            Full path to ffmpeg binary. If None, uses shutil.which('ffmpeg').
+        output_dir : str
+            Directory where frame PNGs are saved.
+        output_video : str
+            Output .mp4 file path.
+        crs_utm : str
+            EPSG code of self.xyz coordinates.
+            Default 'EPSG:32719' (UTM zone 19S, central Chile).
+        tile_zoom : int
+            Slippy map zoom level (10–13 recommended).
+            Higher = more detail but more tiles to download.
+        tile_url : str
+            Tile URL template with {z}, {x}, {y} placeholders.
+            Default: CartoDB Positron (clean, light basemap).
+            Alternatives:
+              OSM:  'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png'
+        stations : dict, optional
+            Station markers drawn on every frame. Keys:
+
+            - ``utmx``   : np.ndarray — Easting  [m]
+            - ``utmy``   : np.ndarray — Northing [m]
+            - ``names``  : list of str — station labels
+            - ``colors`` : list of str — one matplotlib color per station
+            - ``marker`` : str — matplotlib marker symbol (default '^')
+            - ``size``   : int — marker size in points² (default 60)
+
+            Example::
+
+                color_map = {
+                    'red'      : '#d73027', 'blue'     : '#1a6faf',
+                    'green'    : '#2ca25f', 'purple'   : '#7b2d8b',
+                    'orange'   : '#f46d43', 'darkred'  : '#8b0000',
+                    'lightred' : '#fc8d59', 'beige'    : '#f5f5dc',
+                    'darkblue' : '#003399', 'darkgreen': '#1a5c1a',
+                    'cadetblue': '#5f9ea0',
+                }
+                stations = {
+                    'utmx'  : utmx,
+                    'utmy'  : utmy,
+                    'names' : utm_order,
+                    'colors': [color_map[c] for c in colors],
+                    'marker': '^',
+                    'size'  : 60,
+                }
+        """
+        import os
+        import math
+        import io
+        import subprocess
+        import shutil as _shutil
+        import urllib.request
+
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        from PIL import Image
+        from pyproj import Transformer
+
+        #  colour limits (fixed for all frames) 
+        if self._vmax is None:
+            self._compute_vmax()
+        if time_end is None:
+            time_end = self.time[-1]
+
+        if component.lower() == 'resultant':
+            vmax = self._vmax[data_type]['resultant'] * factor
+            vmin = 0.0
+        else:
+            vmax = self._vmax[data_type][component.lower()] * factor
+            vmin = -vmax
+        vmax=vmax*factor
+        norm   = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        thresh = vmax * thresh_pct
+
+        comp_label  = {'z': 'Vertical (Z)', 'e': 'East (E)',
+                       'n': 'North (N)', 'resultant': 'Resultant'}[component.lower()]
+        dtype_label = {'vel': 'Velocity', 'accel': 'Acceleration',
+                       'disp': 'Displacement'}[data_type]
+
+        #  node coordinates (computed once) 
+        # self.xyz[:,0] = Northing, self.xyz[:,1] = Easting (km → m)
+        transformer = Transformer.from_crs(crs_utm, 'EPSG:4326', always_xy=True)
+        lons, lats  = transformer.transform(
+            self.xyz[:, 1] * 1000.0,
+            self.xyz[:, 0] * 1000.0)
+
+        lon_min, lon_max = lons.min(), lons.max()
+        lat_min, lat_max = lats.min(), lats.max()
+        pad_lon = (lon_max - lon_min) * 0.08
+        pad_lat = (lat_max - lat_min) * 0.08
+        plot_extent = [lon_min - pad_lon, lon_max + pad_lon,
+                       lat_min - pad_lat, lat_max + pad_lat]
+
+        #  station coordinates (computed once) 
+        sta_lons = sta_lats = sta_names = sta_colors = None
+        if stations is not None:
+            sta_lons, sta_lats = transformer.transform(
+                stations['utmx'],
+                stations['utmy'])
+            sta_names  = stations.get('names',  ['']*len(sta_lons))
+            sta_colors = stations.get('colors', ['red']*len(sta_lons))
+            sta_marker = stations.get('marker', '^')
+            sta_size   = stations.get('size',   60)
+
+        #  tile helpers 
+        def _deg2tile(lat_deg, lon_deg, z):
+            n     = 2 ** z
+            x     = int((lon_deg + 180.0) / 360.0 * n)
+            lat_r = math.radians(lat_deg)
+            y     = int((1.0 - math.log(
+                math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * n)
+            return x, y
+
+        def _tile2lon(x, z):
+            return x / 2**z * 360.0 - 180.0
+
+        def _tile2lat(y, z):
+            return math.degrees(math.atan(
+                math.sinh(math.pi * (1.0 - 2.0 * y / 2**z))))
+
+        #  download and stitch basemap tiles (once) 
+        print(f"Downloading basemap tiles (zoom={tile_zoom})...")
+        headers = {'User-Agent': 'ShakerMaker/1.0 (research)'}
+
+        x0, y0 = _deg2tile(lat_max + pad_lat, lon_min - pad_lon, tile_zoom)
+        x1, y1 = _deg2tile(lat_min - pad_lat, lon_max + pad_lon, tile_zoom)
+        x0, x1 = min(x0, x1), max(x0, x1)
+        y0, y1 = min(y0, y1), max(y0, y1)
+
+        n_tiles = (x1 - x0 + 1) * (y1 - y0 + 1)
+        print(f"  Fetching {n_tiles} tiles ({x1-x0+1} x {y1-y0+1})...")
+
+        mosaic = Image.new('RGB', ((x1 - x0 + 1) * 256, (y1 - y0 + 1) * 256))
+        for tx in range(x0, x1 + 1):
+            for ty in range(y0, y1 + 1):
+                url = tile_url.format(z=tile_zoom, x=tx, y=ty)
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        tile = Image.open(io.BytesIO(resp.read())).convert('RGB')
+                except Exception:
+                    tile = Image.new('RGB', (256, 256), color=(230, 230, 230))
+                mosaic.paste(tile, ((tx - x0) * 256, (ty - y0) * 256))
+
+        mosaic_extent = [
+            _tile2lon(x0,     tile_zoom),   # west
+            _tile2lon(x1 + 1, tile_zoom),   # east
+            _tile2lat(y1 + 1, tile_zoom),   # south
+            _tile2lat(y0,     tile_zoom),   # north
+        ]
+        basemap = np.array(mosaic)
+        print(f"  Basemap ready: {basemap.shape}  "
+              f"lon=[{mosaic_extent[0]:.3f}, {mosaic_extent[1]:.3f}]  "
+              f"lat=[{mosaic_extent[2]:.3f}, {mosaic_extent[3]:.3f}]")
+
+        #  frame loop 
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Rendering {n_frames} frames → {output_dir}/")
+
+        for i, t_frame in enumerate(np.linspace(time_start, time_end, n_frames)):
+            it = int(np.argmin(np.abs(self.time - t_frame)))
+
+            # Snapshot
+            if component.lower() == 'resultant':
+                mag = np.sqrt(
+                    self.get_surface_snapshot(it, 'e', data_type) ** 2 +
+                    self.get_surface_snapshot(it, 'n', data_type) ** 2 +
+                    self.get_surface_snapshot(it, 'z', data_type) ** 2)
+            else:
+                mag = self.get_surface_snapshot(it, component, data_type)
+
+            mag    = mag * factor
+            active = np.abs(mag) >= thresh
+
+            # Build frame
+            fig, ax = plt.subplots(figsize=figsize)
+
+            # Basemap
+            ax.imshow(basemap, extent=mosaic_extent,
+                      aspect='auto', origin='upper', zorder=0)
+
+            # Faint background dots for all nodes
+            ax.scatter(lons, lats, c='gray', s=1, alpha=0.08,
+                       linewidths=0, zorder=1)
+
+            # Data scatter
+            if active.any():
+                ax.scatter(lons[active], lats[active],
+                           c=mag[active], cmap=cmap, norm=norm,
+                           s=radius, alpha=fill_opacity,
+                           linewidths=0, zorder=2)
+
+            # Colorbar
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            fig.colorbar(sm, ax=ax, shrink=0.6, pad=0.02,
+                         label=f'{dtype_label} [{comp_label}]')
+
+            # Station markers (same on every frame)
+            if sta_lons is not None:
+                for lon, lat, name, color in zip(
+                        sta_lons, sta_lats, sta_names, sta_colors):
+                    ax.scatter(lon, lat,
+                               marker=sta_marker, color=color,
+                               s=sta_size, zorder=5,
+                               edgecolors='white', linewidths=0.8)
+                    ax.annotate(name, (lon, lat),
+                                textcoords='offset points', xytext=(4, 4),
+                                fontsize=7, fontweight='bold',
+                                color=color, zorder=6)
+
+            ax.set_xlim(plot_extent[0], plot_extent[1])
+            ax.set_ylim(plot_extent[2], plot_extent[3])
+            ax.set_xlabel('Longitude', fontsize=11)
+            ax.set_ylabel('Latitude',  fontsize=11)
+            ax.set_title(f'{dtype_label} — {comp_label} | '
+                         f't = {self.time[it]:.3f} s',
+                         fontsize=13, fontweight='bold')
+            ax.tick_params(labelsize=9)
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'frame_{i:04d}.png'),
+                        dpi=dpi, bbox_inches='tight')
+            plt.close(fig)
+            print(f'Frame {i+1}/{n_frames}  (t={self.time[it]:.3f}s)')
+
+        #  assemble video 
+        try:
+            ffmpeg_exe = ffmpeg_path or _shutil.which('ffmpeg') or 'ffmpeg'
+            cmd = [
+                ffmpeg_exe, '-y',
+                '-framerate', str(fps),
+                '-i', os.path.join(output_dir, 'frame_%04d.png'),
+                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-crf', '18',
+                output_video,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f'Video saved: {output_video}')
+            else:
+                print(f'ffmpeg failed (exit {result.returncode})')
+                print(result.stderr[-400:])
+        except Exception as e:
+            print(f'ffmpeg error: {e}')
+

@@ -461,7 +461,7 @@ def plot_models_domain(models,
             ax.scatter(xyz_qa_t[:, 0], xyz_qa_t[:, 1], xyz_qa_t[:, 2],
                        c=[color], marker='*', s=300,
                        edgecolors='black', linewidths=2,
-                       label=obj.model_name)
+                       label=obj.name)
 
         if show_cubes:
             bbox = xyz_int if len(xyz_int) > 0 else xyz_t
