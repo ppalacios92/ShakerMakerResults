@@ -1758,13 +1758,6 @@ class ShakerMakerData:
 
 
 
-
-
-
-
-
-
-
 #### PLOT SURFACES WITH PARALLEL POOL
     def plot_surface_newmark(self,
                              T_target=0.0,
@@ -1778,6 +1771,7 @@ class ShakerMakerData:
                              s=20, alpha=0.85,
                              axis_equal=False,
                              n_jobs=-1):
+
         """Plot a 3-D scatter map of spectral values at a given period T.
 
         Full spectra (Z, E, N) for all spectral quantities are computed once
@@ -1821,15 +1815,14 @@ class ShakerMakerData:
             Number of parallel workers.  ``-1`` uses all CPUs,
             ``-2`` uses all minus one.
         """
+
+
         from joblib import Parallel, delayed
 
         dt        = self.time[1] - self.time[0]
         n         = self._n_nodes
-        comp      = component.lower()
         cache_key = (data_type,)
 
-        # Cache check — keyed only on data_type so all spectral quantities
-        # and components are available without recomputing.
         if not hasattr(self, '_newmark_cache'):
             self._newmark_cache = {}
 
@@ -1847,8 +1840,6 @@ class ShakerMakerData:
                   f"  ({data_needed/1e9:.1f} GB needed  |  "
                   f"{mem_available/1e9:.1f} GB available)")
 
-            # Capture everything workers need — no self references inside
-            # worker functions to avoid serialisation issues with joblib.
             _filename       = self.filename
             _data_grp       = self._data_grp
             _hdf5_path      = {'accel': f'{_data_grp}/acceleration',
@@ -1859,12 +1850,10 @@ class ShakerMakerData:
             _time_len       = len(self.time)
 
             if use_safe_mode:
-                # Each worker reads its own node directly from HDF5.
-                # Peak RAM = n_jobs * bytes_per_node (a few MB at most).
                 def _compute_spectrum(i):
                     with h5py.File(_filename, 'r') as _f:
                         _d = _f[_hdf5_path][3*i : 3*i+3, :]
-                    _d = _d[[2, 0, 1], :]          # reorder E,N,Z -> Z,E,N
+                    _d = _d[[2, 0, 1], :]
                     if _window_mask is not None:
                         _d = _d[:, _window_mask]
                     elif _resample_cache is not None:
@@ -1883,7 +1872,6 @@ class ShakerMakerData:
                           for qty in ('PSa', 'Sa', 'PSv', 'Sv', 'Sd')}
                     return T, sa
             else:
-                # Pre-load all data into RAM; workers read from the array.
                 print("  Loading data into memory...")
                 all_data = np.zeros((n, 3, len(self.time)))
                 for i in range(n):
@@ -1903,52 +1891,55 @@ class ShakerMakerData:
                 delayed(_compute_spectrum)(i) for i in range(n))
 
             T_array = results[0][0]
-            # sa_full[qty] shape: (n_nodes, 3, n_periods)
             sa_full = {qty: np.array([r[1][qty] for r in results])
                        for qty in ('PSa', 'Sa', 'PSv', 'Sv', 'Sd')}
 
             self._newmark_cache[cache_key] = (T_array, sa_full)
             print(f"Done. All spectral quantities cached for {data_type}")
 
-        # Apply component, T_target, spectral_type and factor.
-        # This is pure numpy interpolation — instantaneous.
-        sp_data = sa_full[spectral_type]   # (n_nodes, 3, n_periods)
-
-        if comp == 'resultant':
-            sa_map = np.array([
-                np.mean([np.interp(T_target, T_array, sp_data[i][k])
-                         for k in range(3)])
-                for i in range(n)]) * factor
-        else:
-            k = {'z': 0, 'e': 1, 'n': 2}[comp]
-            sa_map = np.array([
-                np.interp(T_target, T_array, sp_data[i][k])
-                for i in range(n)]) * factor
-
-        print(f"  {spectral_type}(T={T_target}s) | {comp} | factor={factor}  "
-              f"Max={sa_map.max():.4f}  Min={sa_map.min():.4f}")
-
-        # Plot
-        xyz_t = _rotate(self.xyz)
+        sp_data    = sa_full[spectral_type]
+        comp_lbl   = {'z': 'Vertical (Z)', 'e': 'East (E)',
+                      'n': 'North (N)', 'resultant': 'Resultant'}
+        xyz_t      = _rotate(self.xyz)
         x = xyz_t[:, 0]; y = xyz_t[:, 1]; z = xyz_t[:, 2]
-        clbl  = {'z': 'Vertical (Z)', 'e': 'East (E)',
-                 'n': 'North (N)', 'resultant': 'Resultant'}[comp]
 
-        fig = plt.figure(figsize=figsize)
-        ax  = fig.add_subplot(111, projection='3d')
-        sa_map = np.nan_to_num(sa_map, nan=0.0)
-        sc  = ax.scatter(x, y, z, c=sa_map, cmap=cmap, s=s, alpha=alpha,
-                 vmin=0, vmax=np.nanmax(sa_map))
-        fig.colorbar(sc, ax=ax, shrink=0.5,
-                     label=f'{spectral_type}(T={T_target}s)')
+        # Support list or single string for component
+        components = component if isinstance(component, list) else [component]
+        n_comp     = len(components)
+        fig        = plt.figure(figsize=(figsize[0] * n_comp, figsize[1]))
 
-        ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
-        ax.grid(False)
-        if axis_equal:
-            ax.axis('equal')
-        ax.set_title(f'{self.name} | {spectral_type}(T={T_target}s) | {clbl}',
-                     fontweight='bold')
-        ax.view_init(elev=elev, azim=azim)
+        for idx, comp in enumerate(components):
+            comp = comp.lower()
+            if comp == 'resultant':
+                sa_map = np.array([
+                    np.mean([np.interp(T_target, T_array, sp_data[i][k])
+                             for k in range(3)])
+                    for i in range(n)]) * factor
+            else:
+                k_idx  = {'z': 0, 'e': 1, 'n': 2}[comp]
+                sa_map = np.array([
+                    np.interp(T_target, T_array, sp_data[i][k_idx])
+                    for i in range(n)]) * factor
+
+            sa_map = np.nan_to_num(sa_map, nan=0.0)
+            clbl   = comp_lbl[comp]
+            print(f"  {spectral_type}(T={T_target}s) | {comp} | "
+                  f"Max={sa_map.max():.4f}  Min={sa_map.min():.4f}")
+
+            ax = fig.add_subplot(1, n_comp, idx + 1, projection='3d')
+            sc = ax.scatter(x, y, z, c=sa_map, cmap=cmap, s=s, alpha=alpha,
+                            vmin=0, vmax=np.nanmax(sa_map))
+            fig.colorbar(sc, ax=ax, shrink=0.5,
+                         label=f'{spectral_type}(T={T_target}s)')
+            ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
+            ax.grid(False)
+            if axis_equal:
+                ax.axis('equal')
+            ax.set_title(f'{spectral_type}(T={T_target}s) | {clbl}',
+                         fontweight='bold')
+            ax.view_init(elev=elev, azim=azim)
+
+        plt.suptitle(self.name, fontsize=13, fontweight='bold')
         plt.tight_layout()
         plt.show()
 
@@ -1963,30 +1954,34 @@ class ShakerMakerData:
                            s=20, alpha=0.85,
                            axis_equal=False,
                            n_jobs=-1):
+    
         """Plot a 3-D scatter map of Arias intensity for every node.
-
+        
         Arias intensity (Z, E, N) is computed once and cached per
-        ``data_type``.  Subsequent calls with the same ``data_type`` are
-        instantaneous.  Only changing ``data_type`` triggers recomputation.
-
+        ``data_type``. Subsequent calls with the same ``data_type`` are
+        instantaneous. Only changing ``data_type`` triggers recomputation.
+        
         The method automatically selects the loading strategy based on
-        available RAM (same logic as ``plot_surface_newmark``):
-
+        available RAM:
+        
         - **fast/preload** — all node data loaded into RAM before the pool.
         - **safe/chunk**   — each worker reads only its own node from HDF5.
-
+        
         Window masks (``get_window``) and resampling (``resample``) are
         respected in both modes.
-
+        
         Parameters
         ----------
-        component : {'z', 'e', 'n', 'resultant'}, default ``'z'``
-            Component to display.  ``'resultant'`` averages Z, E, N.
+        component : str or list of str, default ``'z'``
+            One or more components to plot. Each component generates one
+            subplot. Valid values: ``'z'``, ``'e'``, ``'n'``, ``'resultant'``.
+            Example: ``['z', 'n', 'e', 'resultant']``.
         data_type : {'accel', 'vel', 'disp'}, default ``'accel'``
         factor : float, default ``1.0``
             Multiplier applied to every Arias value before plotting.
         cmap : str, default ``'hot_r'``
         figsize : tuple of float, default ``(12, 8)``
+            Size per subplot. Total width scales with number of components.
         elev, azim : float
             3-D view angles.
         s : int, default ``20``
@@ -1994,17 +1989,16 @@ class ShakerMakerData:
         alpha : float, default ``0.85``
         axis_equal : bool, default ``False``
         n_jobs : int, default ``-1``
-            Number of parallel workers.  ``-1`` uses all CPUs.
+            Number of parallel workers. ``-1`` uses all CPUs.
         """
+
         from joblib import Parallel, delayed
         from EarthquakeSignal.core.arias_intensity import AriasIntensityAnalyzer
 
         dt        = self.time[1] - self.time[0]
         n         = self._n_nodes
-        comp      = component.lower()
         cache_key = (data_type, 'arias')
 
-        # Cache check — keyed on (data_type, 'arias').
         if not hasattr(self, '_newmark_cache'):
             self._newmark_cache = {}
 
@@ -2022,7 +2016,6 @@ class ShakerMakerData:
                   f"  ({data_needed/1e9:.1f} GB needed  |  "
                   f"{mem_available/1e9:.1f} GB available)")
 
-            # Capture state for workers — no self references.
             _filename       = self.filename
             _data_grp       = self._data_grp
             _hdf5_path      = {'accel': f'{_data_grp}/acceleration',
@@ -2033,15 +2026,12 @@ class ShakerMakerData:
             _time_len       = len(self.time)
 
             if use_safe_mode:
-                # Each worker reads its own node directly from HDF5.
-                # AriasIntensityAnalyzer imported inside worker to avoid
-                # serialisation issues with joblib LokyBackend.
                 def _compute_arias(i):
                     from EarthquakeSignal.core.arias_intensity import \
                         AriasIntensityAnalyzer as _AIA
                     with h5py.File(_filename, 'r') as _f:
                         _d = _f[_hdf5_path][3*i : 3*i+3, :]
-                    _d = _d[[2, 0, 1], :]          # reorder E,N,Z -> Z,E,N
+                    _d = _d[[2, 0, 1], :]
                     if _window_mask is not None:
                         _d = _d[:, _window_mask]
                     elif _resample_cache is not None:
@@ -2059,7 +2049,6 @@ class ShakerMakerData:
                         ia[k] = ia_total
                     return ia
             else:
-                # Pre-load all data into RAM; workers read from the array.
                 print("  Loading data into memory...")
                 all_data = np.zeros((n, 3, len(self.time)))
                 for i in range(n):
@@ -2078,40 +2067,192 @@ class ShakerMakerData:
             results = Parallel(n_jobs=n_jobs, verbose=5)(
                 delayed(_compute_arias)(i) for i in range(n))
 
-            # ia_full shape: (n_nodes, 3) — columns: Z, E, N
             ia_full = np.array(results)
             self._newmark_cache[cache_key] = ia_full
             print(f"Done. Arias intensity cached for {data_type}")
 
-        # Apply component and factor — instantaneous.
-        if comp == 'resultant':
-            ia_map = np.mean(ia_full, axis=1) * factor
+        comp_lbl = {'z': 'Vertical (Z)', 'e': 'East (E)',
+                    'n': 'North (N)', 'resultant': 'Resultant'}
+        xyz_t    = _rotate(self.xyz)
+        x = xyz_t[:, 0]; y = xyz_t[:, 1]; z = xyz_t[:, 2]
+
+        # Support list or single string for component
+        components = component if isinstance(component, list) else [component]
+        n_comp     = len(components)
+        fig        = plt.figure(figsize=(figsize[0] * n_comp, figsize[1]))
+
+        for idx, comp in enumerate(components):
+            comp = comp.lower()
+            if comp == 'resultant':
+                ia_map = np.mean(ia_full, axis=1) * factor
+            else:
+                k_idx  = {'z': 0, 'e': 1, 'n': 2}[comp]
+                ia_map = ia_full[:, k_idx] * factor
+
+            ia_map = np.nan_to_num(ia_map, nan=0.0)
+            clbl   = comp_lbl[comp]
+            print(f"  Arias | {comp} | Max={ia_map.max():.4f}  Min={ia_map.min():.4f}")
+
+            ax = fig.add_subplot(1, n_comp, idx + 1, projection='3d')
+            sc = ax.scatter(x, y, z, c=ia_map, cmap=cmap, s=s, alpha=alpha,
+                            vmin=0, vmax=np.nanmax(ia_map))
+            fig.colorbar(sc, ax=ax, shrink=0.5, label='Arias Intensity [m/s]')
+            ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
+            ax.grid(False)
+            if axis_equal:
+                ax.axis('equal')
+            ax.set_title(f'Arias | {clbl}', fontweight='bold')
+            ax.view_init(elev=elev, azim=azim)
+
+        plt.suptitle(self.name, fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+
+
+
+
+    def plot_surface_arias(self,
+                           component='z',
+                           data_type='accel',
+                           factor=1.0,
+                           cmap='hot_r',
+                           figsize=(12, 8),
+                           elev=30, azim=-60,
+                           s=20, alpha=0.85,
+                           axis_equal=False,
+                           n_jobs=-1):
+        """Plot a 3-D scatter map of Arias intensity for every node.
+
+        Parameters
+        ----------
+        component : str or list of str, default 'z'
+            One or more of {'z', 'e', 'n', 'resultant'}.
+        data_type : {'accel', 'vel', 'disp'}, default 'accel'
+        factor : float, default 1.0
+        cmap : str, default 'hot_r'
+        figsize : tuple, default (12, 8)
+        elev, azim : float
+        s : int, default 20
+        alpha : float, default 0.85
+        axis_equal : bool, default False
+        n_jobs : int, default -1
+        """
+        from joblib import Parallel, delayed
+        from EarthquakeSignal.core.arias_intensity import AriasIntensityAnalyzer
+
+        dt        = self.time[1] - self.time[0]
+        n         = self._n_nodes
+        cache_key = (data_type, 'arias')
+
+        if not hasattr(self, '_newmark_cache'):
+            self._newmark_cache = {}
+
+        if cache_key in self._newmark_cache:
+            print(f"  Cache hit — using stored Arias for {data_type}")
+            ia_full = self._newmark_cache[cache_key]
         else:
-            k      = {'z': 0, 'e': 1, 'n': 2}[comp]
-            ia_map = ia_full[:, k] * factor
+            import psutil as _psutil
+            mem_available = _psutil.virtual_memory().available
+            data_needed   = self._bytes_per_node * n
+            use_safe_mode = self._large_file or (data_needed > mem_available * 0.6)
 
-        print(f"  Arias | {comp} | factor={factor}  "
-              f"Max={ia_map.max():.4f}  Min={ia_map.min():.4f}")
+            print(f"Computing Arias intensity for {n} nodes  n_jobs={n_jobs}")
+            print(f"  Mode     : {'safe/chunk' if use_safe_mode else 'fast/preload'}"
+                  f"  ({data_needed/1e9:.1f} GB needed  |  "
+                  f"{mem_available/1e9:.1f} GB available)")
 
-        # Plot
+            _filename       = self.filename
+            _data_grp       = self._data_grp
+            _hdf5_path      = {'accel': f'{_data_grp}/acceleration',
+                               'vel':   f'{_data_grp}/velocity',
+                               'disp':  f'{_data_grp}/displacement'}[data_type]
+            _window_mask    = getattr(self, '_window_mask',    None)
+            _resample_cache = getattr(self, '_resample_cache', None)
+            _time_len       = len(self.time)
+
+            if use_safe_mode:
+                def _compute_arias(i):
+                    from EarthquakeSignal.core.arias_intensity import \
+                        AriasIntensityAnalyzer as _AIA
+                    with h5py.File(_filename, 'r') as _f:
+                        _d = _f[_hdf5_path][3*i : 3*i+3, :]
+                    _d = _d[[2, 0, 1], :]
+                    if _window_mask is not None:
+                        _d = _d[:, _window_mask]
+                    elif _resample_cache is not None:
+                        _t_orig = _resample_cache['time_orig']
+                        _rs = np.zeros((3, _time_len))
+                        for _k in range(3):
+                            _rs[_k] = interp1d(_t_orig, _d[_k],
+                                               kind='linear',
+                                               fill_value='extrapolate')(
+                                np.linspace(_t_orig[0], _t_orig[-1], _time_len))
+                        _d = _rs
+                    ia = np.zeros(3)
+                    for k in range(3):
+                        _, _, _, ia_total, _ = _AIA.compute(_d[k] / 9.81, dt)
+                        ia[k] = ia_total
+                    return ia
+            else:
+                print("  Loading data into memory...")
+                all_data = np.zeros((n, 3, len(self.time)))
+                for i in range(n):
+                    all_data[i] = self.get_node_data(i, data_type)
+                print("  Data loaded. Computing Arias intensity...")
+
+                def _compute_arias(i):
+                    data = all_data[i]
+                    ia   = np.zeros(3)
+                    for k in range(3):
+                        _, _, _, ia_total, _ = AriasIntensityAnalyzer.compute(
+                            data[k] / 9.81, dt)
+                        ia[k] = ia_total
+                    return ia
+
+            results = Parallel(n_jobs=n_jobs, verbose=5)(
+                delayed(_compute_arias)(i) for i in range(n))
+
+            ia_full = np.array(results)
+            self._newmark_cache[cache_key] = ia_full
+            print(f"Done. Arias intensity cached for {data_type}")
+
+        # --- Plot ---
+        components = component if isinstance(component, list) else [component]
+        n_comps    = len(components)
+
         xyz_t = _rotate(self.xyz)
         x = xyz_t[:, 0]; y = xyz_t[:, 1]; z = xyz_t[:, 2]
-        clbl  = {'z': 'Vertical (Z)', 'e': 'East (E)',
-                 'n': 'North (N)', 'resultant': 'Resultant'}[comp]
 
-        fig = plt.figure(figsize=figsize)
-        ax  = fig.add_subplot(111, projection='3d')
-        ia_map = np.nan_to_num(ia_map, nan=0.0)
-        sc  = ax.scatter(x, y, z, c=ia_map, cmap=cmap, s=s, alpha=alpha,
-                 vmin=0, vmax=np.nanmax(ia_map))
-        fig.colorbar(sc, ax=ax, shrink=0.5, label='Arias Intensity [m/s]')
+        comp_labels = {'z': 'Vertical (Z)', 'e': 'East (E)',
+                       'n': 'North (N)', 'resultant': 'Resultant'}
 
-        ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
-        ax.grid(False)
-        if axis_equal:
-            ax.axis('equal')
-        ax.set_title(f'{self.name} | Arias Intensity | {clbl}', fontweight='bold')
-        ax.view_init(elev=elev, azim=azim)
+        fig = plt.figure(figsize=(figsize[0] * n_comps, figsize[1]))
+
+        for idx, comp in enumerate(components):
+            comp = comp.lower()
+            if comp == 'resultant':
+                ia_map = np.mean(ia_full, axis=1) * factor
+            else:
+                k      = {'z': 0, 'e': 1, 'n': 2}[comp]
+                ia_map = ia_full[:, k] * factor
+
+            ia_map = np.nan_to_num(ia_map, nan=0.0)
+            clbl   = comp_labels[comp]
+
+            print(f"  Arias | {comp} | factor={factor}  "
+                  f"Max={ia_map.max():.4f}  Min={ia_map.min():.4f}")
+
+            ax = fig.add_subplot(1, n_comps, idx + 1, projection='3d')
+            sc = ax.scatter(x, y, z, c=ia_map, cmap=cmap, s=s, alpha=alpha,
+                            vmin=0, vmax=np.nanmax(ia_map))
+            fig.colorbar(sc, ax=ax, shrink=0.5, label='Arias Intensity [m/s]')
+            ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
+            ax.grid(False)
+            if axis_equal:
+                ax.axis('equal')
+            ax.set_title(f'{self.name} | Arias | {clbl}', fontweight='bold')
+            ax.view_init(elev=elev, azim=azim)
+
         plt.tight_layout()
         plt.show()
     
@@ -2604,4 +2745,3 @@ class ShakerMakerData:
                 print(result.stderr[-400:])
         except Exception as e:
             print(f'ffmpeg error: {e}')
-
