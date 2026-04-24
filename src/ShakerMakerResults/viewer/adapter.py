@@ -297,6 +297,19 @@ class ViewerDataAdapter:
             col = min(time_index, cached.shape[1] - 1)
             return np.asarray(cached[:, col], dtype=float)
 
+        # ── Resultant fast path: derive from cached E/N/Z components ─────────
+        # set_playing pre-warms E, N, Z individually (cheaper HDF5 pattern).
+        # Once they are in memory, resultant is free NumPy arithmetic.
+        if component == "resultant":
+            e_key, n_key, z_key = (demand, "e"), (demand, "n"), (demand, "z")
+            if all(k in self._series_cache for k in (e_key, n_key, z_key)):
+                self._series_cache_hits += 1
+                col = min(time_index, self._series_cache[e_key].shape[1] - 1)
+                e = self._series_cache[e_key][:, col]
+                n = self._series_cache[n_key][:, col]
+                z = self._series_cache[z_key][:, col]
+                return np.sqrt(e ** 2 + n ** 2 + z ** 2).astype(float)
+
         direct = self._try_direct_component_snapshot(demand, component, time_index)
         if direct is not None:
             return np.asarray(direct, dtype=float)
@@ -585,9 +598,12 @@ class ViewerDataAdapter:
                 data_handle = handle[self._data_path_for_demand(demand)]
                 source_col = self._source_column_index(time_index, data_handle.shape[1])
                 if component == "resultant":
-                    e = np.asarray(data_handle[0::3, source_col], dtype=np.float32)
-                    n = np.asarray(data_handle[1::3, source_col], dtype=np.float32)
-                    z = np.asarray(data_handle[2::3, source_col], dtype=np.float32)
+                    # One contiguous HDF5 read → NumPy strided slice (3× faster
+                    # than three separate strided reads against HDF5 chunks).
+                    all_data = np.asarray(data_handle[:, source_col], dtype=np.float32)
+                    e = all_data[0::3]
+                    n = all_data[1::3]
+                    z = all_data[2::3]
                     values = np.sqrt(e ** 2 + n ** 2 + z ** 2).astype(np.float32, copy=False)
                     qa_scalar = self._read_qa_resultant_snapshot(handle, demand, source_col)
                 else:

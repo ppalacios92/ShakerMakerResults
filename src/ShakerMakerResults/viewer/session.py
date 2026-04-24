@@ -60,6 +60,22 @@ class ViewerSession:
 
     def show(self, *, start_event_loop: bool | None = None):
         """Build and show the GUI window."""
+        import os
+        import sys
+
+        # PyVistaQt + PyQt5 is unstable on some Wayland sessions and may crash
+        # with a fatal X BadWindow during startup. Prefer xcb on Linux unless
+        # the user explicitly set another stable platform.
+        if sys.platform.startswith("linux"):
+            qpa = os.environ.get("QT_QPA_PLATFORM", "").strip().lower()
+            if qpa == "" or qpa.startswith("wayland"):
+                os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+        # Local viewer style override.
+        # Must happen BEFORE QApplication is created.
+        if os.environ.get("QT_STYLE_OVERRIDE", "").lower() == "kvantum":
+            os.environ["QT_STYLE_OVERRIDE"] = "Fusion"
+
         from .window import ViewerMainWindow
         from ._imports import require_viewer_dependencies
 
@@ -69,13 +85,24 @@ class ViewerSession:
         if app is None:
             app = QtWidgets.QApplication([])
             self._owns_qt_app = True
+
         self._qt_app = app
+
+        try:
+            if "Fusion" in QtWidgets.QStyleFactory.keys():
+                app.setStyle("Fusion")
+        except Exception:
+            pass
 
         if self.window is None:
             self.window = ViewerMainWindow(self)
         self.window.show()
-        self.window.raise_()
-        self.window.activateWindow()
+
+        # Some Linux/X11 environments can crash with a fatal X BadWindow error
+        # when forcing raise_/activate immediately after show().
+        if not sys.platform.startswith("linux"):
+            self.window.raise_()
+            self.window.activateWindow()
 
         if start_event_loop is None:
             start_event_loop = self._owns_qt_app
@@ -193,6 +220,113 @@ class ViewerSession:
         self._notify_window("warp")
         return self.state.warp_scale
 
+    def apply_data_settings(self, *, demand: str, component: str):
+        self.state.set_demand(demand)
+        self.state.set_component(component)
+        self.state.set_user_color_range(*self.default_color_limits())
+        self._notify_window("demand")
+        return self.state.demand, self.state.component
+
+    def apply_color_settings(
+        self,
+        *,
+        colormap: str,
+        vmin: float | None,
+        vmax: float | None,
+        clamp_enabled: bool,
+    ):
+        self.state.set_colormap(colormap)
+        self.state.set_user_color_range(vmin, vmax)
+        self.state.set_clamp_enabled(clamp_enabled)
+        self._notify_window("appearance")
+        return self.state.colormap, self.state.user_vmin, self.state.user_vmax
+
+    def apply_visibility_settings(
+        self,
+        *,
+        show_internal: bool,
+        show_external: bool,
+        show_qa: bool,
+    ):
+        self.state.set_node_visibility(
+            show_internal=show_internal,
+            show_external=show_external,
+            show_qa=show_qa,
+        )
+        self._notify_window("visibility")
+        return self.state.show_internal, self.state.show_external, self.state.show_qa
+
+    def apply_warp_settings(
+        self,
+        *,
+        warp_enabled: bool,
+        warp_axes: tuple[bool, bool, bool],
+        warp_scale: float | None,
+    ):
+        was_warp_enabled = bool(self.state.disp_warp_enabled)
+        self.state.set_warp_enabled(warp_enabled)
+        self.state.set_warp_axes(tuple(bool(v) for v in warp_axes))
+        self.state.set_warp_scale(warp_scale)
+
+        if warp_enabled and not was_warp_enabled:
+            try:
+                for comp in ("e", "n", "z"):
+                    self.adapter.scalar_series("disp", comp)
+            except Exception:
+                pass
+
+        self._notify_window("warp")
+        return self.state.disp_warp_enabled, self.state.warp_axes, self.state.warp_scale
+
+    def apply_panel_settings(
+        self,
+        *,
+        demand: str,
+        component: str,
+        colormap: str,
+        vmin: float | None,
+        vmax: float | None,
+        clamp_enabled: bool,
+        show_internal: bool,
+        show_external: bool,
+        show_qa: bool,
+        warp_enabled: bool,
+        warp_axes: tuple[bool, bool, bool],
+        warp_scale: float | None,
+    ):
+        """Apply right-panel settings in one batch refresh."""
+        was_warp_enabled = bool(self.state.disp_warp_enabled)
+
+        self.state.set_demand(demand)
+        self.state.set_component(component)
+        self.state.set_colormap(colormap)
+        self.state.set_user_color_range(vmin, vmax)
+        self.state.set_clamp_enabled(clamp_enabled)
+        self.state.set_node_visibility(
+            show_internal=show_internal,
+            show_external=show_external,
+            show_qa=show_qa,
+        )
+        self.state.set_warp_enabled(warp_enabled)
+        self.state.set_warp_axes(tuple(bool(v) for v in warp_axes))
+        self.state.set_warp_scale(warp_scale)
+
+        if warp_enabled and not was_warp_enabled:
+            try:
+                for comp in ("e", "n", "z"):
+                    self.adapter.scalar_series("disp", comp)
+            except Exception:
+                pass
+
+        self._notify_window("panel_apply")
+        return {
+            "demand": self.state.demand,
+            "component": self.state.component,
+            "colormap": self.state.colormap,
+            "clamp_enabled": self.state.clamp_enabled,
+            "warp_enabled": self.state.disp_warp_enabled,
+        }
+
     def suggested_warp_scale(self) -> float:
         """Return the adapter's auto-suggested warp scale for this dataset."""
         return self.adapter.suggested_warp_scale()
@@ -202,7 +336,15 @@ class ViewerSession:
             # Pre-warm the series cache so every playback frame is a pure
             # memory slice with zero HDF5 I/O.
             try:
-                self.adapter.scalar_series(self.state.demand, self.state.component)
+                if self.state.component == "resultant":
+                    # Cache E, N, Z individually — one contiguous column read
+                    # each vs. strided reads.  The resultant fast-path in
+                    # scalar_snapshot derives the magnitude from these three
+                    # series with no additional I/O.
+                    for comp in ("e", "n", "z"):
+                        self.adapter.scalar_series(self.state.demand, comp)
+                else:
+                    self.adapter.scalar_series(self.state.demand, self.state.component)
             except Exception:
                 pass  # Large files may exceed cache budget — degrade gracefully
             # Also pre-warm displacement series when warp is active.

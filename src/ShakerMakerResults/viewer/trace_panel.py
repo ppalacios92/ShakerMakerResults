@@ -263,6 +263,12 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self.session = session
         self._syncing = False
+        self._dirty_sections = {
+            "data": False,
+            "color": False,
+            "visibility": False,
+            "warp": False,
+        }
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -328,38 +334,48 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
 
     def _build_data_box(self):
         box = QtWidgets.QGroupBox("Data")
-        layout = QtWidgets.QFormLayout(box)
+        outer = QtWidgets.QVBoxLayout(box)
+        layout = QtWidgets.QFormLayout()
 
         self.demand_combo = QtWidgets.QComboBox()
         for demand in self.session.adapter.available_demands:
             self.demand_combo.addItem(demand, demand)
-        self.demand_combo.currentTextChanged.connect(self._set_demand)
+        self.demand_combo.currentTextChanged.connect(
+            lambda _value: self._on_data_changed("data")
+        )
 
         self.component_combo = QtWidgets.QComboBox()
         for component in self.session.adapter.available_components:
             self.component_combo.addItem(component, component)
-        self.component_combo.currentTextChanged.connect(self._set_component)
+        self.component_combo.currentTextChanged.connect(
+            lambda _value: self._on_data_changed("data")
+        )
 
         layout.addRow("Demand", self.demand_combo)
         layout.addRow("Component", self.component_combo)
+        outer.addLayout(layout)
+        outer.addWidget(self._make_section_apply_button("data", self._apply_data_settings))
         return box
 
     def _build_color_box(self):
         box = QtWidgets.QGroupBox("Color Map")
-        layout = QtWidgets.QFormLayout(box)
+        outer = QtWidgets.QVBoxLayout(box)
+        layout = QtWidgets.QFormLayout()
 
         self.colormap_combo = QtWidgets.QComboBox()
         for cmap in COLORMAP_OPTIONS:
             self.colormap_combo.addItem(cmap, cmap)
-        self.colormap_combo.currentTextChanged.connect(self._set_colormap)
+        self.colormap_combo.currentTextChanged.connect(
+            lambda *_args: self._mark_dirty("color")
+        )
 
         self.vmin_spin = self._value_spin()
         self.vmax_spin = self._value_spin()
-        self.vmin_spin.editingFinished.connect(self._apply_color_range)
-        self.vmax_spin.editingFinished.connect(self._apply_color_range)
+        self.vmin_spin.valueChanged.connect(lambda *_args: self._mark_dirty("color"))
+        self.vmax_spin.valueChanged.connect(lambda *_args: self._mark_dirty("color"))
 
         self.clamp_checkbox = QtWidgets.QCheckBox("Clamp")
-        self.clamp_checkbox.toggled.connect(self._set_clamp)
+        self.clamp_checkbox.toggled.connect(lambda *_args: self._mark_dirty("color"))
 
         self.reset_range_button = QtWidgets.QPushButton("Reset to auto")
         self.reset_range_button.clicked.connect(self._reset_range)
@@ -371,6 +387,8 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
         layout.addRow("User max", self.vmax_spin)
         layout.addRow("", self.clamp_checkbox)
         layout.addRow("", self.reset_range_button)
+        outer.addLayout(layout)
+        outer.addWidget(self._make_section_apply_button("color", self._apply_color_settings))
         return box
 
     def _build_visibility_box(self):
@@ -380,13 +398,14 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
         self.show_internal_checkbox = QtWidgets.QCheckBox("Show internal nodes")
         self.show_external_checkbox = QtWidgets.QCheckBox("Show external nodes")
         self.show_qa_checkbox = QtWidgets.QCheckBox("Show QA")
-        self.show_internal_checkbox.toggled.connect(self._set_visibility)
-        self.show_external_checkbox.toggled.connect(self._set_visibility)
-        self.show_qa_checkbox.toggled.connect(self._set_visibility)
+        self.show_internal_checkbox.toggled.connect(lambda *_args: self._mark_dirty("visibility"))
+        self.show_external_checkbox.toggled.connect(lambda *_args: self._mark_dirty("visibility"))
+        self.show_qa_checkbox.toggled.connect(lambda *_args: self._mark_dirty("visibility"))
 
         layout.addWidget(self.show_internal_checkbox)
         layout.addWidget(self.show_external_checkbox)
         layout.addWidget(self.show_qa_checkbox)
+        layout.addWidget(self._make_section_apply_button("visibility", self._apply_visibility_settings))
         return box
 
     def _build_warp_box(self):
@@ -397,7 +416,7 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
 
         # ── Enable toggle ──────────────────────────────────────────────
         self.warp_enabled_checkbox = QtWidgets.QCheckBox("Enable displacement warp")
-        self.warp_enabled_checkbox.toggled.connect(self._set_warp_enabled)
+        self.warp_enabled_checkbox.toggled.connect(lambda *_args: self._mark_dirty("warp"))
         outer.addWidget(self.warp_enabled_checkbox)
 
         # ── Axis toggles ───────────────────────────────────────────────
@@ -411,7 +430,7 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
         self.warp_z_checkbox = QtWidgets.QCheckBox("Z")
         for cb in (self.warp_x_checkbox, self.warp_y_checkbox, self.warp_z_checkbox):
             cb.setChecked(True)
-            cb.toggled.connect(self._set_warp_axes)
+            cb.toggled.connect(lambda *_args: self._mark_dirty("warp"))
             axes_layout.addWidget(cb)
         axes_layout.addStretch()
         outer.addWidget(axes_widget)
@@ -436,7 +455,7 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
         self.warp_scale_spin.setSingleStep(10.0)
         self.warp_scale_spin.setValue(100.0)
         self.warp_scale_spin.setSuffix("×")
-        self.warp_scale_spin.editingFinished.connect(self._set_warp_scale)
+        self.warp_scale_spin.valueChanged.connect(lambda *_args: self._mark_dirty("warp"))
         scale_layout.addWidget(self.warp_scale_spin, 1)
 
         self.warp_auto_button = QtWidgets.QPushButton("Auto")
@@ -447,35 +466,20 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
         scale_layout.addWidget(self.warp_auto_button)
 
         outer.addWidget(scale_widget)
+        outer.addWidget(self._make_section_apply_button("warp", self._apply_warp_settings))
         return box
 
-    def refresh(self, _reason: str = "full"):
+    def refresh(self, reason: str = "full"):
         self._syncing = True
         try:
-            self._set_combo_value(self.demand_combo, self.session.state.demand)
-            self._set_combo_value(self.component_combo, self.session.state.component)
-            self._set_combo_value(self.colormap_combo, self.session.current_colormap())
-
-            auto_vmin, auto_vmax = self.session.default_color_limits()
-            self.auto_range_label.setText(f"{auto_vmin:.4g}  /  {auto_vmax:.4g}")
-            if self.session.state.user_vmin is None or self.session.state.user_vmax is None:
-                self.session.state.set_user_color_range(auto_vmin, auto_vmax)
-            self.vmin_spin.setValue(float(self.session.state.user_vmin))
-            self.vmax_spin.setValue(float(self.session.state.user_vmax))
-            self.clamp_checkbox.setChecked(self.session.state.clamp_enabled)
-
-            self.show_internal_checkbox.setChecked(self.session.state.show_internal)
-            self.show_external_checkbox.setChecked(self.session.state.show_external)
-            self.show_qa_checkbox.setChecked(self.session.state.show_qa)
-
-            # Warp controls
-            self.warp_enabled_checkbox.setChecked(self.session.state.disp_warp_enabled)
-            axes = self.session.state.warp_axes
-            self.warp_x_checkbox.setChecked(axes[0])
-            self.warp_y_checkbox.setChecked(axes[1])
-            self.warp_z_checkbox.setChecked(axes[2])
-            if self.session.state.warp_scale is not None:
-                self.warp_scale_spin.setValue(float(self.session.state.warp_scale))
+            if reason in {"init", "full", "demand"} or not self._dirty_sections["data"]:
+                self._sync_data_from_session()
+            if reason in {"init", "full", "appearance", "color_range", "demand"} or not self._dirty_sections["color"]:
+                self._sync_color_from_session()
+            if reason in {"init", "full", "visibility"} or not self._dirty_sections["visibility"]:
+                self._sync_visibility_from_session()
+            if reason in {"init", "full", "warp"} or not self._dirty_sections["warp"]:
+                self._sync_warp_from_session()
 
             info = self.session.current_node_info()
             if info is None:
@@ -502,6 +506,7 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
                 self.z_spin.setValue(float(xyz_model[2]))
         finally:
             self._syncing = False
+            self._update_apply_buttons()
 
     def _select_node_id(self):
         if self._syncing:
@@ -518,73 +523,152 @@ class ViewerPropertiesPanel(QtWidgets.QWidget):
         )
         self.nearest_label.setText(f"{node_id} | dist={distance_m:.3f} m")
 
-    def _set_demand(self, value):
-        if not self._syncing:
-            self.session.set_demand(value)
-
-    def _set_component(self, value):
-        if not self._syncing:
-            self.session.set_component(value)
-
-    def _set_colormap(self, value):
-        if not self._syncing:
-            self.session.set_colormap(value)
-
-    def _apply_color_range(self):
-        if not self._syncing:
-            self.session.set_color_range(
-                self.vmin_spin.value(),
-                self.vmax_spin.value(),
-            )
-
-    def _set_clamp(self, enabled):
-        if not self._syncing:
-            self.session.set_clamp_enabled(enabled)
-
-    def _reset_range(self):
-        auto_vmin, auto_vmax = self.session.default_color_limits()
-        self.session.set_color_range(auto_vmin, auto_vmax, clamp=False)
-
-    def _set_visibility(self):
+    def _on_data_changed(self, section: str):
         if self._syncing:
             return
-        self.session.set_node_visibility(
-            show_internal=self.show_internal_checkbox.isChecked(),
-            show_external=self.show_external_checkbox.isChecked(),
-            show_qa=self.show_qa_checkbox.isChecked(),
-        )
+        self._update_auto_range_label()
+        self._mark_dirty(section)
+
+    def _mark_dirty(self, section: str, *_args):
+        if self._syncing:
+            return
+        self._dirty_sections[section] = True
+        self._update_apply_buttons()
+
+    def _reset_range(self):
+        auto_vmin, auto_vmax = self._draft_default_color_limits()
+        block_vmin = self.vmin_spin.blockSignals(True)
+        block_vmax = self.vmax_spin.blockSignals(True)
+        block_clamp = self.clamp_checkbox.blockSignals(True)
+        self.vmin_spin.setValue(auto_vmin)
+        self.vmax_spin.setValue(auto_vmax)
+        self.clamp_checkbox.setChecked(False)
+        self.vmin_spin.blockSignals(block_vmin)
+        self.vmax_spin.blockSignals(block_vmax)
+        self.clamp_checkbox.blockSignals(block_clamp)
+        self._mark_dirty("color")
 
     # ── 3-D Warp callbacks ────────────────────────────────────────────────
 
-    def _set_warp_enabled(self, enabled: bool):
-        if not self._syncing:
-            self.session.set_warp_enabled(enabled)
-
-    def _set_warp_axes(self):
-        if not self._syncing:
-            self.session.set_warp_axes(
-                x=self.warp_x_checkbox.isChecked(),
-                y=self.warp_y_checkbox.isChecked(),
-                z=self.warp_z_checkbox.isChecked(),
-            )
-
-    def _set_warp_scale(self):
-        if not self._syncing:
-            self.session.set_warp_scale(self.warp_scale_spin.value())
-
     def _apply_warp_scale_preset(self, value: float):
-        if not self._syncing:
-            block = self.warp_scale_spin.blockSignals(True)
-            self.warp_scale_spin.setValue(float(value))
-            self.warp_scale_spin.blockSignals(block)
-            self.session.set_warp_scale(float(value))
+        if self._syncing:
+            return
+        block = self.warp_scale_spin.blockSignals(True)
+        self.warp_scale_spin.setValue(float(value))
+        self.warp_scale_spin.blockSignals(block)
+        self._mark_dirty("warp")
 
     def _suggest_warp_scale(self):
         scale = self.session.suggested_warp_scale()
         block = self.warp_scale_spin.blockSignals(True)
         self.warp_scale_spin.setValue(scale)
         self.warp_scale_spin.blockSignals(block)
-        self.session.set_warp_scale(scale)
+        self._mark_dirty("warp")
+
+    def _apply_data_settings(self):
+        if self._syncing:
+            return
+        self.session.apply_data_settings(
+            demand=self.demand_combo.currentText(),
+            component=self.component_combo.currentText(),
+        )
+        self._dirty_sections["data"] = False
+        self._update_apply_buttons()
+
+    def _apply_color_settings(self):
+        if self._syncing:
+            return
+        self.session.apply_color_settings(
+            colormap=self.colormap_combo.currentText(),
+            vmin=self.vmin_spin.value(),
+            vmax=self.vmax_spin.value(),
+            clamp_enabled=self.clamp_checkbox.isChecked(),
+        )
+        self._dirty_sections["color"] = False
+        self._update_apply_buttons()
+
+    def _apply_visibility_settings(self):
+        if self._syncing:
+            return
+        self.session.apply_visibility_settings(
+            show_internal=self.show_internal_checkbox.isChecked(),
+            show_external=self.show_external_checkbox.isChecked(),
+            show_qa=self.show_qa_checkbox.isChecked(),
+        )
+        self._dirty_sections["visibility"] = False
+        self._update_apply_buttons()
+
+    def _apply_warp_settings(self):
+        if self._syncing:
+            return
+        self.session.apply_warp_settings(
+            warp_enabled=self.warp_enabled_checkbox.isChecked(),
+            warp_axes=(
+                self.warp_x_checkbox.isChecked(),
+                self.warp_y_checkbox.isChecked(),
+                self.warp_z_checkbox.isChecked(),
+            ),
+            warp_scale=self.warp_scale_spin.value(),
+        )
+        self._dirty_sections["warp"] = False
+        self._update_apply_buttons()
+
+    def _sync_data_from_session(self):
+        self._set_combo_value(self.demand_combo, self.session.state.demand)
+        self._set_combo_value(self.component_combo, self.session.state.component)
+        self._dirty_sections["data"] = False
+
+    def _sync_color_from_session(self):
+        self._set_combo_value(self.colormap_combo, self.session.current_colormap())
+        auto_vmin, auto_vmax = self._draft_default_color_limits()
+        self.auto_range_label.setText(f"{auto_vmin:.4g}  /  {auto_vmax:.4g}")
+        if self.session.state.user_vmin is None or self.session.state.user_vmax is None:
+            self.session.state.set_user_color_range(auto_vmin, auto_vmax)
+        self.vmin_spin.setValue(float(self.session.state.user_vmin))
+        self.vmax_spin.setValue(float(self.session.state.user_vmax))
+        self.clamp_checkbox.setChecked(self.session.state.clamp_enabled)
+        self._dirty_sections["color"] = False
+
+    def _sync_visibility_from_session(self):
+        self.show_internal_checkbox.setChecked(self.session.state.show_internal)
+        self.show_external_checkbox.setChecked(self.session.state.show_external)
+        self.show_qa_checkbox.setChecked(self.session.state.show_qa)
+        self._dirty_sections["visibility"] = False
+
+    def _sync_warp_from_session(self):
+        self.warp_enabled_checkbox.setChecked(self.session.state.disp_warp_enabled)
+        axes = self.session.state.warp_axes
+        self.warp_x_checkbox.setChecked(axes[0])
+        self.warp_y_checkbox.setChecked(axes[1])
+        self.warp_z_checkbox.setChecked(axes[2])
+        self.warp_scale_spin.setValue(
+            float(self.session.state.warp_scale)
+            if self.session.state.warp_scale is not None
+            else float(self.session.suggested_warp_scale())
+        )
+        self._dirty_sections["warp"] = False
+
+    def _draft_default_color_limits(self):
+        demand = self.demand_combo.currentText() or self.session.state.demand
+        component = self.component_combo.currentText() or self.session.state.component
+        return self.session.adapter.default_scalar_limits(demand, component)
+
+    def _update_auto_range_label(self):
+        auto_vmin, auto_vmax = self._draft_default_color_limits()
+        self.auto_range_label.setText(f"{auto_vmin:.4g}  /  {auto_vmax:.4g}")
+
+    def _make_section_apply_button(self, section: str, callback):
+        button = QtWidgets.QPushButton("Apply")
+        button.setEnabled(False)
+        button.clicked.connect(callback)
+        if not hasattr(self, "_apply_buttons"):
+            self._apply_buttons = {}
+        self._apply_buttons[section] = button
+        return button
+
+    def _update_apply_buttons(self):
+        for section, button in getattr(self, "_apply_buttons", {}).items():
+            button.setEnabled(bool(self._dirty_sections.get(section, False)))
 
     @staticmethod
     def _coord_spin():
