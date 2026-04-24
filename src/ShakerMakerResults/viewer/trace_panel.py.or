@@ -1,0 +1,230 @@
+"""Right-side panels for traces, spectra, and node info."""
+
+from __future__ import annotations
+
+from ._imports import require_viewer_dependencies
+
+_, _, _, _, _, QtWidgets = require_viewer_dependencies()
+
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+except ImportError:  # pragma: no cover - compatibility fallback
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+
+class TracePanel(QtWidgets.QWidget):
+    """Embedded matplotlib panel showing node traces."""
+
+    def __init__(self, session, parent=None):
+        super().__init__(parent)
+        self.session = session
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.title_label = QtWidgets.QLabel("No node selected")
+        self.figure = Figure(figsize=(5, 4), constrained_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        self.axes = self.figure.subplots(3, 1, sharex=True)
+        self._trace_lines = []
+        self._time_cursors = []
+        self._current_key = None
+
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.canvas, 1)
+
+        self.refresh("init")
+
+    def refresh(self, reason: str = "full"):
+        if reason == "time" and self._current_key is not None:
+            self._update_time_cursor()
+            self.canvas.draw_idle()
+            return
+
+        node_id = self.session.state.selected_node
+        if node_id is None:
+            self._current_key = None
+            self._trace_lines = []
+            self._time_cursors = []
+            for ax in self.axes:
+                ax.clear()
+            self.title_label.setText("No node selected")
+            for ax, label in zip(self.axes, ("Z", "E", "N")):
+                ax.set_ylabel(label)
+                ax.grid(True, alpha=0.25)
+            self.axes[-1].set_xlabel("Time [s]")
+            self.canvas.draw_idle()
+            return
+
+        trace = self.session.current_trace()
+        time = self.session.adapter.time
+        labels = ("Z", "E", "N")
+        node_key = (node_id, self.session.state.demand)
+
+        if self._current_key != node_key:
+            self._current_key = node_key
+            self._trace_lines = []
+            self._time_cursors = []
+            for ax in self.axes:
+                ax.clear()
+
+            self.title_label.setText(
+                f"Node {node_id} | {self.session.state.demand} traces"
+            )
+            for ax, values, label in zip(self.axes, trace, labels):
+                line, = ax.plot(time, values, linewidth=1.2)
+                cursor = ax.axvline(self.session.current_time(), color="tab:red", alpha=0.35)
+                self._trace_lines.append(line)
+                self._time_cursors.append(cursor)
+                ax.set_ylabel(label)
+                ax.grid(True, alpha=0.25)
+            self.axes[-1].set_xlabel("Time [s]")
+        else:
+            self.title_label.setText(
+                f"Node {node_id} | {self.session.state.demand} traces"
+            )
+            for line, values in zip(self._trace_lines, trace):
+                line.set_ydata(values)
+
+        self._update_time_cursor()
+        self.canvas.draw_idle()
+
+    def _update_time_cursor(self):
+        current_time = self.session.current_time()
+        for cursor in self._time_cursors:
+            cursor.set_xdata([current_time, current_time])
+
+
+class SpectrumPanel(QtWidgets.QWidget):
+    """Panel that computes and shows Newmark PSa on demand."""
+
+    def __init__(self, session, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self._current_node = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.title_label = QtWidgets.QLabel("No node selected")
+        self.figure = Figure(figsize=(5, 4), constrained_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        self.axes = self.figure.subplots(3, 1, sharex=True)
+
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.canvas, 1)
+
+        self.refresh("init")
+
+    def refresh(self, reason: str = "full"):
+        if reason == "time":
+            return
+
+        node_id = self.session.state.selected_node
+        if node_id is None:
+            self._current_node = None
+            for ax in self.axes:
+                ax.clear()
+                ax.grid(True, alpha=0.25)
+            self.title_label.setText("No node selected")
+            self.axes[-1].set_xlabel("Period [s]")
+            self.canvas.draw_idle()
+            return
+
+        if self._current_node == node_id and reason not in {"selection", "full", "init"}:
+            return
+
+        self._current_node = node_id
+        for ax in self.axes:
+            ax.clear()
+
+        try:
+            spectrum = self.session.current_spectrum()
+        except Exception as exc:  # pragma: no cover - runtime-only when deps are missing
+            self.title_label.setText(f"Spectrum unavailable: {exc}")
+            for ax in self.axes:
+                ax.grid(True, alpha=0.25)
+            self.canvas.draw_idle()
+            return
+
+        self.title_label.setText(f"Node {node_id} | Newmark PSa")
+        for ax, label in zip(self.axes, ("z", "e", "n")):
+            ax.plot(spectrum["T"], spectrum[f"PSa_{label}"], linewidth=1.2)
+            ax.set_ylabel(label.upper())
+            ax.grid(True, alpha=0.25)
+        self.axes[-1].set_xlabel("Period [s]")
+        self.canvas.draw_idle()
+
+
+class InfoPanel(QtWidgets.QWidget):
+    """Panel with data selectors and selected-node metadata."""
+
+    def __init__(self, session, parent=None):
+        super().__init__(parent)
+        self.session = session
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        controls_box = QtWidgets.QGroupBox("Controls")
+        controls_form = QtWidgets.QFormLayout(controls_box)
+
+        self.demand_combo = QtWidgets.QComboBox()
+        for demand in session.adapter.available_demands:
+            self.demand_combo.addItem(demand, demand)
+        self.demand_combo.currentTextChanged.connect(session.set_demand)
+
+        self.component_combo = QtWidgets.QComboBox()
+        for component in session.adapter.available_components:
+            self.component_combo.addItem(component, component)
+        self.component_combo.currentTextChanged.connect(session.set_component)
+
+        controls_form.addRow("Demand", self.demand_combo)
+        controls_form.addRow("Component", self.component_combo)
+
+        info_box = QtWidgets.QGroupBox("Selected Node")
+        info_form = QtWidgets.QFormLayout(info_box)
+
+        self.node_label = QtWidgets.QLabel("None")
+        self.type_label = QtWidgets.QLabel("-")
+        self.xyz_label = QtWidgets.QLabel("-")
+        self.gf_slot_label = QtWidgets.QLabel("-")
+
+        info_form.addRow("Node", self.node_label)
+        info_form.addRow("Type", self.type_label)
+        info_form.addRow("XYZ [m]", self.xyz_label)
+        info_form.addRow("GF slot s0", self.gf_slot_label)
+
+        layout.addWidget(controls_box)
+        layout.addWidget(info_box)
+        layout.addStretch(1)
+
+        self.refresh("init")
+
+    def refresh(self, _reason: str = "full"):
+        self._set_combo_value(self.demand_combo, self.session.state.demand)
+        self._set_combo_value(self.component_combo, self.session.state.component)
+
+        info = self.session.current_node_info()
+        if info is None:
+            self.node_label.setText("None")
+            self.type_label.setText("-")
+            self.xyz_label.setText("-")
+            self.gf_slot_label.setText("-")
+            return
+
+        xyz = info["xyz_m"]
+        xyz_text = "-" if xyz is None else f"{xyz[0]:.1f}, {xyz[1]:.1f}, {xyz[2]:.1f}"
+        gf_slot = info["gf_slot_s0"]
+
+        self.node_label.setText(str(info["node_id"]))
+        self.type_label.setText(str(info["type"]))
+        self.xyz_label.setText(xyz_text)
+        self.gf_slot_label.setText("-" if gf_slot is None else str(gf_slot))
+
+    @staticmethod
+    def _set_combo_value(combo, value):
+        block = combo.blockSignals(True)
+        combo.setCurrentText(str(value))
+        combo.blockSignals(block)

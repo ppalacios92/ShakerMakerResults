@@ -40,7 +40,6 @@ from .utils import _rotate
 
 
 
-
 class ShakerMakerData:
     """Unified reader for ShakerMaker HDF5 output files.
 
@@ -559,6 +558,27 @@ class ShakerMakerData:
         self._node_cache.clear(); self._gf_cache.clear()
         self._spectrum_cache.clear(); gc.collect()
         print("Cache cleared.")
+
+    def viewer(self, show=True, **kwargs):
+        """Open an interactive viewer session for this model.
+
+        Parameters
+        ----------
+        show : bool, default ``True``
+            When ``True``, build and show the Qt/PyVista window
+            immediately. When ``False``, return the session object
+            without opening the GUI yet.
+        **kwargs
+            Forwarded to :class:`ShakerMakerResults.viewer.ViewerSession`.
+
+        Returns
+        -------
+        ViewerSession
+            Interactive session bound to the current model instance.
+        """
+        from .viewer import ViewerSession
+
+        return ViewerSession(self, show=show, **kwargs)
 
     # ------------------------------------------------------------------
     # Windowing / resampling
@@ -1137,33 +1157,66 @@ class ShakerMakerData:
         if not self._gf_loaded:
             print("No GFs. Call load_gf_database() first.")
             return
-        nids = self._collect_node_ids(node_id, target_pos)
+
+        # Resolve node IDs — support list of positions
+        if target_pos is not None:
+            target_pos = np.asarray(target_pos)
+            if target_pos.ndim == 1:
+                # Single position [x, y, z]
+                nids = self._collect_node_ids(target_pos=target_pos)
+            else:
+                # Multiple positions [[x1,y1,z1], [x2,y2,z2], ...]
+                nids = []
+                for pos in target_pos:
+                    nids += self._collect_node_ids(target_pos=pos, print_info=True)
+        elif node_id is not None:
+            if isinstance(node_id, (list, np.ndarray)):
+                nids = []
+                for nid in node_id:
+                    nids += self._collect_node_ids(node_id=nid, print_info=True)
+            else:
+                nids = self._collect_node_ids(node_id=node_id)
+        else:
+            raise ValueError("Provide node_id or target_pos.")
+
         sub_ids = subfault if isinstance(subfault, (list, np.ndarray)) else [subfault]
-        labels = [f'G_{i+1}{j+1}' for i in range(3) for j in range(3)]
+        labels  = [f'G_{i+1}{j+1}' for i in range(3) for j in range(3)]
         fig, axes = plt.subplots(3, 3, figsize=figsize)
-        
+
+        results = {}
+
         for nid in nids:
-            # Convertir 'QA' al índice numérico
             if nid in ('QA', 'qa'):
-                nid_num = self._n_nodes
+                nid_num   = self._n_nodes
                 nid_label = 'QA'
             else:
-                nid_num = nid
+                nid_num   = nid
                 nid_label = f'N{nid}'
-            
+
             for sid in sub_ids:
-                slot = self._get_slot(nid_num, sid)
+                slot  = self._get_slot(nid_num, sid)
                 donor = self._pairs_to_compute[slot, 0]
                 if donor != nid_num:
                     print(f"Node {nid_label}/sub {sid} → slot {slot} (donor {donor})")
+
                 with h5py.File(self._gf_h5_path, 'r') as f:
-                    tdata = f['tdata'][slot]    # shape (nt, 9)
-                    t0    = float(f['t0'][slot]) if self._t0_available else 0.0
-                time = np.arange(tdata.shape[0]) * self._dt_orig + t0
-                lbl = f'{nid_label}_S{sid}'
+                    tdata_out = f['tdata'][slot]    # (nt, 9)
+                    t0_out    = float(f['t0'][slot]) if self._t0_available else 0.0
+
+                time = np.arange(tdata_out.shape[0]) * self._dt_orig + t0_out
+                lbl  = f'{nid_label}_S{sid}'
+
                 for j in range(9):
-                    axes[j // 3, j % 3].plot(time, tdata[:, j], linewidth=0.8, label=lbl)
-        
+                    axes[j // 3, j % 3].plot(time, tdata_out[:, j],
+                                              linewidth=0.8, label=lbl)
+
+                results[f'{nid_label}_S{sid}'] = {
+                    'tdata'  : tdata_out,
+                    'time'   : time,
+                    't0'     : t0_out,
+                    'node_id': nid_num
+                }
+
         for j, lbl in enumerate(labels):
             ax = axes[j // 3, j % 3]
             ax.set_title(lbl, fontsize=11, fontweight='bold')
@@ -1172,10 +1225,13 @@ class ShakerMakerData:
             ax.grid(True, alpha=0.3)
             if xlim:
                 ax.set_xlim(xlim)
+
         axes[0, 2].legend(fontsize=8)
         plt.suptitle('Tensor Green Functions', fontsize=14, fontweight='bold')
         plt.tight_layout()
         plt.show()
+
+        return results
 
     
 
@@ -1206,6 +1262,7 @@ class ShakerMakerData:
         """
         if xlim is None: xlim = [0, 5]
         nids   = self._collect_node_ids(node_id, target_pos)
+
         dt     = self.time[1] - self.time[0]
         scale  = 1.0 / 9.81 if data_type == 'accel' else 1.0
         ylabel = {'PSa': 'PSa (g)', 'Sa': 'Sa (g)', 'PSv': 'PSv (m/s)',
@@ -1722,6 +1779,7 @@ class ShakerMakerData:
         from EarthquakeSignal.core.arias_intensity import AriasIntensityAnalyzer
 
         nids = self._collect_node_ids(node_id, target_pos)
+
         dt   = self.time[1] - self.time[0]
 
         fig, axes = plt.subplots(3, 1, figsize=figsize)

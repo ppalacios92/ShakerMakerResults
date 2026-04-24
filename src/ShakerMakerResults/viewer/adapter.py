@@ -1,0 +1,791 @@
+"""Adapter between :class:`ShakerMakerData` and the interactive viewer."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from collections import OrderedDict
+
+import numpy as np
+
+from ..utils import _rotate
+from .colors import scalar_limits
+
+try:
+    from scipy.spatial import cKDTree
+except ImportError:  # pragma: no cover - fallback kept for optional envs
+    cKDTree = None
+
+
+VALID_DEMANDS = ("accel", "vel", "disp")
+VALID_COMPONENTS = ("z", "e", "n", "resultant")
+TRACE_COMPONENTS = ("z", "e", "n")
+
+
+@dataclass(frozen=True)
+class DatasetSummary:
+    """Human-readable summary of the current model for the viewer."""
+
+    name: str
+    dataset_type: str
+    node_count: int
+    display_node_count: int
+    time_steps: int
+    has_qa: bool
+    has_gf: bool
+    has_map: bool
+
+
+class ViewerDataAdapter:
+    """Expose the subset of ``ShakerMakerData`` needed by the viewer.
+
+    The 3-D scene uses snapshot-level lazy loading: each animation frame reads
+    only the active demand/component/time column. Full time-series are loaded
+    only for selected-node panels such as traces, spectra, and Arias intensity.
+    """
+
+    def __init__(
+        self,
+        model,
+        *,
+        cache_time_series: bool = True,
+        max_cache_bytes: int = 256 * 1024 * 1024,
+        max_cache_entries: int = 6,
+    ):
+        self.model = model
+        self.cache_time_series = bool(cache_time_series)
+        self.max_cache_bytes = int(max_cache_bytes)
+        self.max_cache_entries = max(1, int(max_cache_entries))
+
+        self._points = _rotate(model.xyz)
+        self._qa_point = (
+            _rotate(model.xyz_qa)[0]
+            if getattr(model, "xyz_qa", None) is not None
+            else None
+        )
+        self._display_points = (
+            np.vstack([self._points, self._qa_point[None, :]])
+            if self._qa_point is not None
+            else self._points.copy()
+        )
+        self._display_node_ids = list(range(len(self._points)))
+        if self._qa_point is not None:
+            self._display_node_ids.append("QA")
+        self._node_to_index = {
+            node_id: idx for idx, node_id in enumerate(self._display_node_ids)
+        }
+        self._kdtree = (
+            cKDTree(self._display_points) if cKDTree is not None else None
+        )
+
+        internal = np.asarray(getattr(model, "internal", np.zeros(len(self._points), dtype=bool)), dtype=bool)
+        if len(internal) != len(self._points):
+            internal = np.zeros(len(self._points), dtype=bool)
+        self._display_internal = (
+            np.concatenate([internal, np.array([False])])
+            if self._qa_point is not None
+            else internal.copy()
+        )
+        self._display_is_qa = np.zeros(len(self._display_points), dtype=bool)
+        if self._qa_point is not None:
+            self._display_is_qa[-1] = True
+
+        self._series_cache: OrderedDict[tuple[str, str], np.ndarray] = OrderedDict()
+        self._series_cache_hits = 0
+        self._spectrum_cache: dict[tuple[int | str, float, float, float], dict[str, np.ndarray]] = {}
+        self._arias_cache: dict[int | str, dict[str, object]] = {}
+
+        self._visible_node_ids = list(self._display_node_ids)
+        self._visible_to_display_index = np.arange(len(self._display_node_ids), dtype=int)
+
+    @property
+    def points(self) -> np.ndarray:
+        """All display coordinates in metres, rotated for plotting."""
+        return self._display_points
+
+    @property
+    def time(self) -> np.ndarray:
+        """Return the simulation time vector."""
+        return self.model.time
+
+    @property
+    def has_qa(self) -> bool:
+        return self._qa_point is not None
+
+    @property
+    def has_gf(self) -> bool:
+        return bool(getattr(self.model, "_has_gf", False))
+
+    @property
+    def has_map(self) -> bool:
+        return bool(getattr(self.model, "_has_map", False))
+
+    @property
+    def available_demands(self) -> tuple[str, ...]:
+        return VALID_DEMANDS
+
+    @property
+    def available_components(self) -> tuple[str, ...]:
+        return VALID_COMPONENTS
+
+    @property
+    def trace_components(self) -> tuple[str, ...]:
+        return TRACE_COMPONENTS
+
+    @property
+    def node_ids(self) -> list[int | str]:
+        return list(self._display_node_ids)
+
+    @property
+    def visible_node_ids(self) -> list[int | str]:
+        return list(self._visible_node_ids)
+
+    @property
+    def dataset_type(self) -> str:
+        if getattr(self.model, "is_drm", False):
+            if np.any(getattr(self.model, "internal", np.array([], dtype=bool))):
+                return "DRM"
+            return "SurfaceGrid"
+        return "Station"
+
+    def summary(self) -> DatasetSummary:
+        return DatasetSummary(
+            name=str(getattr(self.model, "name", getattr(self.model, "filename", "Model"))),
+            dataset_type=self.dataset_type,
+            node_count=len(self._points),
+            display_node_count=len(self._display_points),
+            time_steps=len(self.model.time),
+            has_qa=self.has_qa,
+            has_gf=self.has_gf,
+            has_map=self.has_map,
+        )
+
+    @property
+    def cache_info(self) -> dict[str, int]:
+        """Return lightweight scalar-series cache statistics."""
+        total_bytes = sum(arr.nbytes for arr in self._series_cache.values())
+        return {
+            "entries": len(self._series_cache),
+            "bytes": int(total_bytes),
+            "hits": int(self._series_cache_hits),
+        }
+
+    def clamp_time_index(self, time_index: int) -> int:
+        if len(self.model.time) == 0:
+            return 0
+        return max(0, min(int(time_index), len(self.model.time) - 1))
+
+    def node_id_from_index(self, point_index: int) -> int | str:
+        return self._display_node_ids[int(point_index)]
+
+    def node_id_from_visible_index(self, point_index: int) -> int | str:
+        return self._visible_node_ids[int(point_index)]
+
+    def point_index_for_node(self, node_id: int | str) -> int:
+        return self._node_to_index[node_id]
+
+    def point_for_node(self, node_id: int | str) -> np.ndarray:
+        return self._display_points[self.point_index_for_node(node_id)]
+
+    def nearest_node_id(self, point: np.ndarray) -> int | str:
+        """Return nearest node in viewer coordinates [m]."""
+        point = np.asarray(point, dtype=float)
+        if self._kdtree is not None:
+            _, idx = self._kdtree.query(point)
+            return self._display_node_ids[int(idx)]
+
+        distances = np.linalg.norm(self._display_points - point, axis=1)
+        return self._display_node_ids[int(np.argmin(distances))]
+
+    def nearest_node_from_model_xyz_m(self, xyz_m: np.ndarray) -> tuple[int | str, float]:
+        """Resolve nearest node from original model coordinates in metres.
+
+        This intentionally delegates to ShakerMakerData._collect_node_ids when
+        available so the viewer uses the same node-resolution semantics as the
+        plotting API.
+        """
+        xyz_km = np.asarray(xyz_m, dtype=float) / 1000.0
+        if hasattr(self.model, "_collect_node_ids"):
+            nids = self.model._collect_node_ids(target_pos=xyz_km, print_info=False)
+            node_id = nids[0]
+        else:
+            xyz_all = getattr(self.model, "xyz_all", None)
+            if xyz_all is None:
+                xyz_all = self.model.xyz
+            dist = np.linalg.norm(np.asarray(xyz_all) - xyz_km, axis=1)
+            idx = int(np.argmin(dist))
+            node_id = "QA" if self.has_qa and idx == len(self.model.xyz) else idx
+
+        if node_id in ("QA", "qa"):
+            pos_km = self.model.xyz_qa[0]
+        else:
+            pos_km = self.model.xyz[int(node_id)]
+        distance_m = float(np.linalg.norm(np.asarray(pos_km, dtype=float) - xyz_km) * 1000.0)
+        return node_id, distance_m
+
+    def visibility_mask(
+        self,
+        *,
+        show_internal: bool = True,
+        show_external: bool = True,
+        show_qa: bool = True,
+    ) -> np.ndarray:
+        internal = self._display_internal
+        is_qa = self._display_is_qa
+        external = (~internal) & (~is_qa)
+        mask = np.zeros(len(self._display_points), dtype=bool)
+        if show_internal:
+            mask |= internal
+        if show_external:
+            mask |= external
+        if show_qa:
+            mask |= is_qa
+        return mask
+
+    def visible_points(
+        self,
+        *,
+        show_internal: bool = True,
+        show_external: bool = True,
+        show_qa: bool = True,
+    ) -> np.ndarray:
+        mask = self.visibility_mask(
+            show_internal=show_internal,
+            show_external=show_external,
+            show_qa=show_qa,
+        )
+        self._visible_to_display_index = np.flatnonzero(mask)
+        self._visible_node_ids = [self._display_node_ids[i] for i in self._visible_to_display_index]
+        return self._display_points[mask]
+
+    def visible_scalars(
+        self,
+        values: np.ndarray,
+        *,
+        show_internal: bool = True,
+        show_external: bool = True,
+        show_qa: bool = True,
+    ) -> np.ndarray:
+        mask = self.visibility_mask(
+            show_internal=show_internal,
+            show_external=show_external,
+            show_qa=show_qa,
+        )
+        return np.asarray(values)[mask]
+
+    def scalar_snapshot(
+        self,
+        time_index: int,
+        demand: str = "accel",
+        component: str = "resultant",
+    ) -> np.ndarray:
+        """Return one scalar value per displayed point.
+
+        Fast path: if the full series is already cached (e.g. pre-warmed by
+        playback), returns the requested column with zero I/O overhead.
+        Falls back to a direct single-column HDF5 read, then to the
+        ``get_surface_snapshot`` API.
+        """
+        demand = self._validate_demand(demand)
+        component = self._validate_component(component)
+        time_index = self.clamp_time_index(time_index)
+
+        # ── Fast path: series already in memory ──────────────────────────────
+        key = (demand, component)
+        if key in self._series_cache:
+            self._series_cache_hits += 1
+            cached = self._series_cache[key]
+            col = min(time_index, cached.shape[1] - 1)
+            return np.asarray(cached[:, col], dtype=float)
+
+        direct = self._try_direct_component_snapshot(demand, component, time_index)
+        if direct is not None:
+            return np.asarray(direct, dtype=float)
+
+        if component == "resultant":
+            ex = self.model.get_surface_snapshot(time_index, "e", demand)
+            ny = self.model.get_surface_snapshot(time_index, "n", demand)
+            zz = self.model.get_surface_snapshot(time_index, "z", demand)
+            values = np.sqrt(ex ** 2 + ny ** 2 + zz ** 2)
+        else:
+            values = self.model.get_surface_snapshot(time_index, component, demand)
+
+        if self.has_qa:
+            qa_values = self.trace("QA", demand)
+            if component == "resultant":
+                qa_scalar = float(np.linalg.norm(qa_values[:, time_index]))
+            else:
+                qa_scalar = float(qa_values[self._component_to_trace_index(component), time_index])
+            values = np.concatenate([np.asarray(values), np.array([qa_scalar])])
+        return np.asarray(values, dtype=float)
+
+    def scalar_series(self, demand: str = "accel", component: str = "resultant") -> np.ndarray:
+        """Return the full time history matrix for one displayed scalar field."""
+        demand = self._validate_demand(demand)
+        component = self._validate_component(component)
+        key = (demand, component)
+
+        if key in self._series_cache:
+            self._series_cache_hits += 1
+            values = self._series_cache.pop(key)
+            self._series_cache[key] = values
+            return values
+
+        values = self._build_scalar_series(demand, component)
+        if self._can_cache(values):
+            self._series_cache[key] = values
+            while len(self._series_cache) > self.max_cache_entries:
+                self._series_cache.popitem(last=False)
+        return values
+
+    def trace(self, node_id: int | str, demand: str = "accel") -> np.ndarray:
+        """Return the selected node trace as ``[z, e, n]``."""
+        demand = self._validate_demand(demand)
+        if node_id in ("QA", "qa"):
+            if not self.has_qa:
+                raise KeyError("QA station is not available for this model.")
+            data = self.model.get_qa_data(demand)
+        else:
+            data = self.model.get_node_data(int(node_id), demand)
+        return np.asarray(data, dtype=float)
+
+    def gf_trace(self, node_id: int | str, subfault_id: int, component: str = "z") -> np.ndarray:
+        """Return one Green function trace when GF data is available."""
+        if not self.has_gf or not self.has_map:
+            raise RuntimeError("GF/map data is not available in this viewer session.")
+        component = component.lower()
+        if component not in ("z", "e", "n", "tdata"):
+            raise KeyError("GF component must be one of 'z', 'e', 'n', 'tdata'.")
+        return np.asarray(self.model.get_gf(node_id, subfault_id, component))
+
+    def spectrum(
+        self,
+        node_id: int | str,
+        *,
+        zeta: float = 0.05,
+        max_period: float = 5.01,
+        intervals: float = 0.02,
+    ) -> dict[str, np.ndarray]:
+        """Return cached Newmark spectra for the selected node."""
+        cache_key = (node_id, float(zeta), float(max_period), float(intervals))
+        if cache_key in self._spectrum_cache:
+            return self._spectrum_cache[cache_key]
+
+        try:
+            from ..newmark import NewmarkSpectrumAnalyzer
+        except ImportError as exc:  # pragma: no cover - optional runtime dependency
+            raise ImportError(
+                "Spectrum plotting requires the analysis dependencies "
+                "used by ShakerMakerResults.newmark."
+            ) from exc
+
+        trace = self.trace(node_id, "accel")
+        dt = float(self.model.time[1] - self.model.time[0]) if len(self.model.time) > 1 else 0.0
+        if dt <= 0.0:
+            raise ValueError("Cannot compute a spectrum without at least two time samples.")
+
+        labels = ("z", "e", "n")
+        result = {}
+        for label, series in zip(labels, trace):
+            spectrum = NewmarkSpectrumAnalyzer.compute(
+                series / 9.81,
+                dt,
+                zeta=zeta,
+                max_period=max_period,
+                intervals=intervals,
+            )
+            result[f"PSa_{label}"] = spectrum["PSa"]
+            result[f"Sa_{label}"] = spectrum["Sa"]
+            result[f"Sv_{label}"] = spectrum["Sv"]
+            result[f"Sd_{label}"] = spectrum["Sd"]
+            result["T"] = spectrum["T"]
+
+        self._spectrum_cache[cache_key] = result
+        return result
+
+    def arias(self, node_id: int | str) -> dict[str, object]:
+        """Return cached Arias-intensity curves for the selected node.
+
+        Uses EarthquakeSignal.core.arias_intensity.AriasIntensityAnalyzer, the
+        same analyzer used by ShakerMakerData.plot_node_arias().
+        """
+        if node_id in self._arias_cache:
+            return self._arias_cache[node_id]
+
+        try:
+            from EarthquakeSignal.core.arias_intensity import AriasIntensityAnalyzer
+        except ImportError as exc:  # pragma: no cover - optional runtime dependency
+            raise ImportError(
+                "Arias intensity requires EarthquakeSignal.core.arias_intensity."
+            ) from exc
+
+        acc = self.trace(node_id, "accel")
+        dt = float(self.model.time[1] - self.model.time[0]) if len(self.model.time) > 1 else 0.0
+        if dt <= 0.0:
+            raise ValueError("Cannot compute Arias intensity without at least two time samples.")
+
+        result: dict[str, object] = {"time": None, "components": {}}
+        for label, series in zip(("z", "e", "n"), acc):
+            ia_pct, t_start, t_end, ia_total, extra = AriasIntensityAnalyzer.compute(series / 9.81, dt)
+            time = np.arange(len(ia_pct), dtype=float) * dt
+            result["time"] = time
+            result["components"][label] = {
+                "IA_pct": np.asarray(ia_pct, dtype=float),
+                "t_start": float(t_start),
+                "t_end": float(t_end),
+                "ia_total": float(ia_total),
+                "extra": extra,
+            }
+        self._arias_cache[node_id] = result
+        return result
+
+    def displacement_snapshot(self, time_index: int) -> np.ndarray:
+        """Return per-node displacement as an ``(N_display, 3)`` array [E, N, Z] in metres.
+
+        Column mapping: 0 → East/X, 1 → North/Y, 2 → vertical/Z.
+        Uses ``scalar_snapshot`` internally so it benefits from the series cache
+        when pre-warmed by ``set_playing`` or ``set_warp_enabled``.
+        Returns zeros on any error so the scene degrades gracefully when the
+        model has no displacement data.
+        """
+        n = len(self._display_points)
+        try:
+            time_index = self.clamp_time_index(time_index)
+            disp_e = self.scalar_snapshot(time_index, "disp", "e")
+            disp_n = self.scalar_snapshot(time_index, "disp", "n")
+            disp_z = self.scalar_snapshot(time_index, "disp", "z")
+            return np.column_stack([disp_e, disp_n, disp_z])
+        except Exception:
+            return np.zeros((n, 3), dtype=float)
+
+    def suggested_warp_scale(self) -> float:
+        """Estimate a display-scale factor so peak displacements fill ~5 % of the domain.
+
+        Strategy (cheapest first):
+        1. Read ``model._vmax["disp"]`` — O(1), no I/O.
+        2. Fall back to a single ``scalar_snapshot(0, "disp", "resultant")`` call.
+        Returns a rounded power-of-10 value ≥ 1.
+        """
+        import math
+
+        pts = self._display_points
+        if len(pts) == 0:
+            return 1.0
+        domain = float(np.ptp(pts, axis=0).max())
+        if domain <= 0.0:
+            return 1.0
+
+        # Try cached _vmax from the model (written by ShakerMakerData._compute_vmax).
+        max_d = 0.0
+        vmax_by_type = getattr(self.model, "_vmax", None)
+        if isinstance(vmax_by_type, dict) and "disp" in vmax_by_type:
+            for v in vmax_by_type["disp"].values():
+                try:
+                    max_d = max(max_d, abs(float(v)))
+                except (TypeError, ValueError):
+                    pass
+
+        # Fall back to a single snapshot — still cheap (single HDF5 column or cache hit).
+        if max_d <= 0.0:
+            try:
+                snap = self.scalar_snapshot(0, "disp", "resultant")
+                max_d = float(np.max(np.abs(snap))) if len(snap) > 0 else 0.0
+            except Exception:
+                pass
+
+        if max_d <= 0.0:
+            return 1.0
+
+        raw = 0.05 * domain / max_d
+        # Round to nearest "nice" power-of-10 step.
+        magnitude = 10 ** math.floor(math.log10(max(raw, 1e-9)))
+        nice = max(1.0, round(raw / magnitude) * magnitude)
+        return float(nice)
+
+    def default_scalar_limits(self, demand: str = "accel", component: str = "resultant") -> tuple[float, float]:
+        """Return default color limits using ShakerMakerData._vmax when available."""
+        demand = self._validate_demand(demand)
+        component = self._validate_component(component)
+        try:
+            if getattr(self.model, "_vmax", None) is None and hasattr(self.model, "_compute_vmax"):
+                self.model._compute_vmax()
+            vmax_by_type = getattr(self.model, "_vmax", None)
+            if vmax_by_type is not None and demand in vmax_by_type and component in vmax_by_type[demand]:
+                vmax = float(vmax_by_type[demand][component])
+                if component == "resultant":
+                    return 0.0, max(vmax, 1.0 if vmax <= 0.0 else vmax)
+                return -max(abs(vmax), 1.0 if vmax == 0.0 else abs(vmax)), max(abs(vmax), 1.0 if vmax == 0.0 else abs(vmax))
+        except Exception:
+            pass
+
+        snapshot = self.scalar_snapshot(0, demand, component)
+        return scalar_limits(snapshot, component)
+
+    def node_info(self, node_id: int | str) -> dict[str, object]:
+        """Return metadata for the selected node."""
+        if node_id in ("QA", "qa"):
+            coords = self.model.xyz_qa[0] if self.has_qa else None
+            display = self._qa_point if self.has_qa else None
+            node_type = "QA"
+            internal = False
+        else:
+            idx = int(node_id)
+            coords = self.model.xyz[idx]
+            display = self._points[idx]
+            internal = bool(self.model.internal[idx]) if hasattr(self.model, "internal") else False
+            node_type = "internal" if internal else "external"
+
+        info = {
+            "node_id": node_id,
+            "type": node_type,
+            "internal": internal,
+            "xyz_km": None if coords is None else np.asarray(coords, dtype=float),
+            "xyz_model_m": None if coords is None else np.asarray(coords, dtype=float) * 1000.0,
+            "xyz_m": None if display is None else np.asarray(display, dtype=float),
+            "has_gf": self.has_gf and self.has_map,
+            "gf_slot_s0": None,
+        }
+        if info["has_gf"]:
+            try:
+                info["gf_slot_s0"] = int(self.model._get_slot(node_id, 0))
+            except Exception:
+                info["gf_slot_s0"] = None
+        return info
+
+    def _validate_demand(self, demand: str) -> str:
+        demand = demand.lower()
+        if demand not in VALID_DEMANDS:
+            raise KeyError(
+                f"Unknown demand '{demand}'. Use one of {', '.join(VALID_DEMANDS)}."
+            )
+        return demand
+
+    def _validate_component(self, component: str) -> str:
+        component = component.lower()
+        if component not in VALID_COMPONENTS:
+            raise KeyError(
+                "Unknown component "
+                f"'{component}'. Use one of {', '.join(VALID_COMPONENTS)}."
+            )
+        return component
+
+    @staticmethod
+    def _component_to_trace_index(component: str) -> int:
+        return {"z": 0, "e": 1, "n": 2}[component]
+
+    def _try_direct_component_snapshot(self, demand: str, component: str, time_index: int) -> np.ndarray | None:
+        if not self._supports_direct_snapshot():
+            return None
+        try:
+            import h5py
+        except ImportError:  # pragma: no cover
+            return None
+
+        try:
+            with h5py.File(self.model.filename, "r") as handle:
+                data_handle = handle[self._data_path_for_demand(demand)]
+                source_col = self._source_column_index(time_index, data_handle.shape[1])
+                if component == "resultant":
+                    e = np.asarray(data_handle[0::3, source_col], dtype=np.float32)
+                    n = np.asarray(data_handle[1::3, source_col], dtype=np.float32)
+                    z = np.asarray(data_handle[2::3, source_col], dtype=np.float32)
+                    values = np.sqrt(e ** 2 + n ** 2 + z ** 2).astype(np.float32, copy=False)
+                    qa_scalar = self._read_qa_resultant_snapshot(handle, demand, source_col)
+                else:
+                    row = {"e": 0, "n": 1, "z": 2}[component]
+                    values = np.asarray(data_handle[row::3, source_col], dtype=np.float32)
+                    qa_scalar = self._read_qa_component_snapshot(handle, demand, component, source_col)
+            if qa_scalar is not None:
+                values = np.concatenate([values, np.array([qa_scalar], dtype=np.float32)])
+            return values
+        except Exception:
+            return None
+
+    def _supports_direct_snapshot(self) -> bool:
+        return (
+            hasattr(self.model, "filename")
+            and hasattr(self.model, "_data_grp")
+            and not hasattr(self.model, "_resample_cache")
+        )
+
+    def _source_column_index(self, time_index: int, total_cols: int) -> int:
+        window_mask = getattr(self.model, "_window_mask", None)
+        if window_mask is None:
+            return max(0, min(int(time_index), total_cols - 1))
+        col_idx = np.flatnonzero(np.asarray(window_mask, dtype=bool))
+        if len(col_idx) == 0:
+            return 0
+        return int(col_idx[max(0, min(int(time_index), len(col_idx) - 1))])
+
+    def _read_qa_component_snapshot(self, handle, demand: str, component: str, column_index: int) -> float | None:
+        if not self.has_qa:
+            return None
+        path = self._qa_path_for_demand(demand)
+        row = {"e": 0, "n": 1, "z": 2}[component]
+        return float(handle[path][row, column_index])
+
+    def _read_qa_resultant_snapshot(self, handle, demand: str, column_index: int) -> float | None:
+        if not self.has_qa:
+            return None
+        path = self._qa_path_for_demand(demand)
+        qa = np.asarray(handle[path][:, column_index], dtype=np.float32)
+        return float(np.linalg.norm(qa[[2, 0, 1]]))
+
+    def _build_scalar_series(self, demand: str, component: str) -> np.ndarray:
+        direct = self._try_direct_component_series(demand, component)
+        if direct is not None:
+            return direct
+
+        n_times = len(self.model.time)
+        series = []
+        qa_values = self.trace("QA", demand) if self.has_qa else None
+        for time_index in range(n_times):
+            if component == "resultant":
+                ex = self.model.get_surface_snapshot(time_index, "e", demand)
+                ny = self.model.get_surface_snapshot(time_index, "n", demand)
+                zz = self.model.get_surface_snapshot(time_index, "z", demand)
+                values = np.sqrt(ex ** 2 + ny ** 2 + zz ** 2)
+            else:
+                values = self.model.get_surface_snapshot(time_index, component, demand)
+            if qa_values is not None:
+                if component == "resultant":
+                    qa_scalar = float(np.linalg.norm(qa_values[:, time_index]))
+                else:
+                    qa_scalar = float(qa_values[self._component_to_trace_index(component), time_index])
+                values = np.concatenate([values, np.array([qa_scalar])])
+            series.append(np.asarray(values, dtype=np.float32))
+        return np.column_stack(series)
+
+    def _try_direct_component_series(self, demand: str, component: str) -> np.ndarray | None:
+        if not self._supports_direct_series():
+            return None
+        if not self.cache_time_series:
+            return None
+
+        try:
+            import h5py
+        except ImportError:  # pragma: no cover - package dependency in real runtime
+            return None
+
+        series_bytes = self._estimated_series_bytes()
+        if component == "resultant":
+            series_bytes *= 3
+        if series_bytes > self.max_cache_bytes:
+            return None
+
+        with h5py.File(self.model.filename, "r") as handle:
+            data_handle = handle[self._data_path_for_demand(demand)]
+            column_selector, n_cols = self._column_selector(data_handle.shape[1])
+            if component == "resultant":
+                values = self._read_resultant_series(data_handle, column_selector, n_cols)
+                qa_scalar = self._read_qa_resultant_series(handle, demand, column_selector)
+            else:
+                values = self._read_component_series(data_handle, component, column_selector)
+                qa_scalar = self._read_qa_component_series(handle, demand, component, column_selector)
+
+        if qa_scalar is not None:
+            values = np.vstack([values, qa_scalar[None, :]])
+        return np.asarray(values, dtype=np.float32)
+
+    def _supports_direct_series(self) -> bool:
+        return (
+            hasattr(self.model, "filename")
+            and hasattr(self.model, "_data_grp")
+            and self.cache_time_series
+            and not hasattr(self.model, "_resample_cache")
+        )
+
+    def _estimated_series_bytes(self) -> int:
+        rows = len(self._points) + (1 if self.has_qa else 0)
+        cols = len(self.model.time)
+        return rows * cols * np.dtype(np.float32).itemsize
+
+    def _can_cache(self, values: np.ndarray) -> bool:
+        return self.cache_time_series and values.nbytes <= self.max_cache_bytes
+
+    def _read_component_series(self, data_handle, component: str, column_selector) -> np.ndarray:
+        row = {"e": 0, "n": 1, "z": 2}[component]
+        return np.asarray(data_handle[row::3, column_selector], dtype=np.float32)
+
+    def _read_qa_component_series(self, handle, demand: str, component: str, column_selector) -> np.ndarray | None:
+        if not self.has_qa:
+            return None
+        path = self._qa_path_for_demand(demand)
+        row = {"e": 0, "n": 1, "z": 2}[component]
+        return np.asarray(handle[path][row, column_selector], dtype=np.float32)
+
+    def _read_qa_resultant_series(self, handle, demand: str, column_selector) -> np.ndarray | None:
+        if not self.has_qa:
+            return None
+        path = self._qa_path_for_demand(demand)
+        qa_data = np.asarray(handle[path][:, column_selector], dtype=np.float32)
+        qa_reordered = qa_data[[2, 0, 1], :]
+        return np.sqrt(np.sum(qa_reordered ** 2, axis=0)).astype(np.float32, copy=False)
+
+    def _read_resultant_series(self, data_handle, column_selector, n_cols: int) -> np.ndarray:
+        n_nodes = data_handle.shape[0] // 3
+        values = np.empty((n_nodes, n_cols), dtype=np.float32)
+        chunk_cols = self._resultant_chunk_cols(n_nodes)
+
+        if isinstance(column_selector, slice):
+            start = int(column_selector.start or 0)
+            stop = int(column_selector.stop if column_selector.stop is not None else data_handle.shape[1])
+            local = 0
+            for chunk_start in range(start, stop, chunk_cols):
+                chunk_stop = min(chunk_start + chunk_cols, stop)
+                ex = np.asarray(data_handle[0::3, chunk_start:chunk_stop], dtype=np.float32)
+                ny = np.asarray(data_handle[1::3, chunk_start:chunk_stop], dtype=np.float32)
+                zz = np.asarray(data_handle[2::3, chunk_start:chunk_stop], dtype=np.float32)
+                width = chunk_stop - chunk_start
+                values[:, local:local + width] = np.sqrt(ex ** 2 + ny ** 2 + zz ** 2).astype(np.float32, copy=False)
+                local += width
+            return values
+
+        col_idx = np.asarray(column_selector, dtype=np.int64)
+        local = 0
+        for chunk_start in range(0, len(col_idx), chunk_cols):
+            chunk_cols_idx = col_idx[chunk_start:chunk_start + chunk_cols]
+            ex = np.asarray(data_handle[0::3, chunk_cols_idx], dtype=np.float32)
+            ny = np.asarray(data_handle[1::3, chunk_cols_idx], dtype=np.float32)
+            zz = np.asarray(data_handle[2::3, chunk_cols_idx], dtype=np.float32)
+            width = len(chunk_cols_idx)
+            values[:, local:local + width] = np.sqrt(ex ** 2 + ny ** 2 + zz ** 2).astype(np.float32, copy=False)
+            local += width
+        return values
+
+    def _column_selector(self, total_cols: int):
+        window_mask = getattr(self.model, "_window_mask", None)
+        if window_mask is None:
+            return slice(0, total_cols), total_cols
+
+        col_idx = np.flatnonzero(np.asarray(window_mask, dtype=bool))
+        if len(col_idx) == 0:
+            return slice(0, 0), 0
+
+        if len(col_idx) == int(col_idx[-1] - col_idx[0] + 1):
+            start = int(col_idx[0])
+            stop = int(col_idx[-1]) + 1
+            return slice(start, stop), stop - start
+
+        return col_idx.astype(np.int64), len(col_idx)
+
+    @staticmethod
+    def _resultant_chunk_cols(n_nodes: int) -> int:
+        target_bytes = 64 * 1024 * 1024
+        bytes_per_col = max(n_nodes * np.dtype(np.float32).itemsize * 3, 1)
+        return max(16, target_bytes // bytes_per_col)
+
+    def _data_path_for_demand(self, demand: str) -> str:
+        return {
+            "accel": f"{self.model._data_grp}/acceleration",
+            "vel": f"{self.model._data_grp}/velocity",
+            "disp": f"{self.model._data_grp}/displacement",
+        }[demand]
+
+    def _qa_path_for_demand(self, demand: str) -> str:
+        if not self.has_qa or self.model._qa_grp is None:
+            raise KeyError("QA station is not available for this model.")
+        return {
+            "accel": f"{self.model._qa_grp}/acceleration",
+            "vel": f"{self.model._qa_grp}/velocity",
+            "disp": f"{self.model._qa_grp}/displacement",
+        }[demand]

@@ -1,0 +1,146 @@
+"""PyVista scene management for the interactive viewer."""
+
+from __future__ import annotations
+
+from ._imports import require_viewer_dependencies
+from .colors import scalar_limits
+from .interaction import RevitInteractorStyle
+
+pv, _, vtk, _, _, _ = require_viewer_dependencies()
+
+
+class ViewerScene:
+    """Build and refresh the 3D PyVista representation."""
+
+    def __init__(self, plotter, session):
+        self.plotter = plotter
+        self.session = session
+        self.point_cloud = None
+        self.point_actor = None
+        self.selection_actor = None
+        self._picker = vtk.vtkPointPicker()
+        self._picker.SetTolerance(0.02)
+        self._interactor_style = None
+
+    def build(self):
+        scalars = self.session.current_scalars()
+        self.point_cloud = pv.PolyData(self.session.adapter.points)
+        self.point_cloud.point_data["active_scalars"] = scalars
+        self.plotter.set_background(self.session.current_background_color())
+        self.point_actor = self._add_point_actor()
+        self.plotter.add_axes()
+        self.plotter.reset_camera()
+        self._install_picking()
+        self.refresh_selection(render=False)
+
+    def refresh_scalars(self, render: bool = True):
+        scalars = self.session.current_scalars()
+        self.point_cloud.point_data["active_scalars"] = scalars
+        if self.point_cloud is not None:
+            self.point_cloud.Modified()
+        if self.point_actor is not None:
+            mapper = self.point_actor.mapper
+            mapper.scalar_range = scalar_limits(scalars, self.session.state.component)
+        if render:
+            self.plotter.render()
+
+    def rebuild_scalar_actor(self, render: bool = True):
+        scalars = self.session.current_scalars()
+        self.point_cloud.point_data["active_scalars"] = scalars
+        if self.point_cloud is not None:
+            self.point_cloud.Modified()
+        if self.point_actor is not None:
+            self.plotter.remove_actor(self.point_actor, render=False)
+        self.point_actor = self._add_point_actor()
+        if render:
+            self.plotter.render()
+
+    def refresh_selection(self, render: bool = True):
+        if self.selection_actor is not None:
+            self.plotter.remove_actor(self.selection_actor, render=False)
+            self.selection_actor = None
+
+        node_id = self.session.state.selected_node
+        if node_id is None:
+            if render:
+                self.plotter.render()
+            return
+
+        point = self.session.adapter.point_for_node(node_id)
+        selected = pv.PolyData(point[None, :])
+        self.selection_actor = self.plotter.add_points(
+            selected,
+            color="yellow",
+            point_size=max(self._point_size() + 8, 18),
+            render_points_as_spheres=True,
+            render=False,
+        )
+        if render:
+            self.plotter.render()
+
+    def _install_picking(self):
+        vtk_interactor = self._vtk_interactor()
+        if vtk_interactor is None:
+            return
+        self._interactor_style = RevitInteractorStyle(
+            self.plotter,
+            self._picker,
+            on_point_picked=self._handle_point_pick,
+            on_point_double_clicked=self._handle_point_double_click,
+        )
+        vtk_interactor.SetInteractorStyle(self._interactor_style)
+
+    def _handle_point_pick(self, point_id, _pick_pos=None):
+        if point_id >= 0:
+            node_id = self.session.adapter.node_id_from_index(point_id)
+            self.session.select_node(node_id)
+
+    def _handle_point_double_click(self, point_id, _pick_pos=None):
+        if point_id >= 0:
+            node_id = self.session.adapter.node_id_from_index(point_id)
+            self.session.select_node(node_id)
+            self.center_on_node(node_id)
+
+    def apply_appearance(self, render: bool = True):
+        self.plotter.set_background(self.session.current_background_color())
+        self.rebuild_scalar_actor(render=render)
+
+    def center_on_node(self, node_id, render: bool = True):
+        point = self.session.adapter.point_for_node(node_id)
+        camera = getattr(self.plotter, "camera", None)
+        if camera is None:
+            return
+
+        focal = camera.GetFocalPoint()
+        position = camera.GetPosition()
+        direction = [position[i] - focal[i] for i in range(3)]
+        scale = 0.35
+        new_position = [point[i] + direction[i] * scale for i in range(3)]
+        camera.SetFocalPoint(*point)
+        camera.SetPosition(*new_position)
+        self.plotter.reset_camera_clipping_range()
+        if render:
+            self.plotter.render()
+
+    def _add_point_actor(self):
+        scalars = self.point_cloud.point_data["active_scalars"]
+        return self.plotter.add_points(
+            self.point_cloud,
+            scalars="active_scalars",
+            cmap=self.session.current_colormap(),
+            clim=scalar_limits(scalars, self.session.state.component),
+            render_points_as_spheres=True,
+            point_size=self._point_size(),
+            show_scalar_bar=self.session.state.show_scalar_bar,
+            scalar_bar_args={"title": self.session.state.demand},
+            render=False,
+        )
+
+    def _vtk_interactor(self):
+        iren = getattr(self.plotter, "iren", None)
+        if iren is None:
+            return None
+        return getattr(iren, "interactor", iren)
+
+    def _point_size(self) -> float:
+        return self.session.suggested_point_size()

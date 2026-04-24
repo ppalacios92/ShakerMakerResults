@@ -5,53 +5,61 @@ Reader and visualisation toolkit for ShakerMaker HDF5 output files.
 Supports DRM outputs, SurfaceGrid outputs, and real seismic station
 recordings. File format is detected automatically for HDF5 outputs.
 
-Modules
--------
-shakermaker_data
-    ``ShakerMakerData`` — unified HDF5 reader.
-    ``DRMData``         — alias for DRM box outputs.
-    ``SurfaceData``     — alias for SurfaceGrid outputs.
-station_data
-    ``StationData``     — reader for real station recordings (NPZ / HDF5).
-plotting
-    Multi-model plotting functions.
-comparison
-    Quantitative signal and spectral comparison functions.
-newmark
-    ``NewmarkSpectrumAnalyzer`` — β-Newmark response spectrum calculator.
-
-Typical usage
--------------
->>> from ShakerMakerResults import DRMData, SurfaceData, StationData
->>> drm     = DRMData("DRM_5m_H1_s0.h5drm")
->>> surface = SurfaceData("Surface_10m_H1_s0.h5drm")
->>> station = StationData("station_H1.npz", name="H1 field")
->>> from ShakerMakerResults import compare_node_response, plot_models_response
->>> compare_node_response([drm, surface], node_id='QA')
->>> plot_models_response([drm, surface], node_ids=[['QA'], ['QA']])
+The public API is loaded lazily so the package can be imported even when
+optional viewer dependencies are not installed yet.
 """
 
-from .shakermaker_data import ShakerMakerData
-from .station_data     import StationData
-from .newmark          import NewmarkSpectrumAnalyzer
-from .plotting import (
-    plot_models_response,
-    plot_models_newmark,
-    plot_models_gf,
-    plot_models_tensor_gf,
-    plot_models_domain,
-    plot_models_arias,
-)
-from .comparison import (
-    compare_node_response,
-    compare_spectra,
-)
+from importlib import import_module
 
 __all__ = [
-    "ShakerMakerData", "DRMData", "SurfaceData", "StationData",
+    "ShakerMakerData",
+    "DRMData",
+    "SurfaceData",
+    "StationData",
     "NewmarkSpectrumAnalyzer",
-    "plot_models_response", "plot_models_newmark",
-    "plot_models_gf", "plot_models_tensor_gf",
-    "plot_models_domain", "plot_models_arias",
-    "compare_node_response", "compare_spectra",
+    "plot_models_response",
+    "plot_models_newmark",
+    "plot_models_gf",
+    "plot_models_tensor_gf",
+    "plot_models_domain",
+    "plot_models_arias",
+    "compare_node_response",
+    "compare_spectra",
+    "ViewerDataAdapter",
+    "ViewerState",
+    "ViewerSession",
 ]
+
+_EXPORTS = {
+    "ShakerMakerData": (".shakermaker_data", "ShakerMakerData"),
+    "DRMData": (".shakermaker_data", "ShakerMakerData"),
+    "SurfaceData": (".shakermaker_data", "ShakerMakerData"),
+    "StationData": (".station_data", "StationData"),
+    "NewmarkSpectrumAnalyzer": (".newmark", "NewmarkSpectrumAnalyzer"),
+    "plot_models_response": (".plotting", "plot_models_response"),
+    "plot_models_newmark": (".plotting", "plot_models_newmark"),
+    "plot_models_gf": (".plotting", "plot_models_gf"),
+    "plot_models_tensor_gf": (".plotting", "plot_models_tensor_gf"),
+    "plot_models_domain": (".plotting", "plot_models_domain"),
+    "plot_models_arias": (".plotting", "plot_models_arias"),
+    "compare_node_response": (".comparison", "compare_node_response"),
+    "compare_spectra": (".comparison", "compare_spectra"),
+    "ViewerDataAdapter": (".viewer", "ViewerDataAdapter"),
+    "ViewerState": (".viewer", "ViewerState"),
+    "ViewerSession": (".viewer", "ViewerSession"),
+}
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    module_name, attr_name = _EXPORTS[name]
+    module = import_module(module_name, __name__)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

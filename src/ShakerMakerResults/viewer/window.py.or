@@ -1,0 +1,147 @@
+"""Qt main window for the interactive viewer."""
+
+from __future__ import annotations
+
+from ._imports import require_viewer_dependencies
+from .controls import HeaderBar, StatusChipBar, TimeControls
+from .scene import ViewerScene
+from .trace_panel import InfoPanel, SpectrumPanel, TracePanel
+
+_, QtInteractor, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
+
+
+class ViewerMainWindow(QtWidgets.QMainWindow):
+    """Thin Qt shell around the plotter, tabs, and transport controls."""
+
+    def __init__(self, session):
+        super().__init__()
+        self.session = session
+        summary = session.adapter.summary()
+
+        self.setWindowTitle(f"{summary.name} | Interactive Viewer")
+        self.resize(1600, 900)
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        self.header = HeaderBar(session)
+        root.addWidget(self.header)
+
+        splitter = QtWidgets.QSplitter()
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+
+        self.plotter = QtInteractor(self)
+        splitter.addWidget(self.plotter.interactor)
+
+        self.tabs = QtWidgets.QTabWidget()
+        self.trace_panel = TracePanel(session)
+        self.spectrum_panel = SpectrumPanel(session)
+        self.info_panel = InfoPanel(session)
+        self.tabs.addTab(self.trace_panel, "Traces")
+        self.tabs.addTab(self.spectrum_panel, "Spectrum")
+        self.tabs.addTab(self.info_panel, "Info")
+        splitter.addWidget(self.tabs)
+        splitter.setSizes([1280, 320])
+
+        root.addWidget(splitter, 1)
+
+        self.time_controls = TimeControls(session, on_play_toggled=self._on_play_toggled)
+        root.addWidget(self.time_controls)
+
+        self._play_timer = QtCore.QTimer(self)
+        self._play_timer.setInterval(80)
+        self._play_timer.timeout.connect(self._advance_playback)
+
+        self.scene = ViewerScene(self.plotter, session)
+        self.scene.build()
+
+        self.status_chip_bar = StatusChipBar()
+        self.statusBar().addPermanentWidget(self.status_chip_bar, 1)
+        self._update_status()
+
+        self._space_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Space"), self)
+        self._space_shortcut.activated.connect(self._toggle_play_shortcut)
+
+    def on_session_updated(self, reason: str):
+        self.header.sync_from_state()
+        self.time_controls.sync_from_state()
+        self.info_panel.refresh(reason)
+
+        if reason == "time":
+            self.scene.refresh_scalars(render=False)
+            self.trace_panel.refresh("time")
+            self.spectrum_panel.refresh("time")
+        elif reason == "selection":
+            self.scene.refresh_selection(render=False)
+            self.trace_panel.refresh("selection")
+            self.spectrum_panel.refresh("selection")
+        elif reason in {"demand", "component"}:
+            self.scene.rebuild_scalar_actor(render=False)
+            self.trace_panel.refresh("demand")
+            self.spectrum_panel.refresh("demand")
+        elif reason == "appearance":
+            self.scene.apply_appearance(render=False)
+            self.scene.refresh_selection(render=False)
+            self.trace_panel.refresh("full")
+            self.spectrum_panel.refresh("full")
+        elif reason == "playback":
+            self._sync_play_state()
+        else:
+            self.scene.rebuild_scalar_actor(render=False)
+            self.scene.refresh_selection(render=False)
+            self.trace_panel.refresh("full")
+            self.spectrum_panel.refresh("full")
+
+        self._update_status()
+        self.plotter.render()
+
+    def _toggle_play_shortcut(self):
+        self.session.toggle_playing()
+        self._sync_play_state()
+
+    def _on_play_toggled(self, _is_playing: bool):
+        self._sync_play_state()
+
+    def _sync_play_state(self):
+        if self.session.state.is_playing:
+            self._play_timer.setInterval(self._play_interval_ms())
+            self._play_timer.start()
+        else:
+            self._play_timer.stop()
+        self.time_controls.sync_from_state()
+        self._update_status()
+
+    def _advance_playback(self):
+        max_index = max(len(self.session.adapter.time) - 1, 0)
+        if self.session.state.time_index >= max_index:
+            self.session.set_playing(False)
+            self._sync_play_state()
+            return
+        self.session.step_time(1)
+
+    def _update_status(self):
+        selected = self.session.state.selected_node
+        selected_label = "Node -" if selected is None else f"Node {selected}"
+        chips = [
+            f"⏱ {self.session.current_time():.3f}s",
+            f"📊 {self.session.state.demand} · {self.session.state.component}",
+            f"📍 {selected_label}",
+            f"💾 {self._cache_summary()}",
+        ]
+        self.status_chip_bar.update_values(chips)
+
+    def _cache_summary(self) -> str:
+        info = self.session.adapter.cache_info
+        mb = info["bytes"] / (1024 * 1024)
+        return f"cache {mb:.1f} MB"
+
+    def _play_interval_ms(self) -> int:
+        speed = max(float(self.session.state.playback_speed), 0.1)
+        base_ms = 80.0
+        return max(10, int(round(base_ms / speed)))

@@ -1,0 +1,111 @@
+"""Viewer state container."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .adapter import VALID_COMPONENTS, VALID_DEMANDS
+from .colors import BACKGROUND_PRESETS, colormap_for_component
+
+
+@dataclass
+class ViewerState:
+    """Mutable state for one viewer session."""
+
+    time_index: int = 0
+    demand: str = "accel"
+    component: str = "resultant"
+    selected_node: int | str | None = None
+    background: str = "White"
+    colormap: str | None = None
+    point_size: float | None = None
+    show_scalar_bar: bool = True
+    is_playing: bool = False
+    playback_speed: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.demand = self._validate_demand(self.demand)
+        self.component = self._validate_component(self.component)
+        self.time_index = max(0, int(self.time_index))
+        self.background = self._validate_background(self.background)
+        if self.colormap is None:
+            self.colormap = colormap_for_component(self.component)
+        self.point_size = None if self.point_size is None else float(self.point_size)
+        self.show_scalar_bar = bool(self.show_scalar_bar)
+        self.is_playing = bool(self.is_playing)
+        self.playback_speed = self._validate_playback_speed(self.playback_speed)
+
+    def set_time_index(self, time_index: int, max_index: int) -> int:
+        self.time_index = max(0, min(int(time_index), int(max_index)))
+        return self.time_index
+
+    def set_demand(self, demand: str) -> str:
+        self.demand = self._validate_demand(demand)
+        return self.demand
+
+    def set_component(self, component: str) -> str:
+        self.component = self._validate_component(component)
+        return self.component
+
+    def set_selected_node(self, node_id: int | str | None) -> int | str | None:
+        self.selected_node = node_id
+        return self.selected_node
+
+    def set_background(self, background: str) -> str:
+        self.background = self._validate_background(background)
+        return self.background
+
+    def set_colormap(self, colormap: str) -> str:
+        self.colormap = str(colormap)
+        return self.colormap
+
+    def set_point_size(self, point_size: float | None) -> float | None:
+        self.point_size = None if point_size is None else float(point_size)
+        return self.point_size
+
+    def set_show_scalar_bar(self, show_scalar_bar: bool) -> bool:
+        self.show_scalar_bar = bool(show_scalar_bar)
+        return self.show_scalar_bar
+
+    def set_playing(self, is_playing: bool) -> bool:
+        self.is_playing = bool(is_playing)
+        return self.is_playing
+
+    def set_playback_speed(self, playback_speed: float) -> float:
+        self.playback_speed = self._validate_playback_speed(playback_speed)
+        return self.playback_speed
+
+    @staticmethod
+    def _validate_demand(demand: str) -> str:
+        demand = demand.lower()
+        if demand not in VALID_DEMANDS:
+            raise KeyError(
+                f"Unknown demand '{demand}'. Use one of {', '.join(VALID_DEMANDS)}."
+            )
+        return demand
+
+    @staticmethod
+    def _validate_component(component: str) -> str:
+        component = component.lower()
+        if component not in VALID_COMPONENTS:
+            raise KeyError(
+                "Unknown component "
+                f"'{component}'. Use one of {', '.join(VALID_COMPONENTS)}."
+            )
+        return component
+
+    @staticmethod
+    def _validate_background(background: str) -> str:
+        if background not in BACKGROUND_PRESETS:
+            raise KeyError(
+                f"Unknown background '{background}'. Use one of "
+                f"{', '.join(BACKGROUND_PRESETS)}."
+            )
+        return background
+
+    @staticmethod
+    def _validate_playback_speed(playback_speed: float) -> float:
+        speed = float(playback_speed)
+        if speed <= 0.0:
+            raise ValueError("playback_speed must be greater than 0.")
+        return speed

@@ -651,7 +651,7 @@ def plot_models_arias(models,
 
     plt.tight_layout()
     plt.show()
-    
+
 
 # ---------------------------------------------------------------------------
 # Station + DRM mixed helpers — reserved for future release

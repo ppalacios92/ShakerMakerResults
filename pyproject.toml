@@ -19,6 +19,14 @@ dependencies = [
     "numba",
 ]
 
+[project.optional-dependencies]
+viewer = [
+    "pyvista",
+    "vtk",
+    "pyvistaqt",
+    "qtpy",
+]
+
 [project.urls]
 Homepage = "https://github.com/ppalacios92/ShakerMakerResults"
 Repository = "https://github.com/ppalacios92/ShakerMakerResults"

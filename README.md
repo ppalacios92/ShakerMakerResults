@@ -9,6 +9,7 @@ A Python-based tool for reading, analyzing, and visualizing ShakerMaker simulati
 - Read ShakerMaker results from HDF5 files (DRM and station outputs)
 - Extract node coordinates, velocity, acceleration and displacement
 - Visualize domains in 3D
+- Launch an interactive viewer with `model.viewer()` for demand maps and node traces
 - Plot time histories and Fourier spectra
 - Compare multiple models
 - Compute Newmark response spectra
@@ -27,6 +28,22 @@ A Python-based tool for reading, analyzing, and visualizing ShakerMaker simulati
 git clone https://github.com/ppalacios92/ShakerMakerResults.git
 cd ShakerMakerResults
 pip install -e .
+```
+
+For the interactive viewer:
+```bash
+pip install -e ".[viewer]"
+```
+
+## Interactive Viewer
+```python
+from ShakerMakerResults import ShakerMakerData
+
+model = ShakerMakerData("Surface_10m.h5drm")
+model.load_gf_database("gf_database_10m_gf.h5")
+model.load_map("gf_database_10m_map.h5")
+
+model.viewer()
 ```
 
 ---
