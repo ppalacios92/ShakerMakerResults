@@ -7,7 +7,8 @@ from collections import OrderedDict
 
 import numpy as np
 
-from ..utils import _rotate
+from ..core.gf_service import get_gf_tensor
+from ..utils import _R
 from .colors import scalar_limits
 
 try:
@@ -16,9 +17,28 @@ except ImportError:  # pragma: no cover - fallback kept for optional envs
     cKDTree = None
 
 
-VALID_DEMANDS = ("accel", "vel", "disp")
-VALID_COMPONENTS = ("z", "e", "n", "resultant")
+REGULAR_DEMANDS = ("accel", "vel", "disp")
+GF_DEMAND = "gf"
+VALID_DEMANDS = REGULAR_DEMANDS + (GF_DEMAND,)
+
+REGULAR_COMPONENTS = ("z", "e", "n", "resultant")
+GF_COMPONENTS = tuple(f"g{i}{j}" for i in range(1, 4) for j in range(1, 4))
+VALID_COMPONENTS = REGULAR_COMPONENTS + GF_COMPONENTS
 TRACE_COMPONENTS = ("z", "e", "n")
+
+DISPLAY_DEMAND_LABELS = {
+    "accel": "accel",
+    "vel": "vel",
+    "disp": "disp",
+    GF_DEMAND: "Green Functions",
+}
+DISPLAY_COMPONENT_LABELS = {
+    "z": "z",
+    "e": "e",
+    "n": "n",
+    "resultant": "resultant",
+    **{comp: comp.upper() for comp in GF_COMPONENTS},
+}
 
 
 @dataclass(frozen=True)
@@ -55,52 +75,50 @@ class ViewerDataAdapter:
         self.cache_time_series = bool(cache_time_series)
         self.max_cache_bytes = int(max_cache_bytes)
         self.max_cache_entries = max(1, int(max_cache_entries))
+        self._display_transform = np.asarray(_R, dtype=float).copy()
 
-        self._points = _rotate(model.xyz)
-        self._qa_point = (
-            _rotate(model.xyz_qa)[0]
-            if getattr(model, "xyz_qa", None) is not None
-            else None
-        )
-        self._display_points = (
-            np.vstack([self._points, self._qa_point[None, :]])
-            if self._qa_point is not None
-            else self._points.copy()
-        )
-        self._display_node_ids = list(range(len(self._points)))
-        if self._qa_point is not None:
+        self._points = np.empty((0, 3), dtype=float)
+        self._qa_point = None
+        self._display_points = np.empty((0, 3), dtype=float)
+        self._display_node_ids = list(range(len(model.xyz)))
+        if getattr(model, "xyz_qa", None) is not None:
             self._display_node_ids.append("QA")
         self._node_to_index = {
             node_id: idx for idx, node_id in enumerate(self._display_node_ids)
         }
-        self._kdtree = (
-            cKDTree(self._display_points) if cKDTree is not None else None
-        )
+        self._kdtree = None
 
-        internal = np.asarray(getattr(model, "internal", np.zeros(len(self._points), dtype=bool)), dtype=bool)
-        if len(internal) != len(self._points):
-            internal = np.zeros(len(self._points), dtype=bool)
-        self._display_internal = (
-            np.concatenate([internal, np.array([False])])
-            if self._qa_point is not None
-            else internal.copy()
-        )
-        self._display_is_qa = np.zeros(len(self._display_points), dtype=bool)
-        if self._qa_point is not None:
-            self._display_is_qa[-1] = True
+        self._display_internal = np.zeros(len(self._display_node_ids), dtype=bool)
+        self._display_is_qa = np.zeros(len(self._display_node_ids), dtype=bool)
 
         self._series_cache: OrderedDict[tuple[str, str], np.ndarray] = OrderedDict()
         self._series_cache_hits = 0
         self._spectrum_cache: dict[tuple[int | str, float, float, float], dict[str, np.ndarray]] = {}
         self._arias_cache: dict[int | str, dict[str, object]] = {}
+        self._gf_slot_cache: dict[int, np.ndarray] = {}
+        self._gf_t0_cache: dict[int, np.ndarray] = {}
+        self._gf_limit_cache: dict[tuple[int, str], tuple[float, float]] = {}
+        # Pre-warmed GF field: (subfault_id, component_idx) → (n_nodes, nt_gf) float32
+        # One HDF5 read fills this; subsequent playback frames are pure NumPy.
+        self._gf_series_cache: dict[tuple[int, int], np.ndarray] = {}
+        # Persistent HDF5 handle kept open during playback for large regular-demand
+        # models (series too big to cache).  Eliminates ~1-5 ms file-open overhead
+        # per frame when _try_direct_component_snapshot is the active path.
+        self._playback_h5_handle = None
 
         self._visible_node_ids = list(self._display_node_ids)
         self._visible_to_display_index = np.arange(len(self._display_node_ids), dtype=int)
+        self._rebuild_display_geometry()
 
     @property
     def points(self) -> np.ndarray:
         """All display coordinates in metres, rotated for plotting."""
         return self._display_points
+
+    @property
+    def display_transform(self) -> np.ndarray:
+        """Global model-to-display transform used by every viewer pane."""
+        return self._display_transform.copy()
 
     @property
     def time(self) -> np.ndarray:
@@ -121,11 +139,31 @@ class ViewerDataAdapter:
 
     @property
     def available_demands(self) -> tuple[str, ...]:
-        return VALID_DEMANDS
+        if self.has_gf and self.has_map:
+            return VALID_DEMANDS
+        return REGULAR_DEMANDS
 
     @property
     def available_components(self) -> tuple[str, ...]:
-        return VALID_COMPONENTS
+        return REGULAR_COMPONENTS
+
+    def available_components_for_demand(self, demand: str) -> tuple[str, ...]:
+        demand = self._validate_demand(demand)
+        if demand == GF_DEMAND:
+            return GF_COMPONENTS
+        return REGULAR_COMPONENTS
+
+    def display_demand_options(self) -> list[tuple[str, str]]:
+        return [
+            (demand, DISPLAY_DEMAND_LABELS.get(demand, demand))
+            for demand in self.available_demands
+        ]
+
+    def display_component_options(self, demand: str) -> list[tuple[str, str]]:
+        return [
+            (component, DISPLAY_COMPONENT_LABELS.get(component, component))
+            for component in self.available_components_for_demand(demand)
+        ]
 
     @property
     def trace_components(self) -> tuple[str, ...]:
@@ -159,6 +197,46 @@ class ViewerDataAdapter:
             has_map=self.has_map,
         )
 
+    def open_playback_handle(self) -> None:
+        """Open a persistent HDF5 handle for the DRM file during playback.
+
+        When the scalar series is too large to cache (large models), each frame
+        would otherwise open, read, and close the HDF5 file — that is
+        ~1-5 ms of filesystem overhead per frame.  Keeping the handle open
+        amortises that cost to zero for the duration of playback.
+
+        Safe to call multiple times; opens only once.  Must be paired with
+        :meth:`close_playback_handle`.
+        """
+        if self._playback_h5_handle is not None:
+            return
+        if not self._supports_direct_snapshot():
+            return
+        try:
+            import h5py
+            self._playback_h5_handle = h5py.File(self.model.filename, "r")
+        except Exception:
+            self._playback_h5_handle = None
+
+    def close_playback_handle(self) -> None:
+        """Close the persistent playback HDF5 handle (if open)."""
+        if self._playback_h5_handle is not None:
+            try:
+                self._playback_h5_handle.close()
+            except Exception:
+                pass
+            self._playback_h5_handle = None
+
+    def clear_runtime_caches(self) -> None:
+        """Release viewer-only cached arrays and derived analysis results."""
+        self.close_playback_handle()
+        self._series_cache.clear()
+        self._series_cache_hits = 0
+        self._spectrum_cache.clear()
+        self._arias_cache.clear()
+        self._gf_limit_cache.clear()
+        self._gf_series_cache.clear()
+
     @property
     def cache_info(self) -> dict[str, int]:
         """Return lightweight scalar-series cache statistics."""
@@ -185,6 +263,21 @@ class ViewerDataAdapter:
 
     def point_for_node(self, node_id: int | str) -> np.ndarray:
         return self._display_points[self.point_index_for_node(node_id)]
+
+    def display_points_from_model_xyz_m(self, xyz_m: np.ndarray) -> np.ndarray:
+        """Transform arbitrary model coordinates expressed in metres into viewer space."""
+        xyz_m = np.asarray(xyz_m, dtype=float)
+        return self._apply_display_transform_m(xyz_m)
+
+    def set_display_transform(self, matrix) -> np.ndarray:
+        """Update the global display transform and rebuild viewer geometry."""
+        matrix = np.asarray(matrix, dtype=float)
+        if matrix.shape != (3, 3):
+            raise ValueError("Display transform must be a 3x3 matrix.")
+        # TODO: Keep this as the single viewer geometry rebuild path for future transform debugging.
+        self._display_transform = matrix.copy()
+        self._rebuild_display_geometry()
+        return self.display_transform
 
     def nearest_node_id(self, point: np.ndarray) -> int | str:
         """Return nearest node in viewer coordinates [m]."""
@@ -277,6 +370,8 @@ class ViewerDataAdapter:
         time_index: int,
         demand: str = "accel",
         component: str = "resultant",
+        *,
+        subfault_id: int = 0,
     ) -> np.ndarray:
         """Return one scalar value per displayed point.
 
@@ -288,6 +383,9 @@ class ViewerDataAdapter:
         demand = self._validate_demand(demand)
         component = self._validate_component(component)
         time_index = self.clamp_time_index(time_index)
+
+        if demand == GF_DEMAND:
+            return self._gf_scalar_snapshot(time_index, component, int(subfault_id))
 
         # ── Fast path: series already in memory ──────────────────────────────
         key = (demand, component)
@@ -335,6 +433,11 @@ class ViewerDataAdapter:
         """Return the full time history matrix for one displayed scalar field."""
         demand = self._validate_demand(demand)
         component = self._validate_component(component)
+        if demand == GF_DEMAND:
+            raise NotImplementedError(
+                "GF field playback uses per-frame snapshots only; full GF series "
+                "caching is not enabled in the viewer."
+            )
         key = (demand, component)
 
         if key in self._series_cache:
@@ -342,6 +445,25 @@ class ViewerDataAdapter:
             values = self._series_cache.pop(key)
             self._series_cache[key] = values
             return values
+
+        # ── Resultant fast path: derive from already-cached E/N/Z ─────────────
+        # When _prewarm_on_show (or a prior warm cycle) has already loaded the
+        # three component series, resultant is free NumPy arithmetic — no HDF5
+        # I/O, no _read_resultant_series loop.  This eliminates the biggest
+        # single-threaded delay on first Play press.
+        if component == "resultant":
+            e_k, n_k, z_k = (demand, "e"), (demand, "n"), (demand, "z")
+            if all(k in self._series_cache for k in (e_k, n_k, z_k)):
+                self._series_cache_hits += 1
+                e = self._series_cache[e_k]
+                n = self._series_cache[n_k]
+                z = self._series_cache[z_k]
+                values = np.sqrt(e ** 2 + n ** 2 + z ** 2).astype(np.float32, copy=False)
+                if self._can_cache(values):
+                    self._series_cache[key] = values
+                    while len(self._series_cache) > self.max_cache_entries:
+                        self._series_cache.popitem(last=False)
+                return values
 
         values = self._build_scalar_series(demand, component)
         if self._can_cache(values):
@@ -369,6 +491,60 @@ class ViewerDataAdapter:
         if component not in ("z", "e", "n", "tdata"):
             raise KeyError("GF component must be one of 'z', 'e', 'n', 'tdata'.")
         return np.asarray(self.model.get_gf(node_id, subfault_id, component))
+
+    def gf_subfault_count(self) -> int:
+        """Return the number of subfaults (sources) in the GF dataset.
+
+        ``_nsources`` is written by :func:`load_map` from the map HDF5 file
+        and is the most reliable source.  Falls back to other attribute names
+        if the model was built by an older version of the code.
+        """
+        if not self.has_gf or not self.has_map:
+            return 0
+        for attr in ("_nsources", "nsources", "_nsources_db", "n_sources", "num_sources"):
+            val = getattr(self.model, attr, None)
+            if val is not None:
+                try:
+                    return max(1, int(val))
+                except (TypeError, ValueError):
+                    pass
+        return 1
+
+    def gf_tensor(self, node_id, subfault_id: int = 0) -> dict:
+        """Return the full 9-component GF tensor for *(node_id, subfault_id)*.
+
+        The GF HDF5 file stores ``tdata`` with shape ``(n_slots, nt, 9)``.
+        Column ordering matches ``plot_node_tensor_gf`` conventions::
+
+            col 0  G_11   col 1  G_12   col 2  G_13
+            col 3  G_21   col 4  G_22   col 5  G_23
+            col 6  G_31   col 7  G_32   col 8  G_33
+
+        Diagonal (i == j): columns 0, 4, 8  →  G_11, G_22, G_33.
+        Time axis: ``np.arange(nt) * model._dt_orig + t0`` where ``t0`` is
+        read from ``f['t0'][slot]`` (per-slot offset stored in the HDF5).
+
+        Returns
+        -------
+        dict
+            ``"time"``  – 1-D float array, length *nt*.
+            ``"rows"``  – list of ``(label, is_diagonal, data_1d)`` tuples,
+                          length 9.
+        """
+        gf_data = get_gf_tensor(self.model, node_id, int(subfault_id))
+        time_arr = np.asarray(gf_data["time"], dtype=float)
+        tdata = np.asarray(gf_data["tdata"], dtype=float)
+
+        # ── Build 9 rows, G_11 … G_33 in row-major order ─────────────────────
+        # Diagonal cells sit at flat indices where (i == j): 0, 4, 8.
+        _DIAG = {0, 4, 8}
+        labels = [f"G_{i + 1}{j + 1}" for i in range(3) for j in range(3)]
+        rows = [
+            (labels[k], k in _DIAG, tdata[:, k])
+            for k in range(min(9, tdata.shape[1]))
+        ]
+
+        return {"time": time_arr, "rows": rows}
 
     def spectrum(
         self,
@@ -466,7 +642,8 @@ class ViewerDataAdapter:
             disp_e = self.scalar_snapshot(time_index, "disp", "e")
             disp_n = self.scalar_snapshot(time_index, "disp", "n")
             disp_z = self.scalar_snapshot(time_index, "disp", "z")
-            return np.column_stack([disp_e, disp_n, disp_z])
+            disp_model = np.column_stack([disp_e, disp_n, disp_z])
+            return self._apply_display_transform_m(disp_model)
         except Exception:
             return np.zeros((n, 3), dtype=float)
 
@@ -514,10 +691,18 @@ class ViewerDataAdapter:
         nice = max(1.0, round(raw / magnitude) * magnitude)
         return float(nice)
 
-    def default_scalar_limits(self, demand: str = "accel", component: str = "resultant") -> tuple[float, float]:
+    def default_scalar_limits(
+        self,
+        demand: str = "accel",
+        component: str = "resultant",
+        *,
+        subfault_id: int = 0,
+    ) -> tuple[float, float]:
         """Return default color limits using ShakerMakerData._vmax when available."""
         demand = self._validate_demand(demand)
         component = self._validate_component(component)
+        if demand == GF_DEMAND:
+            return self._gf_default_scalar_limits(component, int(subfault_id))
         try:
             if getattr(self.model, "_vmax", None) is None and hasattr(self.model, "_compute_vmax"):
                 self.model._compute_vmax()
@@ -564,6 +749,49 @@ class ViewerDataAdapter:
                 info["gf_slot_s0"] = None
         return info
 
+    def _apply_display_transform_m(self, xyz_m: np.ndarray) -> np.ndarray:
+        xyz_m = np.asarray(xyz_m, dtype=float)
+        if xyz_m.ndim == 1:
+            return xyz_m @ self._display_transform
+        return xyz_m @ self._display_transform
+
+    def _rebuild_display_geometry(self) -> None:
+        model_xyz_m = np.asarray(self.model.xyz, dtype=float) * 1000.0
+        self._points = self._apply_display_transform_m(model_xyz_m)
+        qa_xyz = getattr(self.model, "xyz_qa", None)
+        self._qa_point = (
+            self._apply_display_transform_m(np.asarray(qa_xyz, dtype=float) * 1000.0)[0]
+            if qa_xyz is not None
+            else None
+        )
+        self._display_points = (
+            np.vstack([self._points, self._qa_point[None, :]])
+            if self._qa_point is not None
+            else self._points.copy()
+        )
+        self._node_to_index = {
+            node_id: idx for idx, node_id in enumerate(self._display_node_ids)
+        }
+        internal = np.asarray(
+            getattr(self.model, "internal", np.zeros(len(self._points), dtype=bool)),
+            dtype=bool,
+        )
+        if len(internal) != len(self._points):
+            internal = np.zeros(len(self._points), dtype=bool)
+        self._display_internal = (
+            np.concatenate([internal, np.array([False])])
+            if self._qa_point is not None
+            else internal.copy()
+        )
+        self._display_is_qa = np.zeros(len(self._display_points), dtype=bool)
+        if self._qa_point is not None:
+            self._display_is_qa[-1] = True
+        self._kdtree = (
+            cKDTree(self._display_points) if cKDTree is not None else None
+        )
+        self._visible_node_ids = list(self._display_node_ids)
+        self._visible_to_display_index = np.arange(len(self._display_node_ids), dtype=int)
+
     def _validate_demand(self, demand: str) -> str:
         demand = demand.lower()
         if demand not in VALID_DEMANDS:
@@ -586,35 +814,60 @@ class ViewerDataAdapter:
         return {"z": 0, "e": 1, "n": 2}[component]
 
     def _try_direct_component_snapshot(self, demand: str, component: str, time_index: int) -> np.ndarray | None:
+        """Read one scalar-field column from the HDF5 file.
+
+        Uses the persistent playback handle (opened by
+        :meth:`open_playback_handle`) when available — zero file-open overhead
+        during playback.  Falls back to a fresh ``h5py.File`` context otherwise.
+        """
         if not self._supports_direct_snapshot():
             return None
+
+        # ── Fast path: persistent handle already open (during playback) ───────
+        if self._playback_h5_handle is not None:
+            try:
+                return self._read_snapshot_from_handle(
+                    self._playback_h5_handle, demand, component, time_index
+                )
+            except Exception:
+                # Handle may have been closed externally — fall through.
+                self._playback_h5_handle = None
+
+        # ── Normal path: open fresh handle per call ───────────────────────────
         try:
             import h5py
         except ImportError:  # pragma: no cover
             return None
-
         try:
             with h5py.File(self.model.filename, "r") as handle:
-                data_handle = handle[self._data_path_for_demand(demand)]
-                source_col = self._source_column_index(time_index, data_handle.shape[1])
-                if component == "resultant":
-                    # One contiguous HDF5 read → NumPy strided slice (3× faster
-                    # than three separate strided reads against HDF5 chunks).
-                    all_data = np.asarray(data_handle[:, source_col], dtype=np.float32)
-                    e = all_data[0::3]
-                    n = all_data[1::3]
-                    z = all_data[2::3]
-                    values = np.sqrt(e ** 2 + n ** 2 + z ** 2).astype(np.float32, copy=False)
-                    qa_scalar = self._read_qa_resultant_snapshot(handle, demand, source_col)
-                else:
-                    row = {"e": 0, "n": 1, "z": 2}[component]
-                    values = np.asarray(data_handle[row::3, source_col], dtype=np.float32)
-                    qa_scalar = self._read_qa_component_snapshot(handle, demand, component, source_col)
-            if qa_scalar is not None:
-                values = np.concatenate([values, np.array([qa_scalar], dtype=np.float32)])
-            return values
+                return self._read_snapshot_from_handle(handle, demand, component, time_index)
         except Exception:
             return None
+
+    def _read_snapshot_from_handle(
+        self, handle, demand: str, component: str, time_index: int
+    ) -> np.ndarray:
+        """Extract one scalar-field column from an already-open HDF5 handle."""
+        data_handle = handle[self._data_path_for_demand(demand)]
+        source_col  = self._source_column_index(time_index, data_handle.shape[1])
+
+        if component == "resultant":
+            # One contiguous HDF5 read → NumPy strided slice (3× faster than
+            # three separate strided reads against HDF5 chunks).
+            all_data = np.asarray(data_handle[:, source_col], dtype=np.float32)
+            e = all_data[0::3]
+            n = all_data[1::3]
+            z = all_data[2::3]
+            values    = np.sqrt(e ** 2 + n ** 2 + z ** 2).astype(np.float32, copy=False)
+            qa_scalar = self._read_qa_resultant_snapshot(handle, demand, source_col)
+        else:
+            row       = {"e": 0, "n": 1, "z": 2}[component]
+            values    = np.asarray(data_handle[row::3, source_col], dtype=np.float32)
+            qa_scalar = self._read_qa_component_snapshot(handle, demand, component, source_col)
+
+        if qa_scalar is not None:
+            values = np.concatenate([values, np.array([qa_scalar], dtype=np.float32)])
+        return values
 
     def _supports_direct_snapshot(self) -> bool:
         return (
@@ -682,9 +935,11 @@ class ViewerDataAdapter:
         except ImportError:  # pragma: no cover - package dependency in real runtime
             return None
 
+        # Gate the cache on the size of the final cached array, not on the
+        # temporary operands needed to compute it. Resultant series are built
+        # chunk-by-chunk into a preallocated output matrix, so they should
+        # still use the direct fast path whenever the final matrix fits.
         series_bytes = self._estimated_series_bytes()
-        if component == "resultant":
-            series_bytes *= 3
         if series_bytes > self.max_cache_bytes:
             return None
 
@@ -713,6 +968,15 @@ class ViewerDataAdapter:
     def _estimated_series_bytes(self) -> int:
         rows = len(self._points) + (1 if self.has_qa else 0)
         cols = len(self.model.time)
+        return rows * cols * np.dtype(np.float32).itemsize
+
+    def _estimated_series_bytes_for_demand(self, demand: str) -> int:
+        demand = self._validate_demand(demand)
+        rows = len(self._points) + (1 if self.has_qa else 0)
+        if demand == GF_DEMAND:
+            cols = len(getattr(self.model, "gf_time", getattr(self.model, "time", [])))
+        else:
+            cols = len(self.model.time)
         return rows * cols * np.dtype(np.float32).itemsize
 
     def _can_cache(self, values: np.ndarray) -> bool:
@@ -805,3 +1069,222 @@ class ViewerDataAdapter:
             "vel": f"{self.model._qa_grp}/velocity",
             "disp": f"{self.model._qa_grp}/displacement",
         }[demand]
+
+    def _gf_component_index(self, component: str) -> int:
+        component = self._validate_component(component)
+        if component not in GF_COMPONENTS:
+            raise KeyError(
+                f"GF component '{component}' is invalid. Use one of {', '.join(GF_COMPONENTS)}."
+            )
+        return GF_COMPONENTS.index(component)
+
+    def _gf_slots_for_subfault(self, subfault_id: int = 0) -> np.ndarray:
+        subfault_id = int(subfault_id)
+        cached = self._gf_slot_cache.get(subfault_id)
+        if cached is not None:
+            return cached
+
+        slots = []
+        for node_id in self._display_node_ids:
+            slots.append(int(self.model._get_slot(node_id, subfault_id)))
+        values = np.asarray(slots, dtype=np.int64)
+        self._gf_slot_cache[subfault_id] = values
+        return values
+
+    def _gf_t0_for_subfault(self, subfault_id: int = 0) -> np.ndarray:
+        subfault_id = int(subfault_id)
+        cached = self._gf_t0_cache.get(subfault_id)
+        if cached is not None:
+            return cached
+
+        slots = self._gf_slots_for_subfault(subfault_id)
+        try:
+            import h5py
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("GF field display requires h5py.") from exc
+
+        with h5py.File(self.model._gf_h5_path, "r") as handle:
+            if "t0" in handle:
+                unique_slots, inverse = np.unique(slots, return_inverse=True)
+                unique_t0 = np.asarray(handle["t0"][unique_slots.tolist()], dtype=float)
+                t0_values = unique_t0[inverse]
+            else:
+                t0_values = np.zeros(len(slots), dtype=float)
+        self._gf_t0_cache[subfault_id] = t0_values
+        return t0_values
+
+    def warm_gf_series(self, subfault_id: int = 0, component_index: int = 0) -> bool:
+        """Pre-load the full GF field series into RAM with a single HDF5 read.
+
+        Reads ``tdata[unique_slots, :, component_index]`` — shape
+        ``(n_unique_slots, nt_gf)`` — then expands to ``(n_display_nodes, nt_gf)``
+        via NumPy advanced indexing.  Subsequent calls to ``_gf_scalar_snapshot``
+        use this in-memory array (pure NumPy, zero I/O) instead of re-opening
+        the HDF5 file on every animation frame.
+
+        Returns ``True`` when the series is now in cache (either already was,
+        or was just loaded), ``False`` on any failure.
+        """
+        cache_key = (int(subfault_id), int(component_index))
+        if cache_key in self._gf_series_cache:
+            return True
+
+        if not self.has_gf or not self.has_map:
+            return False
+
+        nt = int(getattr(self.model, "_nt_gf", 0))
+        if nt <= 0:
+            return False
+
+        try:
+            import h5py
+        except ImportError:  # pragma: no cover
+            return False
+
+        try:
+            slots = self._gf_slots_for_subfault(int(subfault_id))
+            unique_slots, inverse = np.unique(slots, return_inverse=True)
+
+            with h5py.File(self.model._gf_h5_path, "r") as f:
+                # One contiguous(ish) read: (n_unique_slots, nt_gf)
+                raw = np.asarray(
+                    f["tdata"][unique_slots.tolist(), :, int(component_index)],
+                    dtype=np.float32,
+                )
+
+            # Expand to all display nodes: (n_nodes, nt_gf)
+            self._gf_series_cache[cache_key] = raw[inverse]
+            return True
+        except Exception:
+            return False
+
+    def _gf_scalar_snapshot(self, time_index: int, component: str, subfault_id: int = 0) -> np.ndarray:
+        """Return per-node GF scalar at *time_index* for *component*.
+
+        Hot path (warm cache)
+        ---------------------
+        Pure NumPy — maps simulation time → GF column index per node, then
+        does one advanced-index lookup into the pre-warmed ``(n_nodes, nt_gf)``
+        array.  Zero HDF5 I/O, < 0.1 ms per frame.
+
+        Cold path (first call / cache miss)
+        ------------------------------------
+        Calls :meth:`warm_gf_series` which does **one** HDF5 read for the entire
+        series, stores it, then serves the frame from RAM.  Subsequent frames are
+        on the hot path.
+
+        Legacy fallback
+        ---------------
+        If warming fails (e.g. h5py absent), the original per-frame scatter-read
+        runs as before.
+        """
+        if not self.has_gf or not self.has_map:
+            raise RuntimeError("GF/map data is not available in this viewer session.")
+
+        component_index = self._gf_component_index(component)
+        n = len(self._display_node_ids)
+
+        if len(self.model.time) == 0:
+            return np.zeros(n, dtype=np.float32)
+
+        current_time = float(self.model.time[self.clamp_time_index(time_index)])
+        dt = float(getattr(self.model, "_dt_orig", getattr(self.model, "dt", 0.0)))
+        nt = int(getattr(self.model, "_nt_gf", 0))
+        if dt <= 0.0 or nt <= 0:
+            return np.zeros(n, dtype=np.float32)
+
+        slots     = self._gf_slots_for_subfault(subfault_id)
+        t0_values = self._gf_t0_for_subfault(subfault_id)
+
+        # ── Hot / warm path: serve entirely from pre-warmed series ───────────
+        cache_key = (int(subfault_id), int(component_index))
+        series = self._gf_series_cache.get(cache_key)
+
+        if series is None:
+            # Lazy warm on first access — one HDF5 read, then cache forever.
+            self.warm_gf_series(int(subfault_id), int(component_index))
+            series = self._gf_series_cache.get(cache_key)
+
+        if series is not None:
+            # Pure NumPy: O(n_nodes) arithmetic + vectorised fancy index
+            raw_pos   = (current_time - t0_values) / dt
+            col_idx   = np.rint(raw_pos).astype(np.int64)
+            valid     = (col_idx >= 0) & (col_idx < nt)
+            values    = np.zeros(n, dtype=np.float32)
+            if np.any(valid):
+                vrows         = np.flatnonzero(valid)
+                clipped_cols  = np.clip(col_idx[valid], 0, nt - 1)
+                values[vrows] = series[vrows, clipped_cols]
+            return values
+
+        # ── Legacy fallback: per-frame scatter HDF5 read ─────────────────────
+        # Reached only when warm_gf_series() failed (e.g. h5py unavailable).
+        try:
+            import h5py
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("GF field display requires h5py.") from exc
+
+        raw_positions = (current_time - t0_values) / dt
+        column_indices = np.rint(raw_positions).astype(np.int64)
+        valid = (column_indices >= 0) & (column_indices < nt)
+        values = np.zeros(n, dtype=np.float32)
+        if not np.any(valid):
+            return values
+
+        valid_rows  = np.flatnonzero(valid)
+        valid_slots = slots[valid]
+        valid_cols  = column_indices[valid]
+
+        with h5py.File(self.model._gf_h5_path, "r") as handle:
+            tdata = handle["tdata"]
+            for source_col in np.unique(valid_cols):
+                local_mask  = valid_cols == int(source_col)
+                row_subset  = valid_rows[local_mask]
+                slot_subset = valid_slots[local_mask]
+                u_slots, inv = np.unique(slot_subset, return_inverse=True)
+                read_vals = np.asarray(
+                    tdata[u_slots.tolist(), int(source_col), component_index],
+                    dtype=np.float32,
+                )
+                values[row_subset] = read_vals[inv]
+        return values
+
+    def _gf_default_scalar_limits(self, component: str, subfault_id: int = 0) -> tuple[float, float]:
+        key = (int(subfault_id), self._validate_component(component))
+        if key in self._gf_limit_cache:
+            return self._gf_limit_cache[key]
+
+        component_index = self._gf_component_index(component)
+
+        # ── Fast path: series already in RAM (pre-warmed by playback) ────────
+        series = self._gf_series_cache.get((int(subfault_id), int(component_index)))
+        if series is not None:
+            vmax = float(np.max(np.abs(series))) if series.size else 0.0
+            if vmax <= 0.0:
+                vmax = 1.0
+            limits = (-vmax, vmax)
+            self._gf_limit_cache[key] = limits
+            return limits
+
+        # ── Normal path: one HDF5 read of all unique slots for this component ─
+        try:
+            import h5py
+        except ImportError:  # pragma: no cover
+            snapshot = self._gf_scalar_snapshot(0, component, subfault_id)
+            limits = scalar_limits(snapshot, component)
+            self._gf_limit_cache[key] = limits
+            return limits
+
+        slots = self._gf_slots_for_subfault(subfault_id)
+        if len(slots) == 0:
+            return -1.0, 1.0
+
+        with h5py.File(self.model._gf_h5_path, "r") as handle:
+            unique_slots = np.unique(slots)
+            data = np.asarray(handle["tdata"][unique_slots.tolist(), :, component_index], dtype=np.float32)
+        vmax = float(np.max(np.abs(data))) if data.size else 0.0
+        if vmax <= 0.0:
+            vmax = 1.0
+        limits = (-vmax, vmax)
+        self._gf_limit_cache[key] = limits
+        return limits

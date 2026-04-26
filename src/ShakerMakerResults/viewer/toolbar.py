@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import numpy as np
+
 from ._imports import require_viewer_dependencies
 
 _, _, _, QtCore, _, QtWidgets = require_viewer_dependencies()
@@ -89,7 +92,6 @@ class ViewerToolBar(QtWidgets.QWidget):
         )
         fit_btn.clicked.connect(self._fit_all)
         layout.addWidget(fit_btn)
-
         self._ortho_btn = self._btn(
             "Ortho", "mdi.grid",
             "Toggle orthographic / perspective projection",
@@ -97,6 +99,24 @@ class ViewerToolBar(QtWidgets.QWidget):
         )
         self._ortho_btn.toggled.connect(self._toggle_ortho)
         layout.addWidget(self._ortho_btn)
+        self._add_sep(layout)
+        rot_minus_btn = self._btn("-90", "mdi.rotate-left", "Rotate active view -90 around Z")
+        rot_minus_btn.clicked.connect(lambda: self._rotate_active_camera(-90))
+        layout.addWidget(rot_minus_btn)
+        rot_plus_btn = self._btn("+90", "mdi.rotate-right", "Rotate active view +90 around Z")
+        rot_plus_btn.clicked.connect(lambda: self._rotate_active_camera(90))
+        layout.addWidget(rot_plus_btn)
+        self._add_sep(layout)
+        self._stations_btn = self._btn(
+            "Stations",
+            "mdi.map-marker-multiple-outline",
+            "Toggle station tags visibility",
+            checkable=True,
+        )
+        self._stations_btn.setChecked(True)
+        self._stations_btn.toggled.connect(self._toggle_stations)
+        layout.addWidget(self._stations_btn)
+        self._multi_view.on_active_pane_changed = self._sync_from_active_pane
 
         # ── Capture ───────────────────────────────────────────────────────────
         self._add_sep(layout)
@@ -134,8 +154,13 @@ class ViewerToolBar(QtWidgets.QWidget):
         layout.addWidget(self._bbox_btn)
 
         layout.addStretch(1)
+        self._add_sep(layout)
+        self._transform_widget = self._build_transform_widget()
+        layout.addWidget(self._transform_widget)
 
         self.setStyleSheet("ViewerToolBar { border-bottom: 1px solid #d0d0d0; }")
+        self._sync_from_active_pane(self._multi_view.active_pane)
+        self._load_transform_from_session()
 
     # ── Active-plotter access ─────────────────────────────────────────────────
 
@@ -188,6 +213,46 @@ class ViewerToolBar(QtWidgets.QWidget):
             pass
 
     # ── Camera ────────────────────────────────────────────────────────────────
+
+    def _rotate_active_camera(self, degrees: float):
+        p = self._plotter
+        if p is None:
+            return
+        camera = getattr(p, "camera", None)
+        if camera is None:
+            return
+        try:
+            angle = math.radians(float(degrees))
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+
+            focal = camera.GetFocalPoint()
+            position = camera.GetPosition()
+            view_up = camera.GetViewUp()
+
+            rel = [position[i] - focal[i] for i in range(3)]
+            rel_rot = (
+                cos_a * rel[0] - sin_a * rel[1],
+                sin_a * rel[0] + cos_a * rel[1],
+                rel[2],
+            )
+            up_rot = (
+                cos_a * view_up[0] - sin_a * view_up[1],
+                sin_a * view_up[0] + cos_a * view_up[1],
+                view_up[2],
+            )
+
+            camera.SetPosition(
+                focal[0] + rel_rot[0],
+                focal[1] + rel_rot[1],
+                focal[2] + rel_rot[2],
+            )
+            camera.SetViewUp(*up_rot)
+            camera.OrthogonalizeViewUp()
+            p.reset_camera_clipping_range()
+            p.render()
+        except Exception:
+            pass
 
     def _toggle_ortho(self, checked: bool):
         p = self._plotter
@@ -293,6 +358,14 @@ class ViewerToolBar(QtWidgets.QWidget):
 
     # ── Overlays ──────────────────────────────────────────────────────────────
 
+    def dispose(self) -> None:
+        """Release toolbar runtime state before the viewer closes."""
+        try:
+            self._stop_recording()
+        except Exception:
+            pass
+        self._multi_view = None
+
     def _toggle_axes(self, checked: bool):
         p = self._plotter
         if p is None:
@@ -321,7 +394,90 @@ class ViewerToolBar(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _toggle_stations(self, checked: bool):
+        pane = getattr(self._multi_view, "active_pane", None)
+        if pane is None:
+            return
+        try:
+            pane.set_station_tags_visible(bool(checked))
+        except Exception:
+            pass
+
+    def _sync_from_active_pane(self, pane=None):
+        if pane is None:
+            pane = getattr(self._multi_view, "active_pane", None)
+        checked = True if pane is None else pane.station_tags_visible()
+        self._stations_btn.blockSignals(True)
+        self._stations_btn.setChecked(bool(checked))
+        self._stations_btn.blockSignals(False)
+
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _build_transform_widget(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self._transform_spins: dict[str, list[QtWidgets.QDoubleSpinBox]] = {}
+        for axis in ("X", "Y", "Z"):
+            label = QtWidgets.QLabel(axis)
+            label.setStyleSheet("font-size: 11px; color: #303030;")
+            layout.addWidget(label)
+            row_spins: list[QtWidgets.QDoubleSpinBox] = []
+            for _ in range(3):
+                spin = self._matrix_spin()
+                spin.valueChanged.connect(self._mark_transform_dirty)
+                layout.addWidget(spin)
+                row_spins.append(spin)
+            self._transform_spins[axis] = row_spins
+            if axis != "Z":
+                layout.addSpacing(6)
+
+        self._transform_apply_btn = QtWidgets.QPushButton("Apply")
+        self._transform_apply_btn.setFixedHeight(24)
+        self._transform_apply_btn.setEnabled(False)
+        self._transform_apply_btn.clicked.connect(self._apply_display_transform)
+        layout.addWidget(self._transform_apply_btn)
+        # TODO: Keep this editor bound to the single global viewer transform state during future geometry debugging.
+        return widget
+
+    def _matrix_spin(self) -> QtWidgets.QDoubleSpinBox:
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setDecimals(4)
+        spin.setRange(-1_000_000.0, 1_000_000.0)
+        spin.setSingleStep(0.1)
+        spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        spin.setFixedWidth(50)
+        spin.setFixedHeight(24)
+        return spin
+
+    def _load_transform_from_session(self) -> None:
+        matrix = np.asarray(self._multi_view.session.current_display_transform(), dtype=float)
+        for row_idx, axis in enumerate(("X", "Y", "Z")):
+            for col_idx, spin in enumerate(self._transform_spins[axis]):
+                blocked = spin.blockSignals(True)
+                spin.setValue(float(matrix[row_idx, col_idx]))
+                spin.blockSignals(blocked)
+        self._transform_apply_btn.setEnabled(False)
+
+    def _mark_transform_dirty(self, *_args) -> None:
+        self._transform_apply_btn.setEnabled(True)
+
+    def _apply_display_transform(self) -> None:
+        matrix = np.array(
+            [
+                [spin.value() for spin in self._transform_spins["X"]],
+                [spin.value() for spin in self._transform_spins["Y"]],
+                [spin.value() for spin in self._transform_spins["Z"]],
+            ],
+            dtype=float,
+        )
+        try:
+            self._multi_view.session.apply_display_transform(matrix)
+            self._load_transform_from_session()
+        except Exception:
+            pass
 
     def _btn(
         self,

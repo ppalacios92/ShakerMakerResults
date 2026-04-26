@@ -28,10 +28,12 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     def __init__(self, session):
         super().__init__()
         self.session = session
+        self._closing = False
         summary = session.adapter.summary()
 
         self.setWindowTitle(f"ShakerMaker Results | {summary.name}")
         self.resize(1600, 900)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -85,6 +87,12 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         # ── Keyboard shortcut ─────────────────────────────────────────────────
         self._space_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Space"), self)
         self._space_shortcut.activated.connect(self._toggle_play_shortcut)
+
+        # ── Startup data pre-warm ─────────────────────────────────────────────
+        # Fire once after the window is fully painted.  Pre-warms the active
+        # scalar series into RAM so the first Play press is instant.
+        # Uses QTimer.singleShot(0) so the event loop paints the window first.
+        QtCore.QTimer.singleShot(0, self._prewarm_on_show)
 
     # ── Session update routing ────────────────────────────────────────────────
 
@@ -183,3 +191,133 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _base_frame_duration_s() -> float:
         return 0.08
+
+    # ── Startup pre-warm ──────────────────────────────────────────────────────
+
+    def _prewarm_on_show(self):
+        """Pre-warm the active scalar series once the window is on screen.
+
+        Runs synchronously on the main thread (one HDF5 read).  The status bar
+        shows "Ladruno warming data…" for the duration so the user knows why
+        the UI is briefly unresponsive for large datasets.
+
+        Skipped when:
+        - The window is already closing.
+        - The active demand is GF (GF warms lazily / on Play press).
+        - The full series would exceed the cache budget (large models fall back
+          to per-frame single-column HDF5 reads, which is already fast).
+        - The series is already cached (viewer was re-shown after a close).
+        """
+        if self._closing:
+            return
+
+        from .adapter import GF_DEMAND
+
+        demand = self.session.state.demand
+        if demand == GF_DEMAND:
+            return  # GF warmed lazily on first Play press
+
+        fits = (
+            self.session.adapter._estimated_series_bytes_for_demand(demand)
+            <= self.session.adapter.max_cache_bytes
+        )
+        if not fits:
+            return  # Too large — per-frame reads are the correct path
+
+        # Is the series already warm?
+        comp = self.session.state.component
+        if comp == "resultant":
+            already_warm = all(
+                (demand, _c) in self.session.adapter._series_cache
+                for _c in ("e", "n", "z")
+            )
+        else:
+            already_warm = (demand, comp) in self.session.adapter._series_cache
+        if already_warm:
+            return
+
+        # ── Build the load list so the progress bar has an accurate range ────
+        series_to_load: list[tuple[str, str]] = []
+        if comp == "resultant":
+            series_to_load += [(demand, "e"), (demand, "n"), (demand, "z")]
+        else:
+            series_to_load.append((demand, comp))
+        if self.session.state.disp_warp_enabled:
+            series_to_load += [("disp", "e"), ("disp", "n"), ("disp", "z")]
+
+        # ── Show a proper progress dialog ─────────────────────────────────────
+        prog = QtWidgets.QProgressDialog(
+            "Loading simulation data…",
+            None,                              # no cancel button
+            0, len(series_to_load),
+            self,
+        )
+        prog.setWindowTitle("Ladruno  ·  ShakerMaker Results")
+        prog.setMinimumDuration(0)             # show immediately, even for fast loads
+        prog.setWindowModality(QtCore.Qt.ApplicationModal)
+        prog.setValue(0)
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            for i, (d, c) in enumerate(series_to_load):
+                prog.setLabelText(
+                    f"Loading simulation data…\n"
+                    f"Series {i + 1} / {len(series_to_load)}  —  {d} · {c}"
+                )
+                self.session.adapter.scalar_series(d, c)
+                prog.setValue(i + 1)
+                QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
+        finally:
+            prog.close()
+            self._update_status()
+
+    # ── Window close / cleanup ────────────────────────────────────────────────
+
+    def closeEvent(self, event):  # noqa: N802
+        """Release every VTK / OpenGL / RAM resource when the viewer closes.
+
+        Cleanup order
+        -------------
+        1. Stop the playback timer — no callbacks fire during teardown.
+        2. ``toolbar.dispose()`` — stops any active recording cleanly.
+        3. ``multi_view.dispose()`` — calls ``scene.dispose()`` on every pane,
+           then ``plotter.close()``; releases all OpenGL contexts so subsequent
+           PyVista / matplotlib calls in the same process are not blocked.
+        4. Disable the Space shortcut so it cannot fire post-close.
+        5. ``session._on_window_closed()`` — sets ``is_playing=False``,
+           clears the series / spectrum / arias caches, and sets
+           ``session.window = None`` so ``show()`` can build a fresh window.
+
+        The ``_closing`` flag prevents re-entrancy when ``WA_DeleteOnClose``
+        causes Qt to call ``closeEvent`` a second time.
+        """
+        if self._closing:
+            event.accept()
+            return
+
+        self._closing = True
+        try:
+            try:
+                self._play_timer.stop()
+            except Exception:
+                pass
+            try:
+                self.toolbar.dispose()
+            except Exception:
+                pass
+            try:
+                self.multi_view.dispose()
+            except Exception:
+                pass
+            try:
+                self._space_shortcut.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                self.session._on_window_closed()
+            except Exception:
+                pass
+        finally:
+            super().closeEvent(event)

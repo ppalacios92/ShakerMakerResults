@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import h5py
 import numpy as np
+
+from ...core.gf_service import get_gf_time
 
 
 def _build_label(obj, node_id):
@@ -22,10 +23,5 @@ def _get_node_data(obj, node_id, data_type):
 
 
 def _get_gf_time(obj, slot):
-    """Return the GF time vector for a given slot, accounting for ``t0``."""
-    t0 = 0.0
-    with h5py.File(obj._gf_h5_path, "r") as f:
-        if "t0" in f:
-            t0 = float(f["t0"][slot])
-        nt = f["tdata"].shape[1]
-    return np.arange(nt) * obj._dt_orig + t0
+    """Return the GF time vector for a given slot, respecting window/resample."""
+    return get_gf_time(obj, slot)

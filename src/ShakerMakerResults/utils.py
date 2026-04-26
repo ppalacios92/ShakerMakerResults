@@ -34,8 +34,8 @@ import numpy as np
 #     np.cross(np.array([0, 1, 0]), np.array([1, 0, 0]))
 # ])
 
-_R = np.array([[1, 0,  0],
-               [0, 1,  0],
+_R = np.array([[0, 1,  0],
+               [1, 0,  0],
                [0, 0, -1]])
 
 def _rotate(xyz_km):

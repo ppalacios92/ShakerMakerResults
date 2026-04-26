@@ -10,16 +10,30 @@ def get_window(model, t_start, t_end):
     new = model.__class__.__new__(model.__class__)
     for a, v in model.__dict__.items():
         setattr(new, a, v)
+    new._gf_window_range = (float(t_start), float(t_end))
     mask = (model.time >= t_start) & (model.time <= t_end)
     new._window_mask = mask
     new._n_time_data = int(mask.sum())
     new.time = model.time[mask]
+    if hasattr(model, "gf_time"):
+        gf_time = np.asarray(model.gf_time)
+        if gf_time.size > 0:
+            gf_mask = (gf_time >= t_start) & (gf_time <= t_end)
+            new._gf_window_mask = gf_mask
+            new._n_time_gf = int(gf_mask.sum())
+            new.gf_time = gf_time[gf_mask]
+        else:
+            new._gf_window_mask = np.zeros(0, dtype=bool)
+            new._n_time_gf = 0
+            new.gf_time = gf_time.copy()
     new.name = f"{model.name} [{t_start}-{t_end}s]"
     new._node_cache = {}
     new._gf_cache = {}
     new._spectrum_cache = {}
     new._vmax = model._vmax
     print(f"Window [{t_start}, {t_end}]s -> {new._n_time_data} samples")
+    if getattr(new, "_has_gf", False):
+        print(f"GF window [{t_start}, {t_end}]s -> {int(getattr(new, '_n_time_gf', 0))} samples")
     return new
 
 

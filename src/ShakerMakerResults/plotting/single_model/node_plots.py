@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 
 from ...analysis.newmark import NewmarkSpectrumAnalyzer
+from ...core.gf_service import get_gf_tensor
 from ...utils import _fk_tensor_rotation, _rotate
 
 def plot_node_response(self,
@@ -137,13 +137,9 @@ def plot_node_gf(self,
             rx, ry = self.xyz[nid, 0], self.xyz[nid, 1]
 
         for sid in sub_ids:
-            slot = self._get_slot(nid_num, sid)
-
-            with h5py.File(self._gf_h5_path, 'r') as f:
-                tdata = f['tdata'][slot]              # (nt, 9)
-                t0    = float(f['t0'][slot]) if self._t0_available else 0.0
-
-            time = np.arange(tdata.shape[0]) * self._dt_orig + t0
+            gf_data = get_gf_tensor(self, nid, sid)
+            tdata = gf_data['tdata']
+            time = gf_data['time']
             lbl  = f'{nid_label}_S{sid}'
 
             if use_physical:
@@ -273,11 +269,9 @@ def plot_node_tensor_gf(self,
             if donor != nid_num:
                 print(f"Node {nid_label}/sub {sid} → slot {slot} (donor {donor})")
 
-            with h5py.File(self._gf_h5_path, 'r') as f:
-                tdata_out = f['tdata'][slot]    # (nt, 9)
-                t0_out    = float(f['t0'][slot]) if self._t0_available else 0.0
-
-            time = np.arange(tdata_out.shape[0]) * self._dt_orig + t0_out
+            gf_data = get_gf_tensor(self, nid, sid)
+            tdata_out = gf_data['tdata']
+            time = gf_data['time']
             lbl  = f'{nid_label}_S{sid}'
 
             for j in range(9):
@@ -287,7 +281,7 @@ def plot_node_tensor_gf(self,
             results[f'{nid_label}_S{sid}'] = {
                 'tdata'  : tdata_out,
                 'time'   : time,
-                't0'     : t0_out,
+                't0'     : gf_data['t0'],
                 'node_id': nid_num
             }
 

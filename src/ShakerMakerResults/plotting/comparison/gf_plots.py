@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 
+from ...core.gf_service import get_gf_tensor
 from ...utils import _fk_tensor_rotation
-from ._common import _get_gf_time
 
 __all__ = ["plot_models_gf", "plot_models_tensor_gf"]
 
@@ -102,12 +101,9 @@ def plot_models_gf(
                 rx, ry = obj.xyz[nid, 0], obj.xyz[nid, 1]
 
             for sid in sub_ids:
-                slot = obj._get_slot(nid_num, sid)
-                with h5py.File(obj._gf_h5_path, "r") as f:
-                    tdata = f["tdata"][slot]
-                    t0 = float(f["t0"][slot]) if obj._t0_available else 0.0
-
-                time = np.arange(tdata.shape[0]) * obj._dt_orig + t0
+                gf_data = get_gf_tensor(obj, nid, sid)
+                tdata = gf_data["tdata"]
+                time = gf_data["time"]
                 lbl = f"{obj.model_name} | {nid_label} | S{sid}"
 
                 if use_physical:
@@ -193,10 +189,10 @@ def plot_models_tensor_gf(
                 donor = obj._pairs_to_compute[slot, 0]
                 if donor != nid_num:
                     print(f"  {obj.model_name} | {nid_label}/S{sid} -> slot {slot} (donor {donor})")
-                time = _get_gf_time(obj, slot)
                 lbl = f"{obj.model_name} | {nid_label} | S{sid}"
-                with h5py.File(obj._gf_h5_path, "r") as f:
-                    tdata = f["tdata"][slot] * factor
+                gf_data = get_gf_tensor(obj, nid, sid)
+                time = gf_data["time"]
+                tdata = gf_data["tdata"] * factor
                 for j in range(9):
                     axes[j // 3, j % 3].plot(time, tdata[:, j], linewidth=0.8, label=lbl)
 

@@ -17,9 +17,99 @@ class ViewerScene:
         self.point_cloud = None
         self.point_actor = None
         self.selection_actor = None
+        self.station_actor = None
+        self.station_label_actor = None
+        self.show_station_tags = True
         self._picker = vtk.vtkPointPicker()
         self._picker.SetTolerance(0.02)
         self._interactor_style = None
+        # ── Per-pane GF component pin (used by the GF 3×3 layout) ────────────
+        # When set and session demand is GF, this pane renders *this* component
+        # instead of session.state.component, giving each pane its own tensor
+        # component independently of the global side-panel selection.
+        self._gf_component_pin: str | None = None
+        self._gf_label_actor = None    # text actor showing the component label
+
+    # ── GF component pin ──────────────────────────────────────────────────────
+
+    def set_gf_component_pin(self, component: str | None, label: str | None = None) -> None:
+        """Pin this pane to *component* when demand is GF (GF 3×3 layout).
+
+        Pass ``component=None`` to release the pin and restore normal behaviour.
+        *label* is rendered as a text overlay in the upper-right corner of this
+        viewport so the user can always see which tensor component is displayed.
+        """
+        self._gf_component_pin = component
+        # Remove the old label actor (if any).
+        if self._gf_label_actor is not None:
+            try:
+                self.plotter.remove_actor(self._gf_label_actor, render=False)
+            except Exception:
+                pass
+            self._gf_label_actor = None
+        # Add a new label when a pin is being set.
+        if label:
+            try:
+                self._gf_label_actor = self.plotter.add_text(
+                    label,
+                    position="upper_right",
+                    font_size=7,
+                    color="#1565C0",
+                    render=False,
+                )
+            except Exception:
+                pass
+
+    def _gf_pin_active(self) -> bool:
+        """Return True when this pane should render its own GF component."""
+        from .adapter import GF_DEMAND
+        return (
+            self._gf_component_pin is not None
+            and self.session.state.demand == GF_DEMAND
+        )
+
+    def _scalars_for_gf_pin(self):
+        """Compute visible scalars using the pinned GF component (no I/O when warm)."""
+        comp = self._gf_component_pin
+        demand = self.session.state.demand
+        sf = int(getattr(self.session, "_display_gf_subfault", 0))
+        raw = self.session.adapter.scalar_snapshot(
+            self.session.state.time_index, demand, comp, subfault_id=sf
+        )
+        return self.session.adapter.visible_scalars(
+            raw,
+            show_internal=self.session.state.show_internal,
+            show_external=self.session.state.show_external,
+            show_qa=self.session.state.show_qa,
+        )
+
+    def _color_limits_for_gf_pin(self, scalars=None) -> tuple:
+        """Color limits for the pinned GF component."""
+        comp = self._gf_component_pin
+        state = self.session.state
+        if state.clamp_enabled and state.user_vmin is not None and state.user_vmax is not None:
+            vmin = float(state.user_vmin)
+            vmax = float(state.user_vmax)
+            return (vmin, vmin + 1.0) if vmax <= vmin else (vmin, vmax)
+        sf = int(getattr(self.session, "_display_gf_subfault", 0))
+        try:
+            return self.session.adapter.default_scalar_limits(
+                self.session.state.demand, comp, subfault_id=sf
+            )
+        except Exception:
+            pass
+        if scalars is None:
+            try:
+                scalars = self._scalars_for_gf_pin()
+            except Exception:
+                return (-1.0, 1.0)
+        try:
+            from .colors import scalar_limits
+            return scalar_limits(scalars, comp)
+        except Exception:
+            return (-1.0, 1.0)
+
+    # ── Scene build ───────────────────────────────────────────────────────────
 
     def build(self):
         self._rebuild_point_cloud()
@@ -29,10 +119,15 @@ class ViewerScene:
         self.plotter.reset_camera()
         self._install_picking()
         self.refresh_selection(render=False)
+        self.refresh_station_tags(render=False)
         self._add_branding()
 
     def refresh_scalars(self, render: bool = True):
-        scalars = self.session.current_visible_scalars()
+        # Hot path — respect the per-pane GF component pin when active.
+        if self._gf_pin_active():
+            scalars = self._scalars_for_gf_pin()
+        else:
+            scalars = self.session.current_visible_scalars()
         if self.point_cloud is None or len(scalars) != self.point_cloud.n_points:
             self.rebuild_scalar_actor(render=render)
             return
@@ -42,7 +137,10 @@ class ViewerScene:
             # Skip color-range recalculation during playback — the range was
             # fixed when the actor was built, so every frame is free.
             if not self.session.state.is_playing:
-                self.point_actor.mapper.scalar_range = self.session.current_color_limits(scalars)
+                if self._gf_pin_active():
+                    self.point_actor.mapper.scalar_range = self._color_limits_for_gf_pin(scalars)
+                else:
+                    self.point_actor.mapper.scalar_range = self.session.current_color_limits(scalars)
         # Update point geometry for warp mode — pure NumPy when cache is warm.
         if self.session.state.disp_warp_enabled:
             self.refresh_geometry(render=False)
@@ -108,8 +206,71 @@ class ViewerScene:
             render_points_as_spheres=True,
             render=False,
         )
+        # Must NOT be pickable — vtkPointPicker would otherwise pick the yellow
+        # sphere and feed its point_id (always 0) to node_id_from_visible_index,
+        # causing every subsequent click to select node 0.
+        try:
+            self.selection_actor.SetPickable(0)
+        except Exception:
+            pass
         if render:
             self.plotter.render()
+
+    def refresh_station_tags(self, render: bool = True):
+        if self.station_actor is not None:
+            try:
+                self.plotter.remove_actor(self.station_actor, render=False)
+            except Exception:
+                pass
+            self.station_actor = None
+        if self.station_label_actor is not None:
+            try:
+                self.plotter.remove_actor(self.station_label_actor, render=False)
+            except Exception:
+                pass
+            self.station_label_actor = None
+
+        stations = self.session.current_station_tags() if self.show_station_tags else []
+        if stations:
+            pts = [entry["xyz_display_m"] for entry in stations]
+            labels = [str(entry["name"]) for entry in stations]
+            try:
+                station_poly = pv.PolyData(pts)
+                self.station_actor = self.plotter.add_points(
+                    station_poly,
+                    color="#d32f2f",
+                    point_size=max(self._point_size() + 3, 12),
+                    render_points_as_spheres=True,
+                    render=False,
+                )
+                # Station markers must NOT be pickable — they sit on top of
+                # simulation nodes and vtkPointPicker would pick them first,
+                # returning a point_id within the station actor (0..M-1) that
+                # gets incorrectly mapped to a simulation node index.
+                try:
+                    self.station_actor.SetPickable(0)
+                except Exception:
+                    pass
+                self.station_label_actor = self.plotter.add_point_labels(
+                    station_poly,
+                    labels,
+                    point_size=0,
+                    font_size=10,
+                    text_color="#d32f2f",
+                    fill_shape=False,
+                    always_visible=True,
+                    render=False,
+                )
+            except Exception:
+                self.station_actor = None
+                self.station_label_actor = None
+
+        if render:
+            self.plotter.render()
+
+    def set_station_tags_visible(self, visible: bool, render: bool = True):
+        self.show_station_tags = bool(visible)
+        self.refresh_station_tags(render=render)
 
     def _install_picking(self):
         vtk_interactor = self._vtk_interactor()
@@ -164,24 +325,39 @@ class ViewerScene:
             self.plotter.render()
 
     def _rebuild_point_cloud(self):
+        # Update _visible_node_ids so that node-picking resolves correctly after
+        # this rebuild.  current_warped_points() was refactored to skip this
+        # O(N) Python list-comprehension on every animation frame, so we call
+        # current_visible_points() explicitly here (rebuild is not a hot path).
+        self.session.current_visible_points()
         # Use warped positions when warp is active; falls back to base positions
         # transparently when warp is disabled.
         points = self.session.current_warped_points()
-        scalars = self.session.current_visible_scalars()
+        # Use pinned GF component when in the GF 3×3 layout.
+        if self._gf_pin_active():
+            scalars = self._scalars_for_gf_pin()
+        else:
+            scalars = self.session.current_visible_scalars()
         self.point_cloud = pv.PolyData(points)
         self.point_cloud.point_data["active_scalars"] = scalars
 
     def _add_point_actor(self):
         scalars = self.point_cloud.point_data["active_scalars"]
+        if self._gf_pin_active():
+            clim = self._color_limits_for_gf_pin(scalars)
+            bar_title = str(self._gf_component_pin).upper()   # e.g. "G11"
+        else:
+            clim = self.session.current_color_limits(scalars)
+            bar_title = self.session.state.demand
         return self.plotter.add_points(
             self.point_cloud,
             scalars="active_scalars",
             cmap=self.session.current_colormap(),
-            clim=self.session.current_color_limits(scalars),
+            clim=clim,
             render_points_as_spheres=True,
             point_size=self._point_size(),
             show_scalar_bar=self.session.state.show_scalar_bar,
-            scalar_bar_args={"title": self.session.state.demand},
+            scalar_bar_args={"title": bar_title},
             render=False,
         )
 
@@ -198,7 +374,7 @@ class ViewerScene:
             self.plotter.add_text(
                 "\n".join(lines),
                 position="upper_left",
-                font_size=8,
+                font_size=7,
                 color="#555555",
                 shadow=False,
                 name="branding",
@@ -216,3 +392,44 @@ class ViewerScene:
 
     def _point_size(self) -> float:
         return self.session.suggested_point_size()
+
+    def dispose(self) -> None:
+        """Release actors, VTK helpers and geometry owned by this scene."""
+        try:
+            if self.station_label_actor is not None:
+                self.plotter.remove_actor(self.station_label_actor, render=False)
+        except Exception:
+            pass
+        try:
+            if self.station_actor is not None:
+                self.plotter.remove_actor(self.station_actor, render=False)
+        except Exception:
+            pass
+        try:
+            if self.selection_actor is not None:
+                self.plotter.remove_actor(self.selection_actor, render=False)
+        except Exception:
+            pass
+        try:
+            if self.point_actor is not None:
+                self.plotter.remove_actor(self.point_actor, render=False)
+        except Exception:
+            pass
+        try:
+            if self._gf_label_actor is not None:
+                self.plotter.remove_actor(self._gf_label_actor, render=False)
+        except Exception:
+            pass
+        try:
+            self.plotter.clear()
+        except Exception:
+            pass
+
+        self.point_cloud = None
+        self.point_actor = None
+        self.selection_actor = None
+        self.station_actor = None
+        self.station_label_actor = None
+        self._gf_label_actor = None
+        self._interactor_style = None
+        self._picker = None

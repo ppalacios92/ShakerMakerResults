@@ -208,7 +208,29 @@ class ShakerMakerData:
         print(f"  Nodes    : {n_nodes}  |  Internal: {self.internal.sum()}  |  External: {(~self.internal).sum()}")
         print(f"  QA       : {'yes  ->  ' + str(self.xyz_qa[0] * 1000) + ' m' if self.xyz_qa is not None else 'no'}")
         print(f"  Time     : dt={dt_orig}s  |  steps={n_time_data}  |  t=[{tstart:.3f}, {tstart + n_time_data*dt_orig:.3f}]s")
-        print(f"  GF       : steps={n_time_gf}" + (f"  |  nsources={self._nsources_db}" if self._gf_loaded else "  |  not loaded"))
+        gf_steps = int(getattr(self, "_n_time_gf", n_time_gf))
+        gf_slots = None
+        tdata_shape = getattr(self, "_tdata_shape", None)
+        if tdata_shape is not None and len(tdata_shape) >= 1:
+            try:
+                gf_slots = int(tdata_shape[0])
+            except (TypeError, ValueError):
+                gf_slots = None
+        if self._has_gf and self._has_map:
+            gf_msg = f"steps={gf_steps}"
+            if gf_slots is not None:
+                gf_msg += f"  |  slots={gf_slots}"
+            gf_msg += f"  |  subfaults={int(getattr(self, '_nsources_db', 0))}"
+        elif self._has_gf:
+            gf_msg = f"steps={gf_steps}"
+            if gf_slots is not None:
+                gf_msg += f"  |  slots={gf_slots}"
+            gf_msg += "  |  map not loaded (subfaults unavailable)"
+        else:
+            gf_msg = f"steps={gf_steps}  |  not loaded"
+        # TODO: Keep the GF summary focused on user-facing concepts:
+        # time steps, unique slots, and subfault count from the map.
+        print(f"  GF       : {gf_msg}")
         with h5py.File(filename, 'r') as f:
             if 'DRM_Metadata/program_used' in f:
                 _ver = f['DRM_Metadata/program_used'][()].decode()

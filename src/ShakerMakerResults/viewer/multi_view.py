@@ -40,6 +40,16 @@ LAYOUT_PRESETS: list[tuple[str, int]] = [
     ("2×2", 4),
     ("2+1", 3),
     ("1+2", 3),
+    ("GF",  9),   # 3×3 Green Function tensor viewer
+]
+
+# GF layout: (adapter component id, viewport label) in row-major order.
+# Row 0 → receiver component 1 (Z), Row 1 → 2 (N), Row 2 → 3 (E)
+# Col 0 → source component 1,      Col 1 → 2,       Col 2 → 3
+_GF_LAYOUT_COMPONENTS: list[tuple[str, str]] = [
+    ("g11", "G_11"), ("g12", "G_12"), ("g13", "G_13"),
+    ("g21", "G_21"), ("g22", "G_22"), ("g23", "G_23"),
+    ("g31", "G_31"), ("g32", "G_32"), ("g33", "G_33"),
 ]
 
 # Azimuth offsets for ISO presets (degrees, applied after view_isometric).
@@ -98,6 +108,7 @@ class ViewPane(QtWidgets.QWidget):
         self.session = session
         self._on_activated = on_activated
         self._is_active = False
+        self._show_station_tags = True
 
         self.setMinimumSize(80, 80)
 
@@ -119,6 +130,7 @@ class ViewPane(QtWidgets.QWidget):
         self.scene = ViewerScene(self.plotter, session)
         try:
             self.scene.build()
+            self.scene.set_station_tags_visible(self._show_station_tags, render=False)
             self._apply_initial_camera(label)
         except Exception:
             pass
@@ -169,6 +181,13 @@ class ViewPane(QtWidgets.QWidget):
         if active:
             self._indicator.setStyleSheet("background: #1565C0;")
 
+    def set_station_tags_visible(self, visible: bool, render: bool = True):
+        self._show_station_tags = bool(visible)
+        self.scene.set_station_tags_visible(self._show_station_tags, render=render)
+
+    def station_tags_visible(self) -> bool:
+        return bool(self._show_station_tags)
+
     # ── Scene refresh ─────────────────────────────────────────────────────────
 
     def on_session_updated(self, reason: str):
@@ -177,6 +196,12 @@ class ViewPane(QtWidgets.QWidget):
             self.scene.refresh_scalars(render=False)
         elif reason == "selection":
             self.scene.refresh_selection(render=False)
+        elif reason in {"stations", "stations_visibility"}:
+            self.scene.refresh_station_tags(render=False)
+        elif reason == "geometry_transform":
+            self.scene.rebuild_scalar_actor(render=False)
+            self.scene.refresh_selection(render=False)
+            self.scene.refresh_station_tags(render=False)
         elif reason in {"demand", "component"}:
             self.scene.rebuild_scalar_actor(render=False)
             self.scene.refresh_selection(render=False)
@@ -199,6 +224,46 @@ class ViewPane(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def dispose(self) -> None:
+        """Tear down this pane's scene and VTK/Qt interactor resources."""
+        try:
+            if self.scene is not None:
+                self.scene.dispose()
+        except Exception:
+            pass
+
+        iren = getattr(self.plotter, "iren", None)
+        vtk_interactor = getattr(iren, "interactor", iren)
+        for obj in (vtk_interactor, iren):
+            if obj is None:
+                continue
+            for method_name in ("Finalize", "TerminateApp", "Close"):
+                method = getattr(obj, method_name, None)
+                if callable(method):
+                    try:
+                        method()
+                    except Exception:
+                        pass
+
+        interactor_widget = getattr(self.plotter, "interactor", None)
+        if interactor_widget is not None:
+            try:
+                interactor_widget.close()
+            except Exception:
+                pass
+            try:
+                interactor_widget.deleteLater()
+            except Exception:
+                pass
+
+        try:
+            self.plotter.close()
+        except Exception:
+            pass
+
+        self.scene = None
+        self.plotter = None
+
 
 # ── MultiViewArea ─────────────────────────────────────────────────────────────
 
@@ -220,9 +285,12 @@ class MultiViewArea(QtWidgets.QWidget):
         self.session = session
         self._panes: list[ViewPane] = []
         self._active_pane: ViewPane | None = None
+        self.on_active_pane_changed = None
         self._current_layout: str = "1×1"
         self._container: QtWidgets.QWidget | None = None
         self._layout_n: dict[str, int] = dict(LAYOUT_PRESETS)
+        # Demand that was active before entering the GF 3×3 layout; restored on exit.
+        self._pre_gf_demand: str | None = None
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -243,15 +311,28 @@ class MultiViewArea(QtWidgets.QWidget):
         self._layout_buttons: dict[str, QtWidgets.QPushButton] = {}
         for name, _n in LAYOUT_PRESETS:
             btn = QtWidgets.QPushButton(name)
-            btn.setFixedSize(44, 22)
+            # GF button gets a slightly different style to distinguish it as
+            # a "specialised" preset rather than a generic grid selector.
+            w = 36 if name == "GF" else 44
+            btn.setFixedSize(w, 22)
             btn.setCheckable(True)
-            btn.setStyleSheet(
-                "QPushButton { border: 1px solid #bbb; border-radius: 3px;"
-                "  background: #fff; font-size: 11px; }"
-                "QPushButton:checked { background: #1565C0; color: white;"
-                "  border-color: #1565C0; }"
-                "QPushButton:hover:!checked { background: #e3eaf6; }"
-            )
+            if name == "GF":
+                btn.setStyleSheet(
+                    "QPushButton { border: 1px solid #1565C0; border-radius: 3px;"
+                    "  background: #e8f0fe; color: #1565C0; font-size: 11px;"
+                    "  font-weight: bold; }"
+                    "QPushButton:checked { background: #1565C0; color: white;"
+                    "  border-color: #1565C0; }"
+                    "QPushButton:hover:!checked { background: #c5d8fa; }"
+                )
+            else:
+                btn.setStyleSheet(
+                    "QPushButton { border: 1px solid #bbb; border-radius: 3px;"
+                    "  background: #fff; font-size: 11px; }"
+                    "QPushButton:checked { background: #1565C0; color: white;"
+                    "  border-color: #1565C0; }"
+                    "QPushButton:hover:!checked { background: #e3eaf6; }"
+                )
             btn.clicked.connect(lambda _c, n=name: self._switch_layout(n))
             self._layout_buttons[name] = btn
             blay.addWidget(btn)
@@ -273,6 +354,7 @@ class MultiViewArea(QtWidgets.QWidget):
 
     def _switch_layout(self, name: str):
         """Switch to layout *name*, creating panes as needed."""
+        old_layout = self._current_layout
         needed = self._layout_n.get(name, 1)
 
         # 1. Detach all panes from the current container (reparent, not delete).
@@ -316,6 +398,14 @@ class MultiViewArea(QtWidgets.QWidget):
         self._current_layout = name
         for n, btn in self._layout_buttons.items():
             btn.setChecked(n == name)
+
+        # 7. GF-specific configuration.
+        # Entering GF: auto-switch demand to GF + pin each pane to one component.
+        # Leaving GF: clear pins and restore the previous demand.
+        if name == "GF":
+            self._apply_gf_layout(panes_for_layout)
+        elif old_layout == "GF":
+            self._clear_gf_layout(panes_for_layout)
 
     def _build_container(
         self, name: str, panes: list[ViewPane]
@@ -364,8 +454,158 @@ class MultiViewArea(QtWidgets.QWidget):
             outer.setSizes([300, 600])
             return outer
 
+        if name == "GF":
+            # 3 × 3 tensor grid — each pane shows one GF component.
+            # Row 0: G_11 G_12 G_13
+            # Row 1: G_21 G_22 G_23
+            # Row 2: G_31 G_32 G_33
+            row0 = _h(panes[0], panes[1], panes[2])
+            row1 = _h(panes[3], panes[4], panes[5])
+            row2 = _h(panes[6], panes[7], panes[8])
+            return _v(row0, row1, row2)
+
         # Fallback — plain horizontal split.
         return _h(*panes)
+
+    # ── GF layout helpers ─────────────────────────────────────────────────────
+
+    def _apply_gf_layout(self, panes: list) -> None:
+        """Configure the 9 GF panes: Top view + per-pane component pin.
+
+        Steps
+        -----
+        1. Save the current demand so it can be restored when leaving GF layout.
+        2. Pre-warm all 9 GF component series in one pass (avoids per-frame I/O).
+        3. Set Top / orthographic camera on every pane.
+        4. Assign each pane its component pin and label overlay.
+        5. Switch session demand to "gf" — the normal demand-change broadcast
+           rebuilds every pane's scalar actor using its pin.  If demand is
+           already "gf" the panes are rebuilt directly.
+        """
+        session = self.session
+
+        # Step 1 — remember old demand.
+        self._pre_gf_demand = session.state.demand
+
+        # Step 2 — pre-warm all 9 GF series so playback is instant.
+        # Show a progress dialog so the user sees Ladruno is working.
+        if session.adapter.has_gf and session.adapter.has_map:
+            sf = int(getattr(session, "_display_gf_subfault", 0))
+            window = getattr(session, "window", None)
+            prog = None
+            if window is not None:
+                prog = QtWidgets.QProgressDialog(
+                    "Warming Green Function series…\nSeries 0 / 9  —  G_11",
+                    None,          # no cancel button
+                    0, 9,
+                    window,
+                )
+                prog.setWindowTitle("Ladruno  ·  Green Functions")
+                prog.setMinimumDuration(0)
+                prog.setWindowModality(QtCore.Qt.ApplicationModal)
+                prog.setValue(0)
+                QtWidgets.QApplication.processEvents()
+
+            for idx in range(9):
+                comp_label = _GF_LAYOUT_COMPONENTS[idx][1]   # e.g. "G_11"
+                if prog is not None:
+                    prog.setLabelText(
+                        f"Warming Green Function series…\n"
+                        f"Series {idx + 1} / 9  —  {comp_label}"
+                    )
+                    QtWidgets.QApplication.processEvents()
+                try:
+                    session.adapter.warm_gf_series(sf, idx)
+                except Exception:
+                    pass
+                if prog is not None:
+                    prog.setValue(idx + 1)
+                    QtWidgets.QApplication.processEvents()
+
+            if prog is not None:
+                prog.close()
+
+        # Steps 3 & 4 — camera + pins (before the demand switch so the first
+        # rebuild already uses the correct per-pane component).
+        for pane, (comp, label) in zip(panes, _GF_LAYOUT_COMPONENTS):
+            try:
+                scene = getattr(pane, "scene", None)
+                if scene is None:
+                    continue
+                # Top (plan) view + orthographic for a clean 2-D heat map.
+                try:
+                    pane.plotter.view_xy()
+                    pane.plotter.enable_parallel_projection()
+                except Exception:
+                    pass
+                scene.set_gf_component_pin(comp, label)
+            except Exception:
+                pass
+
+        # Step 5 — switch demand.
+        if session.adapter.has_gf and session.adapter.has_map:
+            if session.state.demand != "gf":
+                # set_demand triggers the normal window broadcast → rebuilds
+                # all 9 active panes via on_session_updated("demand").
+                session.set_demand("gf")
+            else:
+                # Demand is already GF — rebuild panes manually (broadcast
+                # would be a no-op because the demand did not change).
+                for pane in panes:
+                    try:
+                        if pane.scene is not None:
+                            pane.scene.rebuild_scalar_actor(render=False)
+                            pane.plotter.render()
+                    except Exception:
+                        pass
+        else:
+            # No GF data — rebuild panes so they show whatever demand is active,
+            # ignoring the (inactive) pins.
+            for pane in panes:
+                try:
+                    if pane.scene is not None:
+                        pane.scene.rebuild_scalar_actor(render=False)
+                        pane.plotter.render()
+                except Exception:
+                    pass
+
+    def _clear_gf_layout(self, panes_for_new_layout: list) -> None:
+        """Remove GF component pins from all panes and restore the old demand.
+
+        Called when the user switches *away* from the GF layout.  The pins are
+        cleared on every pane (not just the currently visible 9), so stale
+        overrides can never bleed into a later layout switch.
+        """
+        session = self.session
+
+        # Clear pins on ALL panes (some may have been hidden, but they still
+        # carry their pin state and could become active again later).
+        for pane in self._panes:
+            try:
+                scene = getattr(pane, "scene", None)
+                if scene is not None and scene._gf_component_pin is not None:
+                    scene.set_gf_component_pin(None, None)
+            except Exception:
+                pass
+
+        # Restore the demand that was active before the GF layout was entered.
+        pre = self._pre_gf_demand
+        self._pre_gf_demand = None
+
+        if pre is not None and pre != session.state.demand:
+            # set_demand fires the normal broadcast → rebuilds the new layout's
+            # panes with their cleared pins.
+            session.set_demand(pre)
+        else:
+            # Demand unchanged (user stayed on GF, or no saved state) — rebuild
+            # the new layout's visible panes manually with pins cleared.
+            for pane in panes_for_new_layout:
+                try:
+                    if pane.scene is not None:
+                        pane.scene.rebuild_scalar_actor(render=False)
+                        pane.plotter.render()
+                except Exception:
+                    pass
 
     # ── Active pane ───────────────────────────────────────────────────────────
 
@@ -376,6 +616,12 @@ class MultiViewArea(QtWidgets.QWidget):
         for p in self._panes:
             p.set_active(p is pane)
         self._active_pane = pane
+        callback = self.on_active_pane_changed
+        if callable(callback):
+            try:
+                callback(pane)
+            except Exception:
+                pass
 
     @property
     def active_pane(self) -> ViewPane | None:
@@ -396,3 +642,51 @@ class MultiViewArea(QtWidgets.QWidget):
         needed = self._layout_n.get(self._current_layout, 1)
         for pane in self._panes[:needed]:
             pane.on_session_updated(reason)
+
+    def dispose(self) -> None:
+        """Dispose every pane and release layout containers."""
+        for pane in list(self._panes):
+            try:
+                pane.dispose()
+            except Exception:
+                pass
+            try:
+                pane.setParent(None)
+            except Exception:
+                pass
+            try:
+                pane.deleteLater()
+            except Exception:
+                pass
+        self._panes.clear()
+        self._active_pane = None
+
+        if self._container is not None:
+            try:
+                self._content_lay.removeWidget(self._container)
+            except Exception:
+                pass
+            try:
+                self._container.setParent(None)
+            except Exception:
+                pass
+            try:
+                self._container.deleteLater()
+            except Exception:
+                pass
+            self._container = None
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+
+    def close_all_panes(self):
+        """Close every pane's VTK interactor, releasing all OpenGL contexts.
+
+        Called by :class:`~.window.ViewerMainWindow` ``closeEvent`` so that
+        subsequent PyVista / matplotlib operations in the same process are
+        not blocked by orphaned VTK render windows.
+        """
+        for pane in self._panes:
+            try:
+                pane.plotter.close()
+            except Exception:
+                pass
