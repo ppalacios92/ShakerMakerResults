@@ -27,6 +27,7 @@ viewer = [
     "vtk",
     "pyvistaqt",
     "qtpy",
+    "PyQt5",
 ]
 
 [project.urls]
