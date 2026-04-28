@@ -190,6 +190,17 @@ class ViewerSession:
         self._notify_window("selection")
         return node_id, distance_m
 
+    def select_nearest_display_coordinate_m(self, x_m: float, y_m: float, z_m: float):
+        import numpy as np
+
+        point = [x_m, y_m, z_m]
+        node_id = self.adapter.nearest_node_id(point)
+        node_point = self.adapter.point_for_node(node_id)
+        distance_m = float(np.linalg.norm(np.asarray(node_point, dtype=float) - np.asarray(point, dtype=float)))
+        self.state.set_selected_node(node_id)
+        self._notify_window("selection")
+        return node_id, distance_m
+
     def set_background(self, background: str):
         self.state.set_background(background)
         self._notify_window("appearance")

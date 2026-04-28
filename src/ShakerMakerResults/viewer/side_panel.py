@@ -389,7 +389,7 @@ class NodeSearchSection(_SectionBase):
     def _find_nearest(self):
         if self._syncing:
             return
-        nid, dist = self.session.select_nearest_coordinate_m(
+        nid, dist = self.session.select_nearest_display_coordinate_m(
             self.x_spin.value(), self.y_spin.value(), self.z_spin.value()
         )
         self.nearest_lbl.setText(f"{nid} | dist={dist:.3f} m")
