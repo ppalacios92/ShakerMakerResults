@@ -61,9 +61,10 @@ class ViewerToolBar(QtWidgets.QWidget):
         so the toolbar naturally follows whichever pane the user last clicked.
     """
 
-    def __init__(self, multi_view, parent=None):
+    def __init__(self, multi_view, session, parent=None):
         super().__init__(parent)
         self._multi_view = multi_view
+        self._session = session
         self._recording = False
         self._recording_plotters = []    # captured at open_movie() call time
         self._show_bbox = False
@@ -147,6 +148,56 @@ class ViewerToolBar(QtWidgets.QWidget):
         )
         self._bbox_btn.toggled.connect(self._toggle_bbox)
         layout.addWidget(self._bbox_btn)
+
+        # ── Selection filters ─────────────────────────────────────────────────
+        self._add_sep(layout)
+
+        self._sel_all_btn = self._sel_btn(
+            "Show All", "sel_all", "Show all visible nodes (reset filter)"
+        )
+        self._sel_all_btn.clicked.connect(
+            lambda: self._apply_selection_filter("all")
+        )
+        layout.addWidget(self._sel_all_btn)
+
+        self._sel_only_btn = self._sel_btn(
+            "Show Sel.", "sel_show", "Show only selected nodes"
+        )
+        self._sel_only_btn.clicked.connect(
+            lambda: self._apply_selection_filter("only")
+        )
+        layout.addWidget(self._sel_only_btn)
+
+        self._sel_hide_btn = self._sel_btn(
+            "Hide Sel.", "sel_hide", "Hide selected nodes"
+        )
+        self._sel_hide_btn.clicked.connect(
+            lambda: self._apply_selection_filter("hide")
+        )
+        layout.addWidget(self._sel_hide_btn)
+
+        self._sel_prev_btn = self._sel_btn(
+            "Reset", "sel_cursor", "Reset selection filter"
+        )
+        self._sel_prev_btn.clicked.connect(
+            lambda: self._apply_selection_filter("all")
+        )
+        layout.addWidget(self._sel_prev_btn)
+
+        # ── Node opacity ──────────────────────────────────────────────────────
+        self._add_sep(layout)
+
+        opacity_lbl = QtWidgets.QLabel("Opacity")
+        opacity_lbl.setToolTip("Uniform opacity for all rendered nodes (0 = transparent, 1 = opaque)")
+        layout.addWidget(opacity_lbl)
+
+        self._opacity_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._opacity_slider.setRange(0, 100)
+        self._opacity_slider.setValue(100)
+        self._opacity_slider.setFixedWidth(80)
+        self._opacity_slider.setToolTip("Node opacity")
+        self._opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        layout.addWidget(self._opacity_slider)
 
         layout.addStretch(1)
         self._add_sep(layout)
@@ -554,6 +605,28 @@ class ViewerToolBar(QtWidgets.QWidget):
             self._load_transform_from_session()
         except Exception:
             pass
+
+    # ── Selection helpers ─────────────────────────────────────────────────────
+
+    def _on_opacity_changed(self, value: int):
+        self._session.set_node_opacity(value / 100.0)
+
+    def _apply_selection_filter(self, mode: str):
+        apply_fn = getattr(self._multi_view, "apply_selection_filter", None)
+        if callable(apply_fn):
+            apply_fn(mode, apply_to_all=self._all_windows_chk.isChecked())
+
+    def _sel_btn(self, label: str, icon_name: str, tooltip: str) -> QtWidgets.QToolButton:
+        """Create a small toolbar button using a viewer SVG icon."""
+        btn = QtWidgets.QToolButton()
+        btn.setText(label)
+        btn.setIcon(viewer_icon(icon_name, LIGHT_PALETTE.navy, 16))
+        btn.setIconSize(QtCore.QSize(16, 16))
+        btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        btn.setToolTip(tooltip)
+        btn.setAutoRaise(True)
+        btn.setFixedHeight(26)
+        return btn
 
     def _btn(
         self,

@@ -66,6 +66,7 @@ class ViewerSession:
         self._station_tags: list[dict[str, object]] = []
         self._show_station_tags = True
         self._display_gf_subfault: int = 0
+        self._prev_multi_selection: frozenset = frozenset()
 
         if show:
             self.show()
@@ -188,13 +189,15 @@ class ViewerSession:
 
     def select_node(self, node_id):
         self.state.set_selected_node(node_id)
+        self.state.multi_selection = frozenset()
+        self.state.set_selection_visibility("all")
         self._notify_window("selection")
+        self._notify_window("multi_selection")
         return self.state.selected_node
 
     def select_nearest_coordinate_m(self, x_m: float, y_m: float, z_m: float):
         node_id, distance_m = self.adapter.nearest_node_from_model_xyz_m([x_m, y_m, z_m])
-        self.state.set_selected_node(node_id)
-        self._notify_window("selection")
+        self.select_node(node_id)
         return node_id, distance_m
 
     def select_nearest_display_coordinate_m(self, x_m: float, y_m: float, z_m: float):
@@ -204,9 +207,58 @@ class ViewerSession:
         node_id = self.adapter.nearest_node_id(point)
         node_point = self.adapter.point_for_node(node_id)
         distance_m = float(np.linalg.norm(np.asarray(node_point, dtype=float) - np.asarray(point, dtype=float)))
-        self.state.set_selected_node(node_id)
-        self._notify_window("selection")
+        self.select_node(node_id)
         return node_id, distance_m
+
+    def clear_selection(self):
+        self.state.set_selected_node(None)
+        self.state.multi_selection = frozenset()
+        self.state.set_selection_visibility("all")
+        self._notify_window("selection")
+        self._notify_window("multi_selection")
+
+    # ── Multi-node selection (visualization only) ─────────────────────────────
+
+    def set_selection_visibility(self, mode: str):
+        self.state.set_selection_visibility(mode)
+        self._notify_window("multi_selection")
+        return self.state.selection_visibility
+
+    def set_node_opacity(self, opacity: float):
+        self.state.set_node_opacity(opacity)
+        self._notify_window("node_opacity")
+        return self.state.node_opacity
+
+    def apply_selection_filter(self, mode: str):
+        """Apply a visibility filter using the current selection set."""
+        if self.state.multi_selection:
+            self._prev_multi_selection = frozenset(self.state.multi_selection)
+        self.state.set_selection_visibility(mode)
+        self._notify_window("multi_selection")
+
+    def restore_prev_selection(self):
+        """Restore the selection set saved before the last filter was applied."""
+        self.state.multi_selection = frozenset(self._prev_multi_selection)
+        self.state.set_selection_visibility("all")
+        self._notify_window("multi_selection")
+
+    def add_nodes_to_multi_selection(self, node_ids):
+        """Add a batch of nodes to the selection set, then notify once."""
+        selected = set(self.state.multi_selection)
+        for nid in node_ids:
+            selected.add(nid)
+        self.state.multi_selection = frozenset(selected)
+        self.state.set_selected_node(None)
+        self.state.set_selection_visibility("all")
+        self._notify_window("selection")
+        self._notify_window("multi_selection")
+        return self.state.multi_selection
+
+    def has_multi_selection(self) -> bool:
+        return bool(self.state.multi_selection)
+
+    def current_visible_node_ids(self) -> list:
+        return self.adapter.visible_node_ids
 
     def set_background(self, background: str):
         self.state.set_background(background)
@@ -317,6 +369,27 @@ class ViewerSession:
         self.state.set_colormap(colormap)
         self.state.set_user_color_range(vmin, vmax)
         self.state.set_clamp_enabled(clamp_enabled)
+
+        # Pre-warm the requested series so the scene rebuild is pure NumPy
+        # (no HDF5 I/O during the VTK render call that follows).
+        if demand != GF_DEMAND:
+            fits = (
+                self.adapter._estimated_series_bytes_for_demand(demand)
+                <= self.adapter.max_cache_bytes
+            )
+            if fits:
+                if component == "resultant":
+                    for _c in ("e", "n", "z"):
+                        try:
+                            self.adapter.scalar_series(demand, _c)
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self.adapter.scalar_series(demand, component)
+                    except Exception:
+                        pass
+
         # "panel_apply" triggers a full scalar-actor rebuild that picks up every
         # state change above in one render pass.
         self._notify_window("panel_apply")

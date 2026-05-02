@@ -35,7 +35,9 @@ import time
 from ._imports import require_viewer_dependencies
 from .busy_dialog import BusyDialog
 from .colors import COLORMAP_OPTIONS, colormap_for_component
+from .icons import icon
 from .session import VALID_STATIC_COLOR_BY
+from .theme import LIGHT_PALETTE
 from .trace_panel import AriasIntensityPanel, GFPanel, ResponsesPanel, SpectrumPanel
 
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
@@ -43,14 +45,14 @@ _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
 
 # ── Menu configuration ────────────────────────────────────────────────────────
 
-_MENU_ENTRIES: list[tuple[str, str]] = [
-    ("Node",       "Node"),
-    ("Display",    "Display"),
-    ("Visibility", "Visibility"),
-    ("Warp",       "Warp"),
+_MENU_ENTRIES: list[tuple[str, str, str]] = [
+    ("Node",       "nav_node",       "Node"),
+    ("Display",    "nav_display",    "Display"),
+    ("Visibility", "nav_visibility", "Vis."),
+    ("Warp",       "nav_warp",       "Warp"),
     # ── separator ── analysis pages below ──
-    ("Responses",  "Responses"),
-    ("GF",         "GF"),
+    ("Responses",  "nav_responses",  "Resp."),
+    ("GF",         "nav_gf",         "GF"),
 ]
 
 # Keys whose pages are heavy (lazy-created; refresh only when active).
@@ -589,6 +591,10 @@ class DisplaySection(_SectionBase):
         color_form.addRow("",           self.reset_btn)
         outer.addWidget(color_box)
 
+        outer.addWidget(
+            self._make_apply_button(self._apply, "Applying display settings…")
+        )
+
         static_color_box = QtWidgets.QGroupBox("Color By")
         static_color_form = QtWidgets.QFormLayout(static_color_box)
         static_color_form.setContentsMargins(6, 4, 6, 6)
@@ -633,10 +639,6 @@ class DisplaySection(_SectionBase):
         static_color_form.addRow("", self.static_reset_btn)
         static_color_form.addRow("", self.static_apply_btn)
         outer.addWidget(static_color_box)
-
-        outer.addWidget(
-            self._make_apply_button(self._apply, "Applying display settings…")
-        )
         outer.addStretch(1)
         self.refresh("init")
 
@@ -957,16 +959,17 @@ class ViewerSidePanel(QtWidgets.QWidget):
 
         # ── Vertical nav menu ─────────────────────────────────────────────────
         nav = QtWidgets.QWidget()
-        nav.setFixedWidth(84)
+        nav.setObjectName("SidePanelNav")
+        nav.setFixedWidth(72)
         nav_lay = QtWidgets.QVBoxLayout(nav)
-        nav_lay.setContentsMargins(0, 4, 0, 4)
-        nav_lay.setSpacing(1)
+        nav_lay.setContentsMargins(4, 6, 4, 6)
+        nav_lay.setSpacing(2)
 
-        self._nav_buttons: dict[str, QtWidgets.QPushButton] = {}
+        self._nav_buttons: dict[str, QtWidgets.QToolButton] = {}
         group = QtWidgets.QButtonGroup(self)
         group.setExclusive(True)
 
-        for key, label in _MENU_ENTRIES:
+        for key, icon_name, short_label in _MENU_ENTRIES:
             if key == "Responses":
                 sep = QtWidgets.QFrame()
                 sep.setFrameShape(QtWidgets.QFrame.HLine)
@@ -976,24 +979,31 @@ class ViewerSidePanel(QtWidgets.QWidget):
                 nav_lay.addWidget(sep)
                 nav_lay.addSpacing(4)
 
-            btn = QtWidgets.QPushButton(label)
+            btn = QtWidgets.QToolButton()
+            btn.setObjectName("SidePanelNavButton")
+            btn.setText(short_label)
+            btn.setIcon(icon(icon_name, LIGHT_PALETTE.navy, 18))
+            btn.setIconSize(QtCore.QSize(18, 18))
+            btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
             btn.setCheckable(True)
-            btn.setFixedHeight(30)
             btn.clicked.connect(lambda _c, k=key: self._navigate(k))
             self._nav_buttons[key] = btn
             group.addButton(btn)
-            nav_lay.addWidget(btn)
+            nav_lay.addWidget(btn, alignment=QtCore.Qt.AlignHCenter)
 
         nav_lay.addStretch(1)
         nav.setStyleSheet(
-            "QWidget { background: #f3f4f6; border-right: 1px solid #d7dbe2; }"
-            "QPushButton {"
-            "  border: none; border-radius: 0;"
-            "  text-align: left; padding: 4px 10px;"
-            "  background: transparent; color: #222; font-size: 12px;"
+            "QWidget#SidePanelNav { background: #f3f4f6; border-right: 1px solid #d7dbe2; }"
+            "QToolButton#SidePanelNavButton {"
+            "  min-width: 60px; max-width: 60px; min-height: 50px;"
+            "  border: 1px solid transparent; border-radius: 5px;"
+            "  background: transparent; color: #1e3558;"
+            "  font-size: 10px; padding: 3px 2px;"
             "}"
-            "QPushButton:checked { background: #e8f0fe; color: #1e3558; }"
-            "QPushButton:hover:!checked { background: #e3eaf6; }"
+            "QToolButton#SidePanelNavButton:checked {"
+            "  background: #e8f0fe; border-color: #2a6bc2; font-weight: 600;"
+            "}"
+            "QToolButton#SidePanelNavButton:hover:!checked { background: #e6ebef; }"
         )
         root.addWidget(nav)
 
@@ -1027,6 +1037,7 @@ class ViewerSidePanel(QtWidgets.QWidget):
             self._stack.addWidget(view)
 
         self._navigate("Node")
+        self._sync_analysis_nav()
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -1084,6 +1095,10 @@ class ViewerSidePanel(QtWidgets.QWidget):
                     page.refresh("time")
             return
 
+        if reason == "multi_selection":
+            self._sync_analysis_nav()
+            return
+
         # ── All other reasons: lightweight pages always, heavy only if active ──
 
         # Lightweight pages — cheap Qt-label updates, always safe to refresh.
@@ -1104,6 +1119,17 @@ class ViewerSidePanel(QtWidgets.QWidget):
             if page is not None:
                 page.refresh(reason)
                 self._dirty_heavy.discard(self._active_key)
+
+
+    def _sync_analysis_nav(self):
+        """Disable heavy analysis pages while a multi-node selection is active."""
+        multi_on = self.session.has_multi_selection()
+        for key in ("Responses", "GF"):
+            btn = self._nav_buttons.get(key)
+            if btn is not None:
+                btn.setEnabled(not multi_on)
+        if multi_on and self._active_key in _HEAVY_KEYS:
+            self._navigate("Node")
 
 
 __all__ = ["ViewerSidePanel"]

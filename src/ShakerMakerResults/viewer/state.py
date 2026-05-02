@@ -44,6 +44,19 @@ class ViewerState:
     warp_axes: tuple = (True, True, True)   # (E/X, N/Y, Z)
     warp_scale: float | None = None
 
+    # ── Multi-node selection (visualization only — zero data impact) ──────────
+    # multi_selection: frozenset of node IDs currently highlighted red.
+    # selection_visibility: controls which nodes the main actor renders:
+    #   "all"  → normal view (all visible nodes shown)
+    #   "only" → only nodes in multi_selection are rendered
+    #   "hide" → nodes in multi_selection are hidden, rest shown
+    # node_opacity: uniform opacity for the main point actor (0–1).
+    #   Does NOT affect the single-node yellow sphere or the red multi-selection
+    #   overlay — those always render fully opaque.
+    multi_selection: frozenset = frozenset()
+    selection_visibility: str = "all"
+    node_opacity: float = 1.0
+
     def __post_init__(self) -> None:
         self.demand = self._validate_demand(self.demand)
         self.component = self._validate_component(self.component)
@@ -65,6 +78,11 @@ class ViewerState:
         axes = self.warp_axes
         self.warp_axes = (bool(axes[0]), bool(axes[1]), bool(axes[2]))
         self.warp_scale = None if self.warp_scale is None else float(self.warp_scale)
+        if not isinstance(self.multi_selection, frozenset):
+            self.multi_selection = frozenset(self.multi_selection)
+        if self.selection_visibility not in ("all", "only", "hide"):
+            self.selection_visibility = "all"
+        self.node_opacity = max(0.0, min(1.0, float(self.node_opacity)))
 
     def set_time_index(self, time_index: int, max_index: int) -> int:
         self.time_index = max(0, min(int(time_index), int(max_index)))
@@ -143,6 +161,16 @@ class ViewerState:
     def set_warp_scale(self, scale: float | None) -> float | None:
         self.warp_scale = None if scale is None else max(0.0, float(scale))
         return self.warp_scale
+
+    def set_selection_visibility(self, mode: str) -> str:
+        if mode not in ("all", "only", "hide"):
+            mode = "all"
+        self.selection_visibility = mode
+        return self.selection_visibility
+
+    def set_node_opacity(self, opacity: float) -> float:
+        self.node_opacity = max(0.0, min(1.0, float(opacity)))
+        return self.node_opacity
 
     @staticmethod
     def _validate_demand(demand: str) -> str:

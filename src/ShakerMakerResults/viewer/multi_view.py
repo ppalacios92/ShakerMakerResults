@@ -297,6 +297,12 @@ class ViewPane(QtWidgets.QWidget):
         elif reason == "warp":
             self.scene.rebuild_scalar_actor(render=False)
             self.scene.refresh_selection(render=False)
+        elif reason == "multi_selection":
+            # Node added/removed from selection set, or show/hide filter changed.
+            self.scene.rebuild_scalar_actor(render=False)
+            self.scene.refresh_multi_selection(render=False)
+        elif reason == "node_opacity":
+            self.scene.update_node_opacity(render=False)
         else:
             # "full" or any unknown reason — full rebuild.
             self.scene.rebuild_scalar_actor(render=False)
@@ -462,9 +468,23 @@ class MultiViewArea(QtWidgets.QWidget):
 
     def _camera_target_panes(self) -> list[ViewPane]:
         if self._apply_camera_to_all_panes:
-            needed = self._layout_n.get(self._current_layout, 1)
-            return self._panes[: max(0, min(needed, len(self._panes)))]
+            return self.visible_panes()
         return [self._active_pane] if self._active_pane is not None else []
+
+    def visible_panes(self) -> list[ViewPane]:
+        needed = self._layout_n.get(self._current_layout, 1)
+        return self._panes[: max(0, min(needed, len(self._panes)))]
+
+    def apply_selection_filter(self, mode: str, *, apply_to_all: bool = False):
+        panes = self.visible_panes() if apply_to_all else [self._active_pane]
+        for pane in panes:
+            if pane is None or pane.scene is None:
+                continue
+            pane.scene.apply_selection_filter(mode, render=False)
+            try:
+                pane.plotter.render()
+            except Exception:
+                pass
 
     @staticmethod
     def _apply_camera_preset_to_plotter(plotter, key: str) -> None:

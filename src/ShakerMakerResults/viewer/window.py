@@ -9,6 +9,7 @@ from ._imports import require_viewer_dependencies
 from .controls import HeaderBar, StatusChipBar, TimeControls
 from .multi_view import MultiViewArea
 from .side_panel import ViewerSidePanel
+from .theme import LIGHT_PALETTE, build_stylesheet
 from .toolbar import ViewerToolBar
 
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
@@ -35,8 +36,10 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f"ShakerMaker Results | {summary.name}")
         self.resize(1600, 900)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        self.setStyleSheet(build_stylesheet(LIGHT_PALETTE))
 
         central = QtWidgets.QWidget()
+        central.setObjectName("ViewerCentral")
         self.setCentralWidget(central)
 
         root = QtWidgets.QVBoxLayout(central)
@@ -60,7 +63,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self.multi_view = MultiViewArea(session)
         splitter.addWidget(self.multi_view)
 
-        self.toolbar = ViewerToolBar(self.multi_view, self)
+        self.toolbar = ViewerToolBar(self.multi_view, session, self)
         root.addWidget(self.toolbar)
 
         self.side_panel = ViewerSidePanel(session)
@@ -172,11 +175,11 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         mode = "clamp" if self.session.state.clamp_enabled else "auto"
         vmin, vmax = self.session.current_color_limits()
         chips = [
-            f"⏱ {self.session.current_time():.3f}s",
-            f"📊 {self.session.state.demand} · {self.session.state.component}",
-            f"🎨 {mode} [{vmin:.3g}, {vmax:.3g}]",
-            f"📍 {selected_label}",
-            f"💾 {self._cache_summary()}",
+            f"time {self.session.current_time():.3f}s",
+            f"{self.session.state.demand} / {self.session.state.component}",
+            f"{mode} [{vmin:.3g}, {vmax:.3g}]",
+            selected_label,
+            self._cache_summary(),
         ]
         self.status_chip_bar.update_values(chips)
 
@@ -243,7 +246,14 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             series_to_load += [(demand, "e"), (demand, "n"), (demand, "z")]
         else:
             series_to_load.append((demand, comp))
-        if self.session.state.disp_warp_enabled:
+        # Always warm disp series when it fits — makes enabling Warp instant
+        # even if warp is currently off.  Uses the same cache-size guard so
+        # large models skip it (per-frame reads remain the correct path there).
+        disp_fits = (
+            self.session.adapter._estimated_series_bytes()
+            <= self.session.adapter.max_cache_bytes
+        )
+        if disp_fits:
             series_to_load += [("disp", "e"), ("disp", "n"), ("disp", "z")]
 
         # ── Show the unified busy dialog ──────────────────────────────────────
