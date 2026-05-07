@@ -51,6 +51,9 @@ class ViewerSession:
         self._static_clamp_enabled: bool = False
         self._static_user_vmin: float | None = None
         self._static_user_vmax: float | None = None
+        # ── Wave-blend: modulate elevation Z coloring with wave amplitude ─────
+        self._wave_blend_enabled: bool = False
+        self._wave_blend_strength: float = 0.5   # 0 = pure elevation, 1 = full shift
         max_index = max(len(self.adapter.time) - 1, 0)
         self.state = ViewerState(
             time_index=time_index,
@@ -383,14 +386,26 @@ class ViewerSession:
         vmin: float | None,
         vmax: float | None,
         clamp_enabled: bool,
+        wave_blend_enabled: bool = False,
+        wave_blend_strength: float = 0.5,
     ):
         self._static_color_by = self._validate_static_color_by(color_by)
         self._static_color_map = str(colormap).strip() or self._static_color_map
         self._static_user_vmin = None if vmin is None else float(vmin)
         self._static_user_vmax = None if vmax is None else float(vmax)
         self._static_clamp_enabled = bool(clamp_enabled)
+        self._wave_blend_enabled = bool(wave_blend_enabled)
+        self._wave_blend_strength = max(0.01, min(1.0, float(wave_blend_strength)))
         self._notify_window("static_color")
         return self._static_color_by, self._static_color_map
+
+    # ── Wave-blend getters ────────────────────────────────────────────────────
+
+    def current_wave_blend_enabled(self) -> bool:
+        return self._wave_blend_enabled
+
+    def current_wave_blend_strength(self) -> float:
+        return self._wave_blend_strength
 
     def current_display_gf_subfault(self) -> int:
         return int(self._display_gf_subfault)
@@ -567,7 +582,8 @@ class ViewerSession:
 
     def set_playing(self, is_playing: bool):
         had_static_color_override = bool(self._static_color_by)
-        if is_playing:
+        # Wave-blend keeps the elevation active during playback — don't clear it.
+        if is_playing and not self._wave_blend_enabled:
             self._static_color_by = None
         if is_playing and not self.state.is_playing:
             if self.state.demand == GF_DEMAND:
@@ -593,7 +609,9 @@ class ViewerSession:
             # Stopping: release the persistent handle (no-op if never opened).
             self.adapter.close_playback_handle()
 
-        if had_static_color_override and is_playing:
+        # Only force a scene rebuild for static-color → wave transition when
+        # blend mode is OFF (blend mode keeps elevation alive during playback).
+        if had_static_color_override and is_playing and not self._wave_blend_enabled:
             self._notify_window("static_color")
         self.state.set_playing(is_playing)
         self._notify_window("playback")
@@ -615,6 +633,9 @@ class ViewerSession:
 
     def current_scalars(self):
         if self._static_color_by == "elevation_z":
+            # Wave-blend: during playback, modulate elevation with the wave field
+            if self._wave_blend_enabled and self.state.is_playing:
+                return self._elevation_wave_blend()
             return self.adapter.elevation_snapshot()
         gf_subfault = self._display_gf_subfault if self.state.demand == GF_DEMAND else 0
         return self.adapter.scalar_snapshot(
@@ -623,6 +644,51 @@ class ViewerSession:
             self.state.component,
             subfault_id=gf_subfault,
         )
+
+    def _elevation_wave_blend(self):
+        """Return scalars that blend elevation Z with the current wave frame.
+
+        The elevation values are kept in their original units (e.g. metres) and
+        the wave field is normalised to ``[-1, 1]`` using the dataset's global
+        amplitude.  The wave contribution shifts elevation values by at most
+        ``±strength × 0.5 × elevation_range``, so the overall visual range
+        stays close to the elevation limits and the terrain shape stays visible.
+
+        Blend formula::
+
+            blended = elevation + normalize(wave) × elev_range × strength × 0.5
+
+        With ``strength = 0.5`` (default) the wave can shift the colour by up
+        to ±25 % of the full elevation range — clearly visible without drowning
+        out the terrain detail.
+        """
+        import numpy as np
+
+        elev = self.adapter.elevation_snapshot()                    # (N,) float32
+        e_min, e_max = self.adapter.elevation_limits()
+        e_range = float(e_max - e_min) if e_max > e_min else 1.0
+
+        wave = self.adapter.scalar_snapshot(
+            self.state.time_index,
+            self.state.demand,
+            self.state.component,
+        )                                                            # (N,) float32
+
+        # Use the dataset's global amplitude for a stable [-1, 1] normalisation
+        # (per-frame normalisation would make weak early frames look the same
+        # as the main seismic arrival, which is visually confusing).
+        try:
+            w_min, w_max = self.adapter.default_scalar_limits(
+                self.state.demand, self.state.component
+            )
+            w_abs = max(abs(float(w_min)), abs(float(w_max)), 1e-12)
+        except Exception:
+            w_abs = float(np.max(np.abs(wave))) or 1e-12
+
+        w_norm = wave / w_abs                                        # [-1, 1]
+        strength = float(self._wave_blend_strength)
+        shift = w_norm * e_range * strength * 0.5
+        return (elev + shift).astype(np.float32)
 
     def current_visible_points(self):
         return self.adapter.visible_points(

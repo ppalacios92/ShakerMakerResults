@@ -669,6 +669,29 @@ class DisplaySection(_SectionBase):
         self.static_reset_btn = QtWidgets.QPushButton("Reset to auto")
         self.static_reset_btn.clicked.connect(self._reset_static_range)
 
+        # ── Wave blend controls ───────────────────────────────────────────
+        self.wave_blend_cb = QtWidgets.QCheckBox("Blend wave propagation")
+        self.wave_blend_cb.setToolTip(
+            "During playback the wave field modulates the elevation colour.\n"
+            "The terrain pattern stays visible while the wave passes through."
+        )
+        self.wave_blend_cb.toggled.connect(lambda *_: self._set_static_color_dirty())
+
+        self.wave_blend_strength_spin = QtWidgets.QDoubleSpinBox()
+        self.wave_blend_strength_spin.setRange(0.05, 1.0)
+        self.wave_blend_strength_spin.setSingleStep(0.05)
+        self.wave_blend_strength_spin.setDecimals(2)
+        self.wave_blend_strength_spin.setValue(0.5)
+        self.wave_blend_strength_spin.setToolTip(
+            "How strongly the wave shifts the elevation colour.\n"
+            "0.05 = very subtle  ·  1.0 = full elevation range."
+        )
+        self.wave_blend_strength_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
+        # Only meaningful when the checkbox is on
+        self.wave_blend_cb.toggled.connect(
+            lambda checked: self.wave_blend_strength_spin.setEnabled(checked)
+        )
+
         self.static_apply_btn = QtWidgets.QPushButton("Apply")
         self.static_apply_btn.setEnabled(False)
         self.static_apply_btn.clicked.connect(
@@ -682,6 +705,8 @@ class DisplaySection(_SectionBase):
         static_color_form.addRow("User max", self.static_vmax_spin)
         static_color_form.addRow("", self.static_clamp_cb)
         static_color_form.addRow("", self.static_reset_btn)
+        static_color_form.addRow("", self.wave_blend_cb)
+        static_color_form.addRow("Blend strength", self.wave_blend_strength_spin)
         static_color_form.addRow("", self.static_apply_btn)
         outer.addWidget(static_color_box)
         outer.addStretch(1)
@@ -772,6 +797,14 @@ class DisplaySection(_SectionBase):
                 self.static_vmin_spin.setValue(float(static_vmin))
                 self.static_vmax_spin.setValue(float(static_vmax))
                 self.static_clamp_cb.setChecked(self.session.current_static_clamp_enabled())
+                # Wave blend controls
+                b = self.wave_blend_cb.blockSignals(True)
+                self.wave_blend_cb.setChecked(self.session.current_wave_blend_enabled())
+                self.wave_blend_cb.blockSignals(b)
+                b = self.wave_blend_strength_spin.blockSignals(True)
+                self.wave_blend_strength_spin.setValue(self.session.current_wave_blend_strength())
+                self.wave_blend_strength_spin.blockSignals(b)
+                self.wave_blend_strength_spin.setEnabled(self.session.current_wave_blend_enabled())
                 self._clear_static_color_dirty()
             allow_static = not self.session.state.is_playing
             self.static_color_combo.setEnabled(allow_static)
@@ -780,6 +813,10 @@ class DisplaySection(_SectionBase):
             self.static_vmax_spin.setEnabled(allow_static)
             self.static_clamp_cb.setEnabled(allow_static)
             self.static_reset_btn.setEnabled(allow_static)
+            self.wave_blend_cb.setEnabled(allow_static)
+            self.wave_blend_strength_spin.setEnabled(
+                allow_static and self.session.current_wave_blend_enabled()
+            )
             self.static_apply_btn.setEnabled(allow_static and self._static_color_dirty)
         finally:
             self._syncing = False
@@ -850,6 +887,8 @@ class DisplaySection(_SectionBase):
             vmin=self.static_vmin_spin.value(),
             vmax=self.static_vmax_spin.value(),
             clamp_enabled=self.static_clamp_cb.isChecked(),
+            wave_blend_enabled=self.wave_blend_cb.isChecked(),
+            wave_blend_strength=self.wave_blend_strength_spin.value(),
         )
         self._clear_static_color_dirty()
 

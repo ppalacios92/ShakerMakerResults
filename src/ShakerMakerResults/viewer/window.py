@@ -144,6 +144,16 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                 self._prewarm_demands(["disp"])
             elif reason == "vector_field" and self.session.state.vector_field_enabled:
                 self._prewarm_demands([self.session.state.vector_field_demand])
+            elif reason == "static_color" and self.session.current_wave_blend_enabled():
+                # Wave blend just activated — prewarm the wave demand so the
+                # first Play press is instant rather than showing a BusyDialog.
+                from .adapter import GF_DEMAND
+                demand = self.session.state.demand
+                if demand != GF_DEMAND:
+                    needs = [demand]
+                    if self.session.state.disp_warp_enabled and demand != "disp":
+                        needs.append("disp")
+                    self._prewarm_demands(needs)
 
             self.multi_view.on_session_updated(reason)
             self.side_panel.refresh(reason)
