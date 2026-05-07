@@ -92,6 +92,11 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._space_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Space"), self)
         self._space_shortcut.activated.connect(self._toggle_play_shortcut)
 
+        # Guard flag: prevents re-entrant BusyDialog calls while one prewarm
+        # is already running (processEvents inside the dialog can re-trigger
+        # on_session_updated for unrelated reasons).
+        self._prewarming: bool = False
+
         # ── Startup data pre-warm ─────────────────────────────────────────────
         # Fire once after the window is fully painted.  Pre-warms the active
         # scalar series into RAM so the first Play press is instant.
@@ -101,14 +106,45 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Session update routing ────────────────────────────────────────────────
 
     def on_session_updated(self, reason: str):
-        """Fan a state-change reason out to every affected sub-widget."""
+        """Fan a state-change reason out to every affected sub-widget.
+
+        For reasons that change the active data field (``panel_apply``,
+        ``demand``, ``component``, ``warp``, ``vector_field``, ``playback``),
+        ``_prewarm_demands`` is called first so the 3-D render always hits the
+        cache rather than blocking on an HDF5 read.
+        """
         self.header.sync_from_state()
         self.time_controls.sync_from_state()
 
         if reason == "playback":
+            # Prewarm BEFORE starting the play timer so the first frame is
+            # served from cache and animation is smooth from tick one.
+            if self.session.state.is_playing:
+                from .adapter import GF_DEMAND
+                demand = self.session.state.demand
+                if demand != GF_DEMAND:
+                    needs = [demand]
+                    if self.session.state.disp_warp_enabled and demand != "disp":
+                        needs.append("disp")
+                    self._prewarm_demands(needs)
             self._sync_play_state()
             self.side_panel.refresh("playback")
         else:
+            # Prewarm whenever the active field or warp state changes so the
+            # following 3-D rebuild reads from RAM, not from HDF5.
+            if reason in ("panel_apply", "demand", "component"):
+                from .adapter import GF_DEMAND
+                demand = self.session.state.demand
+                if demand != GF_DEMAND:
+                    needs = [demand]
+                    if self.session.state.disp_warp_enabled and demand != "disp":
+                        needs.append("disp")
+                    self._prewarm_demands(needs)
+            elif reason == "warp" and self.session.state.disp_warp_enabled:
+                self._prewarm_demands(["disp"])
+            elif reason == "vector_field" and self.session.state.vector_field_enabled:
+                self._prewarm_demands([self.session.state.vector_field_demand])
+
             self.multi_view.on_session_updated(reason)
             self.side_panel.refresh(reason)
 
@@ -204,58 +240,30 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     def _base_frame_duration_s() -> float:
         return 0.08
 
-    # ── Startup pre-warm ──────────────────────────────────────────────────────
+    # ── Shared prewarm helper ─────────────────────────────────────────────────
 
-    def _prewarm_on_show(self):
-        """Pre-warm demand triplets (E/N/Z) once the window is fully painted.
+    def _prewarm_demands(self, demands: list) -> None:
+        """Load *demands* E/N/Z triplets into RAM, showing a BusyDialog.
 
-        Strategy
-        --------
-        1. Build a load order: active demand first, then ``vel``, then ``disp``
-           (deduped).  ``disp`` is always included so Warp is instant.
-        2. A full E/N/Z triplet (3 × series_bytes) must fit in the cache budget
-           simultaneously.  If it does not, per-frame HDF5 reads handle the
-           animation instead (fast on SSD with the persistent handle).
-        3. Determine how many triplets fit (``n_fits``); only load the first
-           ``n_fits`` demands so we never evict a just-loaded triplet while
-           loading the next one.
-        4. Show a BusyDialog with real-time GB/s and ETA so the user always
-           knows what is happening.
-
-        Skipped when closing or when the active demand is GF (GF warms lazily
-        on the first Play press).
+        Skips demands that are already fully cached, don't fit the budget, or
+        are the special GF demand (which is warmed lazily on demand).
+        Re-entrant calls while a prewarm is running are silently ignored.
         """
-        if self._closing:
+        if self._closing or self._prewarming:
             return
 
         from .adapter import GF_DEMAND
 
-        demand = self.session.state.demand
-        if demand == GF_DEMAND:
-            return
-
         adapter = self.session.adapter
         one_series_bytes = adapter._estimated_series_bytes()
-        triplet_bytes    = 3 * one_series_bytes
+        triplet_bytes = 3 * one_series_bytes
 
-        # If even one triplet doesn't fit the budget, skip (per-frame reads win).
-        if triplet_bytes == 0 or triplet_bytes > adapter.max_cache_bytes:
-            return
-
-        # Build candidate list: active demand first, always add vel + disp.
-        candidates: list[str] = [demand]
-        for _d in ("vel", "disp"):
-            if _d not in candidates:
-                candidates.append(_d)
-
-        # How many full triplets fit simultaneously?
-        n_fits = max(1, adapter.max_cache_bytes // triplet_bytes)
-        candidates = candidates[:n_fits]
-
-        # Skip already fully-cached demands.
         to_load = [
-            d for d in candidates
-            if any((d, c) not in adapter._series_cache for c in ("e", "n", "z"))
+            d for d in demands
+            if d != GF_DEMAND
+            and triplet_bytes > 0
+            and triplet_bytes <= adapter.max_cache_bytes
+            and any((d, c) not in adapter._series_cache for c in ("e", "n", "z"))
         ]
         if not to_load:
             return
@@ -264,11 +272,12 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         busy = BusyDialog(
             "Cargando datos de simulación...",
             self,
-            total_steps=1000,   # 0-1000 scale → smooth progress bar
+            total_steps=1000,
         )
         busy.show()
         QtWidgets.QApplication.processEvents()
 
+        self._prewarming = True
         bytes_before_demand = 0
         _last_events = [time.monotonic()]
 
@@ -292,9 +301,9 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                     f"{gb_done:.2f} / {gb_total:.2f} GB  ({pct}%)\n"
                     f"{speed_str}"
                 )
-                global_pct = int(global_done * 1000 // total_bytes) if total_bytes > 0 else 0
-                busy.set_step(global_pct)
-
+                busy.set_step(
+                    int(global_done * 1000 // total_bytes) if total_bytes > 0 else 0
+                )
                 now = time.monotonic()
                 if now - _last_events[0] >= 0.10:
                     QtWidgets.QApplication.processEvents()
@@ -315,8 +324,50 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         finally:
+            self._prewarming = False
             busy.close()
             self._update_status()
+
+    # ── Startup pre-warm ──────────────────────────────────────────────────────
+
+    def _prewarm_on_show(self):
+        """Pre-warm demand triplets (E/N/Z) once the window is fully painted.
+
+        Builds a prioritised candidate list (active demand first, then ``vel``
+        and ``disp`` for instant Warp), caps it to however many full triplets
+        fit simultaneously in the budget, and delegates to ``_prewarm_demands``.
+
+        Skipped when closing or when the active demand is GF (GF warms lazily
+        on the first Play press).
+        """
+        if self._closing:
+            return
+
+        from .adapter import GF_DEMAND
+
+        demand = self.session.state.demand
+        if demand == GF_DEMAND:
+            return
+
+        adapter = self.session.adapter
+        one_series_bytes = adapter._estimated_series_bytes()
+        triplet_bytes    = 3 * one_series_bytes
+
+        # If even one triplet doesn't fit the budget, skip (per-frame reads win).
+        if triplet_bytes == 0 or triplet_bytes > adapter.max_cache_bytes:
+            return
+
+        # Build candidate list: active demand first, always add vel + disp.
+        candidates: list = [demand]
+        for _d in ("vel", "disp"):
+            if _d not in candidates:
+                candidates.append(_d)
+
+        # How many full triplets fit simultaneously?
+        n_fits = max(1, adapter.max_cache_bytes // triplet_bytes)
+        candidates = candidates[:n_fits]
+
+        self._prewarm_demands(candidates)
 
     # ── Window close / cleanup ────────────────────────────────────────────────
 

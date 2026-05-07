@@ -320,11 +320,6 @@ class ViewerSession:
     def set_warp_enabled(self, enabled: bool):
         """Enable or disable 3-D displacement warp."""
         self.state.set_warp_enabled(enabled)
-        if enabled:
-            try:
-                self.adapter.prewarm_component_triplet("disp")
-            except Exception:
-                pass
         self._notify_window("warp")
         return self.state.disp_warp_enabled
 
@@ -374,22 +369,9 @@ class ViewerSession:
         self.state.set_user_color_range(vmin, vmax)
         self.state.set_clamp_enabled(clamp_enabled)
 
-        # Pre-warm the requested series so the scene rebuild is pure NumPy
-        # (no HDF5 I/O during the VTK render call that follows).
-        if demand != GF_DEMAND:
-            if component == "resultant":
-                try:
-                    self.adapter.prewarm_component_triplet(demand)
-                except Exception:
-                    pass
-            else:
-                try:
-                    self.adapter.scalar_series(demand, component)
-                except Exception:
-                    pass
-
         # "panel_apply" triggers a full scalar-actor rebuild that picks up every
-        # state change above in one render pass.
+        # state change above in one render pass.  Data pre-warming with a
+        # progress dialog is handled by ViewerMainWindow.on_session_updated.
         self._notify_window("panel_apply")
         return self.state.demand, self.state.component
 
@@ -477,12 +459,6 @@ class ViewerSession:
         self.state.set_warp_axes(tuple(bool(v) for v in warp_axes))
         self.state.set_warp_scale(warp_scale)
 
-        if warp_enabled and not was_warp_enabled:
-            try:
-                self.adapter.prewarm_component_triplet("disp")
-            except Exception:
-                pass
-
         self._notify_window("warp")
         return self.state.disp_warp_enabled, self.state.warp_axes, self.state.warp_scale
 
@@ -508,11 +484,6 @@ class ViewerSession:
         self.state.vector_field_demand = demand_lower
         self.state.vector_field_scale = max(0.01, float(scale))
         self.state.vector_field_colormap = str(colormap) or "viridis"
-        if enabled:
-            try:
-                self.adapter.prewarm_component_triplet(demand_lower)
-            except Exception:
-                pass
         self._notify_window("vector_field")
 
     def current_vector_data(self):
@@ -581,12 +552,6 @@ class ViewerSession:
         self.state.set_warp_axes(tuple(bool(v) for v in warp_axes))
         self.state.set_warp_scale(warp_scale)
 
-        if warp_enabled and not was_warp_enabled:
-            try:
-                self.adapter.prewarm_component_triplet("disp")
-            except Exception:
-                pass
-
         self._notify_window("panel_apply")
         return {
             "demand": self.state.demand,
@@ -606,48 +571,22 @@ class ViewerSession:
             self._static_color_by = None
         if is_playing and not self.state.is_playing:
             if self.state.demand == GF_DEMAND:
-                # ── GF demand: pre-warm the full (n_nodes, nt_gf) series in
-                # one HDF5 read so every animation frame is pure NumPy.
-                # GF series are compact (nt_gf << nt_sim) and almost always fit
-                # in cache, so no size-guard is needed here.
+                # GF series are compact — warm instantly with no dialog needed.
                 try:
                     comp_idx = self.adapter._gf_component_index(self.state.component)
                     self.adapter.warm_gf_series(self._display_gf_subfault, comp_idx)
                 except Exception:
                     pass
             else:
-                # ── Regular demand: only pre-warm when the full series fits.
-                # When it doesn't fit, _try_direct_component_snapshot handles
-                # each frame via a fast single-column HDF5 read.  Calling
-                # scalar_series() on an oversized dataset just runs the slow
-                # O(T) loop and then discards the result.
+                # Regular demands: ViewerMainWindow.on_session_updated("playback")
+                # runs _prewarm_demands (with BusyDialog + progress) BEFORE this
+                # set_playing call starts the play timer, so the triplet should
+                # already be in cache by now.
+                # If the series is still not cached (budget too small to hold the
+                # triplet), open a persistent HDF5 handle so per-frame reads skip
+                # the ~1-5 ms file-open overhead on every animation tick.
                 demand = self.state.demand
-                if self.adapter.cache_time_series:
-                    if self.state.component == "resultant":
-                        # Warm E, N, Z individually.  scalar_snapshot derives
-                        # resultant from the cached trio on every frame (free
-                        # NumPy sqrt, no I/O).  scalar_series("resultant") would
-                        # also work after Fix A in adapter, but this is more
-                        # direct and avoids an unnecessary cache entry.
-                        try:
-                            self.adapter.prewarm_component_triplet(demand)
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            self.adapter.scalar_series(demand, self.state.component)
-                        except Exception:
-                            pass
-                    # Pre-warm displacement series when warp is active.
-                    if self.state.disp_warp_enabled:
-                        try:
-                            self.adapter.prewarm_component_triplet("disp")
-                        except Exception:
-                            pass
                 if not any((demand, _c) in self.adapter._series_cache for _c in ("e", "n", "z")):
-                    # Series too large to cache — keep an HDF5 handle open for
-                    # the duration of playback so _try_direct_component_snapshot
-                    # avoids the ~1-5 ms file-open cost on every animation frame.
                     self.adapter.open_playback_handle()
 
         elif not is_playing and self.state.is_playing:
