@@ -6,11 +6,40 @@ from ._imports import require_viewer_dependencies
 
 _, _, _, QtCore, _, QtWidgets = require_viewer_dependencies()
 
+# Cross-binding Signal: PySide2/6 uses QtCore.Signal, PyQt5/6 uses QtCore.pyqtSignal.
+try:
+    _Signal = QtCore.Signal      # PySide2 / PySide6
+except AttributeError:
+    _Signal = QtCore.pyqtSignal  # PyQt5 / PyQt6
+
 try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 except ImportError:  # pragma: no cover - compatibility fallback
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+
+class _BgWorker(QtCore.QThread):
+    """Run a callable in a background thread; emit (key, result) on finish.
+
+    *result* is either the return value of *fn* or an ``Exception`` instance.
+    Connect to ``finished`` before calling ``start()``.  Disconnect before
+    discarding this object to avoid stale callbacks.
+    """
+
+    finished = _Signal(object, object)  # (key, result_or_exception)
+
+    def __init__(self, key, fn, parent=None):
+        super().__init__(parent)
+        self._key = key
+        self._fn = fn
+
+    def run(self):
+        try:
+            result = self._fn()
+        except Exception as exc:  # noqa: BLE001
+            result = exc
+        self.finished.emit(self._key, result)
 
 
 COMPONENT_COLORS = {
@@ -125,6 +154,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         self.session = session
         self._current_node = None
         self._table_rows: list[tuple[float, float, float, float]] = []
+        self._worker: _BgWorker | None = None  # background computation thread
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -190,6 +220,7 @@ class SpectrumPanel(QtWidgets.QWidget):
 
         node_id = self.session.state.selected_node
         if node_id is None:
+            self._cancel_worker()
             self._current_node = None
             for ax in self.axes:
                 ax.clear()
@@ -204,19 +235,53 @@ class SpectrumPanel(QtWidgets.QWidget):
             return
 
         self._current_node = node_id
+        self._cancel_worker()
+
+        # Show a placeholder immediately so the panel doesn't look frozen.
         for ax in self.axes:
             ax.clear()
+            ax.grid(True, alpha=0.25)
+        self.axes[-1].set_xlabel("Period [s]")
+        self.title_label.setText(f"Node {node_id} | Computing spectrum…")
+        self.copy_table_button.setEnabled(False)
+        self._set_table_rows([])
+        self.canvas.draw_idle()
 
-        try:
-            spectrum = self.session.current_spectrum()
-        except Exception as exc:  # pragma: no cover - runtime-only when deps are missing
-            self.title_label.setText(f"Spectrum unavailable: {exc}")
+        # Capture node_id so the lambda always calls adapter.spectrum for THIS node,
+        # not whatever selected_node happens to be when the thread finally runs.
+        _node_id = node_id
+        fn = lambda: self.session.adapter.spectrum(_node_id)  # noqa: E731
+        worker = _BgWorker(_node_id, fn, parent=self)
+        worker.finished.connect(self._on_spectrum_ready)
+        self._worker = worker
+        worker.start()
+
+    def _cancel_worker(self):
+        """Disconnect and release any running background worker (result is discarded)."""
+        if self._worker is not None:
+            try:
+                self._worker.finished.disconnect(self._on_spectrum_ready)
+            except Exception:  # noqa: BLE001
+                pass
+            self._worker = None
+
+    def _on_spectrum_ready(self, node_id, result):
+        """Slot called on the main thread when the background worker finishes."""
+        self._worker = None
+        if node_id != self._current_node:
+            return  # Node changed while computing — discard stale result.
+
+        if isinstance(result, Exception):
+            self.title_label.setText(f"Spectrum unavailable: {result}")
             for ax in self.axes:
                 ax.grid(True, alpha=0.25)
             self._set_table_rows([])
             self.canvas.draw_idle()
             return
 
+        spectrum = result
+        for ax in self.axes:
+            ax.clear()
         self.title_label.setText(f"Node {node_id} | Newmark PSa")
         for ax, label in zip(self.axes, ("z", "e", "n")):
             ax.plot(
@@ -270,6 +335,7 @@ class AriasIntensityPanel(QtWidgets.QWidget):
         self.session = session
         self._current_node = None
         self._metric_rows: list[tuple[str, float, float, float, float, float]] = []
+        self._worker: _BgWorker | None = None  # background computation thread
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -322,6 +388,7 @@ class AriasIntensityPanel(QtWidgets.QWidget):
 
         node_id = self.session.state.selected_node
         if node_id is None:
+            self._cancel_worker()
             self._current_node = None
             for ax in self.axes:
                 ax.clear()
@@ -336,20 +403,52 @@ class AriasIntensityPanel(QtWidgets.QWidget):
             return
 
         self._current_node = node_id
+        self._cancel_worker()
+
+        # Show a placeholder immediately so the panel doesn't look frozen.
         for ax in self.axes:
             ax.clear()
+            ax.grid(True, alpha=0.25)
+        self.axes[-1].set_xlabel("Time [s]")
+        self.title_label.setText(f"Node {node_id} | Computing Arias…")
+        self._set_metric_rows([])
+        self.canvas.draw_idle()
 
-        try:
-            arias = self.session.current_arias()
-        except Exception as exc:  # pragma: no cover - optional dependency/runtime
-            self.title_label.setText(f"Arias unavailable: {exc}")
+        # Capture node_id so the lambda always calls adapter.arias for THIS node.
+        _node_id = node_id
+        fn = lambda: self.session.adapter.arias(_node_id)  # noqa: E731
+        worker = _BgWorker(_node_id, fn, parent=self)
+        worker.finished.connect(self._on_arias_ready)
+        self._worker = worker
+        worker.start()
+
+    def _cancel_worker(self):
+        """Disconnect and release any running background worker (result is discarded)."""
+        if self._worker is not None:
+            try:
+                self._worker.finished.disconnect(self._on_arias_ready)
+            except Exception:  # noqa: BLE001
+                pass
+            self._worker = None
+
+    def _on_arias_ready(self, node_id, result):
+        """Slot called on the main thread when the background worker finishes."""
+        self._worker = None
+        if node_id != self._current_node:
+            return  # Node changed while computing — discard stale result.
+
+        if isinstance(result, Exception):
+            self.title_label.setText(f"Arias unavailable: {result}")
             for ax in self.axes:
                 ax.grid(True, alpha=0.25)
             self._set_metric_rows([])
             self.canvas.draw_idle()
             return
 
+        arias = result
         time = arias["time"]
+        for ax in self.axes:
+            ax.clear()
         self.title_label.setText(f"Node {node_id} | Arias Intensity")
         metric_rows = []
         for ax, label in zip(self.axes, ("z", "e", "n")):

@@ -272,3 +272,8 @@ class StatusChipBar(QtWidgets.QWidget):
     def update_values(self, values):
         for label, text in zip(self._chips, values):
             label.setText(str(text))
+
+    def update_time_chip(self, text: str) -> None:
+        """Update only the time chip (index 0) — zero-cost during playback."""
+        if self._chips:
+            self._chips[0].setText(str(text))

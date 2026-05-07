@@ -112,7 +112,15 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             self.multi_view.on_session_updated(reason)
             self.side_panel.refresh(reason)
 
-        self._update_status()
+        # During frame-by-frame playback only the time chip changes — skip the
+        # full status rebuild (color limits, cache MB, etc.) to reduce Qt
+        # widget pressure on every animation tick.
+        if reason == "time" and self.session.state.is_playing:
+            self.status_chip_bar.update_time_chip(
+                f"time {self.session.current_time():.3f}s"
+            )
+        else:
+            self._update_status()
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
@@ -211,6 +219,14 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         - The full series would exceed the cache budget (large models fall back
           to per-frame single-column HDF5 reads, which is already fast).
         - The series is already cached (viewer was re-shown after a close).
+
+        Load strategy:
+        1. Always try to warm the active demand/component first (primary).
+        2. Optionally warm disp for instant Warp — but only when the combined
+           total of primary + disp fits within the cache budget.  This prevents
+           silent MemoryError on machines where one series fits but six do not.
+        3. When the session was opened with field=, skip the disp bonus entirely
+           so only the requested field is loaded.
         """
         if self._closing:
             return
@@ -221,40 +237,44 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         if demand == GF_DEMAND:
             return  # GF warmed lazily on first Play press
 
-        fits = (
-            self.session.adapter._estimated_series_bytes_for_demand(demand)
-            <= self.session.adapter.max_cache_bytes
-        )
-        if not fits:
-            return  # Too large — per-frame reads are the correct path
+        one_series_bytes = self.session.adapter._estimated_series_bytes()
 
-        # Is the series already warm?
+        # ── Build primary load list (active demand + component) ───────────────
         comp = self.session.state.component
         if comp == "resultant":
-            already_warm = all(
-                (demand, _c) in self.session.adapter._series_cache
-                for _c in ("e", "n", "z")
-            )
+            primary: list[tuple[str, str]] = [(demand, "e"), (demand, "n"), (demand, "z")]
         else:
-            already_warm = (demand, comp) in self.session.adapter._series_cache
-        if already_warm:
-            return
+            primary = [(demand, comp)]
 
-        # ── Build the load list so the progress bar has an accurate range ────
-        series_to_load: list[tuple[str, str]] = []
-        if comp == "resultant":
-            series_to_load += [(demand, "e"), (demand, "n"), (demand, "z")]
-        else:
-            series_to_load.append((demand, comp))
-        # Always warm disp series when it fits — makes enabling Warp instant
-        # even if warp is currently off.  Uses the same cache-size guard so
-        # large models skip it (per-frame reads remain the correct path there).
-        disp_fits = (
-            self.session.adapter._estimated_series_bytes()
-            <= self.session.adapter.max_cache_bytes
-        )
-        if disp_fits:
-            series_to_load += [("disp", "e"), ("disp", "n"), ("disp", "z")]
+        # Skip already-cached entries so restarts are instant.
+        primary = [
+            (d, c) for (d, c) in primary
+            if (d, c) not in self.session.adapter._series_cache
+        ]
+
+        primary_bytes = len(primary) * one_series_bytes
+        if primary_bytes > self.session.adapter.max_cache_bytes:
+            return  # Even the primary series doesn't fit — per-frame reads are the correct path
+
+        # ── Optionally add disp for instant Warp ─────────────────────────────
+        # Only include disp when the COMBINED total (primary + disp) fits within
+        # the cache budget.  A per-series check (old behaviour) passed even when
+        # loading all six series would exceed available RAM.
+        # Skipped entirely when the session was opened with field= so the user
+        # gets only what they asked for and nothing extra is loaded.
+        series_to_load: list[tuple[str, str]] = list(primary)
+        if demand != "disp" and not self.session._field_only:
+            disp_candidates = [
+                (d, c) for (d, c) in [("disp", "e"), ("disp", "n"), ("disp", "z")]
+                if (d, c) not in self.session.adapter._series_cache
+            ]
+            disp_bytes = len(disp_candidates) * one_series_bytes
+            combined_bytes = primary_bytes + disp_bytes
+            if combined_bytes <= self.session.adapter.max_cache_bytes:
+                series_to_load += disp_candidates
+
+        if not series_to_load:
+            return  # Everything already cached
 
         # ── Show the unified busy dialog ──────────────────────────────────────
         busy = BusyDialog("Loading simulation data...", self, total_steps=len(series_to_load))

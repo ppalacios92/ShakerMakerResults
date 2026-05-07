@@ -17,15 +17,25 @@ class ViewerSession:
         model_or_adapter,
         *,
         show: bool = False,
+        field: str | None = None,
         demand: str = "accel",
         component: str = "resultant",
         time_index: int = 0,
         selected_node=None,
         title: str | None = None,
         cache_time_series: bool = True,
-        max_cache_bytes: int = 512 * 1024 * 1024,
+        max_cache_bytes: int = 4 * 1024 * 1024 * 1024,
         max_cache_entries: int = 6,
     ) -> None:
+        # ── field= shorthand ──────────────────────────────────────────────────
+        # ``field='vel'`` is sugar for ``demand='vel', component='resultant'``
+        # and tells the pre-warm to load ONLY that demand (skipping the bonus
+        # disp series that the normal path adds for instant Warp).
+        if field is not None:
+            demand = str(field).lower()
+            component = "resultant"
+        self._field_only: bool = field is not None
+
         if isinstance(model_or_adapter, ViewerDataAdapter):
             self.adapter = model_or_adapter
         else:

@@ -76,7 +76,7 @@ class ViewerDataAdapter:
         model,
         *,
         cache_time_series: bool = True,
-        max_cache_bytes: int = 512 * 1024 * 1024,
+        max_cache_bytes: int = 4 * 1024 * 1024 * 1024,
         max_cache_entries: int = 6,
     ):
         self.model = model
@@ -113,6 +113,10 @@ class ViewerDataAdapter:
         # models (series too big to cache).  Eliminates ~1-5 ms file-open overhead
         # per frame when _try_direct_component_snapshot is the active path.
         self._playback_h5_handle = None
+        # Cached visibility mask — recomputed only when show_* flags change.
+        # Avoids a 497k-element boolean array allocation on every animation frame.
+        self._visibility_mask_cache: np.ndarray | None = None
+        self._visibility_mask_key: tuple[bool, bool, bool] | None = None
 
         self._visible_node_ids = list(self._display_node_ids)
         self._visible_to_display_index = np.arange(len(self._display_node_ids), dtype=int)
@@ -346,6 +350,17 @@ class ViewerDataAdapter:
         show_external: bool = True,
         show_qa: bool = True,
     ) -> np.ndarray:
+        """Return a boolean mask of visible nodes.
+
+        The result is cached keyed on (show_internal, show_external, show_qa).
+        During animation the flags never change, so every frame after the first
+        is a zero-cost dict lookup instead of a 497k-element NumPy computation.
+        The cache is invalidated by ``_rebuild_display_geometry``.
+        """
+        key = (bool(show_internal), bool(show_external), bool(show_qa))
+        if self._visibility_mask_key == key and self._visibility_mask_cache is not None:
+            return self._visibility_mask_cache
+
         internal = self._display_internal
         is_qa = self._display_is_qa
         external = (~internal) & (~is_qa)
@@ -356,6 +371,9 @@ class ViewerDataAdapter:
             mask |= external
         if show_qa:
             mask |= is_qa
+
+        self._visibility_mask_key = key
+        self._visibility_mask_cache = mask
         return mask
 
     def visible_points(
@@ -382,12 +400,21 @@ class ViewerDataAdapter:
         show_external: bool = True,
         show_qa: bool = True,
     ) -> np.ndarray:
+        """Return scalars filtered to visible nodes.
+
+        Short-circuits the mask application when all nodes are visible
+        (the common case for DRM models) — avoids a full 497k-element
+        fancy-index copy and returns a view of the original array instead.
+        """
         mask = self.visibility_mask(
             show_internal=show_internal,
             show_external=show_external,
             show_qa=show_qa,
         )
-        return np.asarray(values)[mask]
+        values = np.asarray(values)
+        if mask.all():
+            return values
+        return values[mask]
 
     def scalar_snapshot(
         self,
@@ -497,14 +524,36 @@ class ViewerDataAdapter:
         return values
 
     def trace(self, node_id: int | str, demand: str = "accel") -> np.ndarray:
-        """Return the selected node trace as ``[z, e, n]``."""
+        """Return the selected node trace as ``[z, e, n]``.
+
+        Fast path: when all three components for *demand* are already in the
+        series cache (e.g. pre-warmed by ``_prewarm_on_show`` or ``set_playing``),
+        extracts the node row with a pure NumPy slice — zero HDF5 I/O, instant
+        response even on 50+ GB models.
+
+        Falls back to ``get_node_data`` (HDF5 read) when the cache is cold or
+        the demand was never pre-warmed (e.g. requesting accel when only vel was
+        loaded via ``field='vel'``).
+        """
         demand = self._validate_demand(demand)
         if node_id in ("QA", "qa"):
             if not self.has_qa:
                 raise KeyError("QA station is not available for this model.")
             data = self.model.get_qa_data(demand)
-        else:
-            data = self.model.get_node_data(int(node_id), demand)
+            return np.asarray(data, dtype=float)
+
+        # ── Fast path: all three components already in RAM ────────────────────
+        z_key, e_key, n_key = (demand, "z"), (demand, "e"), (demand, "n")
+        if all(k in self._series_cache for k in (z_key, e_key, n_key)):
+            idx = int(node_id)
+            z = self._series_cache[z_key][idx, :]
+            e = self._series_cache[e_key][idx, :]
+            n = self._series_cache[n_key][idx, :]
+            # Row order matches get_node_data convention: [z, e, n]
+            return np.stack([z, e, n], axis=0).astype(float)
+
+        # ── Cold path: read from HDF5 ─────────────────────────────────────────
+        data = self.model.get_node_data(int(node_id), demand)
         return np.asarray(data, dtype=float)
 
     def gf_trace(self, node_id: int | str, subfault_id: int, component: str = "z") -> np.ndarray:
@@ -815,6 +864,9 @@ class ViewerDataAdapter:
         )
         self._visible_node_ids = list(self._display_node_ids)
         self._visible_to_display_index = np.arange(len(self._display_node_ids), dtype=int)
+        # Invalidate visibility mask cache — geometry or internal flags changed.
+        self._visibility_mask_cache = None
+        self._visibility_mask_key = None
 
     def _validate_demand(self, demand: str) -> str:
         demand = demand.lower()
