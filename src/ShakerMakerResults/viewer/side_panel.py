@@ -453,7 +453,7 @@ class NodeSearchSection(_SectionBase):
 
     def _select_by_id(self):
         if not self._syncing:
-            self.session.select_node(int(self.node_id_spin.value()))
+            self.session.add_node_to_multi_selection(int(self.node_id_spin.value()))
 
     def _find_nearest(self):
         if self._syncing:
@@ -672,19 +672,19 @@ class DisplaySection(_SectionBase):
         # ── Wave blend controls ───────────────────────────────────────────
         self.wave_blend_cb = QtWidgets.QCheckBox("Blend wave propagation")
         self.wave_blend_cb.setToolTip(
-            "During playback the wave field modulates the elevation colour.\n"
-            "The terrain pattern stays visible while the wave passes through."
+            "During playback the wave field shifts the elevation colour.\n"
+            "Disable it for pure topography during the animation."
         )
         self.wave_blend_cb.toggled.connect(lambda *_: self._set_static_color_dirty())
 
         self.wave_blend_strength_spin = QtWidgets.QDoubleSpinBox()
-        self.wave_blend_strength_spin.setRange(0.05, 1.0)
+        self.wave_blend_strength_spin.setRange(0.0, 1.0)
         self.wave_blend_strength_spin.setSingleStep(0.05)
         self.wave_blend_strength_spin.setDecimals(2)
         self.wave_blend_strength_spin.setValue(0.5)
         self.wave_blend_strength_spin.setToolTip(
             "How strongly the wave shifts the elevation colour.\n"
-            "0.05 = very subtle  ·  1.0 = full elevation range."
+            "0.00 = pure topography  ·  1.00 = full elevation range."
         )
         self.wave_blend_strength_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
         # Only meaningful when the checkbox is on
@@ -888,7 +888,11 @@ class DisplaySection(_SectionBase):
             vmax=self.static_vmax_spin.value(),
             clamp_enabled=self.static_clamp_cb.isChecked(),
             wave_blend_enabled=self.wave_blend_cb.isChecked(),
-            wave_blend_strength=self.wave_blend_strength_spin.value(),
+            wave_blend_strength=(
+                self.wave_blend_strength_spin.value()
+                if self.wave_blend_cb.isChecked()
+                else 0.0
+            ),
         )
         self._clear_static_color_dirty()
 
@@ -1356,6 +1360,12 @@ class ViewerSidePanel(QtWidgets.QWidget):
 
         if reason == "multi_selection":
             self._sync_analysis_nav()
+            if self._active_key == "Responses":
+                page = self._pages.get("Responses")
+                if page is not None:
+                    page.refresh("full")
+            else:
+                self._dirty_heavy.add("Responses")
             return
 
         # ── All other reasons: lightweight pages always, heavy only if active ──
@@ -1382,13 +1392,15 @@ class ViewerSidePanel(QtWidgets.QWidget):
 
 
     def _sync_analysis_nav(self):
-        """Disable heavy analysis pages while a multi-node selection is active."""
+        """Keep multi-node compatible analysis available."""
         multi_on = self.session.has_multi_selection()
-        for key in ("Responses", "GF"):
-            btn = self._nav_buttons.get(key)
-            if btn is not None:
-                btn.setEnabled(not multi_on)
-        if multi_on and self._active_key in _HEAVY_KEYS:
+        responses_btn = self._nav_buttons.get("Responses")
+        if responses_btn is not None:
+            responses_btn.setEnabled(True)
+        gf_btn = self._nav_buttons.get("GF")
+        if gf_btn is not None:
+            gf_btn.setEnabled(not multi_on)
+        if multi_on and self._active_key == "GF":
             self._navigate("Node")
 
 

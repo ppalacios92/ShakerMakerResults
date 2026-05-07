@@ -88,11 +88,19 @@ class ViewerDataAdapter:
         if max_cache_bytes is None:
             try:
                 import psutil as _psutil
-                _available = int(_psutil.virtual_memory().available)
+                _vm = _psutil.virtual_memory()
+                _available = int(_vm.available)
+                _total = int(_vm.total)
             except Exception:
                 _available = 4 * 1024 * 1024 * 1024
-            max_cache_bytes = max(1 * 1024 * 1024 * 1024, int(_available * 0.5))
+                _total = _available
+            if _total >= 24 * 1024 * 1024 * 1024:
+                max_cache_bytes = int(_total * 0.70)
+            else:
+                max_cache_bytes = int(_available * 0.5)
+            max_cache_bytes = max(1 * 1024 * 1024 * 1024, int(max_cache_bytes))
         self.max_cache_bytes = int(max_cache_bytes)
+        self._series_cache_dtype = np.dtype(np.float16)
         # Running total of bytes currently held in _series_cache.
         # Maintained by _cache_insert / _cache_touch / clear_runtime_caches.
         self._total_cache_bytes: int = 0
@@ -130,6 +138,9 @@ class ViewerDataAdapter:
         # Avoids a 497k-element boolean array allocation on every animation frame.
         self._visibility_mask_cache: np.ndarray | None = None
         self._visibility_mask_key: tuple[bool, bool, bool] | None = None
+        self._disp_window_cache: np.ndarray | None = None
+        self._disp_window_start: int = -1
+        self._disp_window_count: int = 0
 
         self._visible_node_ids = list(self._display_node_ids)
         self._visible_to_display_index = np.arange(len(self._display_node_ids), dtype=int)
@@ -278,6 +289,9 @@ class ViewerDataAdapter:
         self._arias_cache.clear()
         self._gf_limit_cache.clear()
         self._gf_series_cache.clear()
+        self._disp_window_cache = None
+        self._disp_window_start = -1
+        self._disp_window_count = 0
 
     @property
     def cache_info(self) -> dict[str, int]:
@@ -494,7 +508,13 @@ class ViewerDataAdapter:
             values = np.concatenate([np.asarray(values), np.array([qa_scalar])])
         return np.asarray(values, dtype=float)
 
-    def scalar_series(self, demand: str = "accel", component: str = "resultant") -> np.ndarray:
+    def scalar_series(
+        self,
+        demand: str = "accel",
+        component: str = "resultant",
+        *,
+        no_evict: bool = False,
+    ) -> np.ndarray:
         """Return the full time history matrix for one displayed scalar field."""
         demand = self._validate_demand(demand)
         component = self._validate_component(component)
@@ -521,15 +541,23 @@ class ViewerDataAdapter:
                 for _k in (e_k, n_k, z_k):
                     self._cache_touch(_k)
                 values = self._resultant_from_cached_components(demand)
-                self._cache_insert(key, values)
+                self._cache_insert(key, values, no_evict=no_evict)
                 return values
 
+        estimated = self._estimated_series_bytes_for_demand(demand)
+        if estimated <= 0 or estimated > self.max_cache_bytes:
+            raise MemoryError(
+                f"{demand}/{component} series requires "
+                f"{estimated / (1024 ** 3):.2f} GiB, cache budget is "
+                f"{self.max_cache_bytes / (1024 ** 3):.2f} GiB"
+            )
+
         values = self._build_scalar_series(demand, component)
-        self._cache_insert(key, values)
+        self._cache_insert(key, values, no_evict=no_evict)
         return values
 
     def prewarm_component_triplet(
-        self, demand: str, *, progress_cb=None
+        self, demand: str, *, progress_cb=None, no_evict: bool = False
     ) -> tuple[tuple[str, str], ...]:
         """Load E/N/Z full series for *demand* into cache with one HDF5 pass.
 
@@ -566,6 +594,12 @@ class ViewerDataAdapter:
         if one_series * 3 > self.max_cache_bytes:
             return tuple()
 
+        if no_evict:
+            missing_bytes = one_series * len(missing)
+            free_bytes = self.max_cache_bytes - self._total_cache_bytes
+            if missing_bytes > free_bytes:
+                return tuple()
+
         if self._supports_direct_series():
             try:
                 import h5py
@@ -581,7 +615,7 @@ class ViewerDataAdapter:
                         )
                         if qa is not None:
                             values = np.vstack([values, qa[None, :]])
-                        self._cache_insert((demand, comp), values)
+                        self._cache_insert((demand, comp), values, no_evict=no_evict)
                 return keys
             except Exception:
                 pass
@@ -589,7 +623,7 @@ class ViewerDataAdapter:
         loaded: list[tuple[str, str]] = []
         for comp in ("e", "n", "z"):
             try:
-                self.scalar_series(demand, comp)
+                self.scalar_series(demand, comp, no_evict=no_evict)
                 loaded.append((demand, comp))
             except Exception:
                 pass
@@ -784,11 +818,27 @@ class ViewerDataAdapter:
         n = len(self._display_points)
         try:
             time_index = self.clamp_time_index(time_index)
+            e_key, n_key, z_key = ("disp", "e"), ("disp", "n"), ("disp", "z")
+            if all(k in self._series_cache for k in (e_key, n_key, z_key)):
+                self._series_cache_hits += 1
+                col = min(time_index, self._series_cache[e_key].shape[1] - 1)
+                disp_e = np.asarray(self._series_cache[e_key][:, col], dtype=np.float32)
+                disp_n = np.asarray(self._series_cache[n_key][:, col], dtype=np.float32)
+                disp_z = np.asarray(self._series_cache[z_key][:, col], dtype=np.float32)
+                return np.column_stack([disp_e, disp_n, disp_z])
+
+            windowed = self._displacement_window_snapshot(time_index)
+            if windowed is not None:
+                return windowed
+
+            direct = self._try_direct_displacement_snapshot(time_index)
+            if direct is not None:
+                return direct
+
             disp_e = self.scalar_snapshot(time_index, "disp", "e")
             disp_n = self.scalar_snapshot(time_index, "disp", "n")
             disp_z = self.scalar_snapshot(time_index, "disp", "z")
-            disp_model = np.column_stack([disp_e, disp_n, disp_z])
-            return self._apply_display_transform_m(disp_model)
+            return np.column_stack([disp_e, disp_n, disp_z])
         except Exception:
             return np.zeros((n, 3), dtype=float)
 
@@ -881,7 +931,8 @@ class ViewerDataAdapter:
             "internal": internal,
             "xyz_km": None if coords is None else np.asarray(coords, dtype=float),
             "xyz_model_m": None if coords is None else np.asarray(coords, dtype=float) * 1000.0,
-            "xyz_m": None if display is None else np.asarray(display, dtype=float),
+            "xyz_m": None if coords is None else np.asarray(coords, dtype=float) * 1000.0,
+            "xyz_display_m": None if display is None else np.asarray(display, dtype=float),
             "has_gf": self.has_gf and self.has_map,
             "gf_slot_s0": None,
         }
@@ -1052,6 +1103,126 @@ class ViewerDataAdapter:
         qa = np.asarray(handle[path][:, column_index], dtype=np.float32)
         return float(np.linalg.norm(qa[[2, 0, 1]]))
 
+    def _try_direct_displacement_snapshot(self, time_index: int) -> np.ndarray | None:
+        if not self._supports_direct_snapshot():
+            return None
+
+        handle = self._playback_h5_handle
+        opened_here = False
+        if handle is None:
+            try:
+                import h5py
+                handle = h5py.File(self.model.filename, "r")
+                opened_here = True
+            except Exception:
+                return None
+
+        try:
+            data_handle = handle[self._data_path_for_demand("disp")]
+            source_col = self._source_column_index(time_index, data_handle.shape[1])
+            all_data = np.asarray(data_handle[:, source_col], dtype=np.float32)
+            disp_e = all_data[0::3]
+            disp_n = all_data[1::3]
+            disp_z = all_data[2::3]
+
+            if self.has_qa:
+                qa_path = self._qa_path_for_demand("disp")
+                qa_col = np.asarray(handle[qa_path][:, source_col], dtype=np.float32)
+                disp_e = np.append(disp_e, float(qa_col[0]))
+                disp_n = np.append(disp_n, float(qa_col[1]))
+                disp_z = np.append(disp_z, float(qa_col[2]))
+
+            return np.column_stack([disp_e, disp_n, disp_z]).astype(np.float32, copy=False)
+        except Exception:
+            return None
+        finally:
+            if opened_here and handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
+    def _displacement_window_snapshot(self, time_index: int) -> np.ndarray | None:
+        if not self._supports_direct_snapshot():
+            return None
+        time_index = self.clamp_time_index(time_index)
+        if (
+            self._disp_window_cache is not None
+            and self._disp_window_start <= time_index
+            and time_index < self._disp_window_start + self._disp_window_count
+        ):
+            local = time_index - self._disp_window_start
+            return np.asarray(self._disp_window_cache[:, local, :], dtype=np.float32)
+
+        n_nodes = len(self._points)
+        if n_nodes <= 0:
+            return None
+        bytes_per_frame = n_nodes * 3 * self._series_cache_dtype.itemsize
+        target_bytes = 128 * 1024 * 1024
+        window_count = max(8, min(96, target_bytes // max(bytes_per_frame, 1)))
+        total_steps = len(self.model.time)
+        if total_steps <= 0:
+            return None
+        start = min(time_index, max(0, total_steps - int(window_count)))
+        count = min(int(window_count), total_steps - start)
+        if count <= 0:
+            return None
+
+        handle = self._playback_h5_handle
+        opened_here = False
+        if handle is None:
+            try:
+                import h5py
+                handle = h5py.File(self.model.filename, "r")
+                opened_here = True
+            except Exception:
+                return None
+
+        try:
+            data_handle = handle[self._data_path_for_demand("disp")]
+            source_start = self._source_column_index(start, data_handle.shape[1])
+            source_stop = self._source_column_index(start + count - 1, data_handle.shape[1]) + 1
+            if source_stop - source_start != count:
+                return None
+
+            window = np.empty((n_nodes, count, 3), dtype=self._series_cache_dtype)
+            chunk_nodes = self._series_chunk_rows(count, component_count=3)
+            column_selector = slice(source_start, source_stop)
+            for node_start in range(0, n_nodes, chunk_nodes):
+                node_stop = min(node_start + chunk_nodes, n_nodes)
+                raw = np.asarray(
+                    data_handle[node_start * 3:node_stop * 3, column_selector],
+                    dtype=np.float32,
+                )
+                window[node_start:node_stop, :, 0] = raw[0::3, :]
+                window[node_start:node_stop, :, 1] = raw[1::3, :]
+                window[node_start:node_stop, :, 2] = raw[2::3, :]
+
+            if self.has_qa:
+                qa_path = self._qa_path_for_demand("disp")
+                qa_raw = np.asarray(handle[qa_path][:, column_selector], dtype=np.float32)
+                qa_window = np.empty((1, count, 3), dtype=self._series_cache_dtype)
+                qa_window[0, :, 0] = qa_raw[0, :]
+                qa_window[0, :, 1] = qa_raw[1, :]
+                qa_window[0, :, 2] = qa_raw[2, :]
+                window = np.concatenate([window, qa_window], axis=0)
+
+            self._disp_window_cache = window
+            self._disp_window_start = start
+            self._disp_window_count = count
+            return np.asarray(window[:, time_index - start, :], dtype=np.float32)
+        except Exception:
+            self._disp_window_cache = None
+            self._disp_window_start = -1
+            self._disp_window_count = 0
+            return None
+        finally:
+            if opened_here and handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
     def _build_scalar_series(self, demand: str, component: str) -> np.ndarray:
         direct = self._try_direct_component_series(demand, component)
         if direct is not None:
@@ -1075,7 +1246,7 @@ class ViewerDataAdapter:
                     qa_scalar = float(qa_values[self._component_to_trace_index(component), time_index])
                 values = np.concatenate([values, np.array([qa_scalar])])
             series.append(np.asarray(values, dtype=np.float32))
-        return np.column_stack(series)
+        return np.column_stack(series).astype(self._series_cache_dtype, copy=False)
 
     def _try_direct_component_series(self, demand: str, component: str) -> np.ndarray | None:
         if not self._supports_direct_series():
@@ -1108,7 +1279,7 @@ class ViewerDataAdapter:
 
         if qa_scalar is not None:
             values = np.vstack([values, qa_scalar[None, :]])
-        return np.asarray(values, dtype=np.float32)
+        return np.asarray(values, dtype=self._series_cache_dtype)
 
     def _supports_direct_series(self) -> bool:
         return (
@@ -1121,7 +1292,7 @@ class ViewerDataAdapter:
     def _estimated_series_bytes(self) -> int:
         rows = len(self._points) + (1 if self.has_qa else 0)
         cols = len(self.model.time)
-        return rows * cols * np.dtype(np.float32).itemsize
+        return rows * cols * self._series_cache_dtype.itemsize
 
     def _estimated_series_bytes_for_demand(self, demand: str) -> int:
         demand = self._validate_demand(demand)
@@ -1130,9 +1301,15 @@ class ViewerDataAdapter:
             cols = len(getattr(self.model, "gf_time", getattr(self.model, "time", [])))
         else:
             cols = len(self.model.time)
-        return rows * cols * np.dtype(np.float32).itemsize
+        return rows * cols * self._series_cache_dtype.itemsize
 
-    def _cache_insert(self, key: tuple[str, str], values: np.ndarray) -> bool:
+    def _cache_insert(
+        self,
+        key: tuple[str, str],
+        values: np.ndarray,
+        *,
+        no_evict: bool = False,
+    ) -> bool:
         """Insert *values* into the series cache using a global byte-budget LRU.
 
         The total in-memory cost of all cached series is tracked in
@@ -1144,7 +1321,8 @@ class ViewerDataAdapter:
         """
         if not self.cache_time_series:
             return False
-        incoming = int(np.asarray(values, dtype=np.float32).nbytes)
+        values = np.asarray(values, dtype=self._series_cache_dtype)
+        incoming = int(values.nbytes)
         if incoming > self.max_cache_bytes:
             return False   # Single series larger than the whole budget
 
@@ -1153,14 +1331,18 @@ class ViewerDataAdapter:
             old = self._series_cache.pop(key)
             self._total_cache_bytes -= int(old.nbytes)
 
-        # Evict globally least-recently-used entries until there is room.
-        while self._total_cache_bytes + incoming > self.max_cache_bytes:
-            if not self._series_cache:
+        if no_evict:
+            if self._total_cache_bytes + incoming > self.max_cache_bytes:
                 return False
-            _, evicted = self._series_cache.popitem(last=False)
-            self._total_cache_bytes -= int(evicted.nbytes)
+        else:
+            # Evict globally least-recently-used entries until there is room.
+            while self._total_cache_bytes + incoming > self.max_cache_bytes:
+                if not self._series_cache:
+                    return False
+                _, evicted = self._series_cache.popitem(last=False)
+                self._total_cache_bytes -= int(evicted.nbytes)
 
-        self._series_cache[key] = np.asarray(values, dtype=np.float32)
+        self._series_cache[key] = values
         self._total_cache_bytes += incoming
         return True
 
@@ -1174,15 +1356,16 @@ class ViewerDataAdapter:
         e = self._series_cache[(demand, "e")]
         n = self._series_cache[(demand, "n")]
         z = self._series_cache[(demand, "z")]
-        values = np.empty_like(e, dtype=np.float32)
+        values = np.empty_like(e, dtype=self._series_cache_dtype)
         chunk_rows = self._series_chunk_rows(e.shape[1], component_count=4)
         for start in range(0, e.shape[0], chunk_rows):
             stop = min(start + chunk_rows, e.shape[0])
-            out = values[start:stop, :]
-            np.square(e[start:stop, :], out=out)
-            out += n[start:stop, :] * n[start:stop, :]
-            out += z[start:stop, :] * z[start:stop, :]
+            out = np.asarray(e[start:stop, :], dtype=np.float32)
+            np.square(out, out=out)
+            out += np.asarray(n[start:stop, :], dtype=np.float32) ** 2
+            out += np.asarray(z[start:stop, :], dtype=np.float32) ** 2
             np.sqrt(out, out=out)
+            values[start:stop, :] = out
         return values
 
     def _read_component_series(self, data_handle, component: str, column_selector) -> np.ndarray:
@@ -1194,7 +1377,7 @@ class ViewerDataAdapter:
             n_cols = max(0, stop - start)
         else:
             n_cols = len(column_selector)
-        values = np.empty((n_nodes, n_cols), dtype=np.float32)
+        values = np.empty((n_nodes, n_cols), dtype=self._series_cache_dtype)
         chunk_nodes = self._series_chunk_rows(n_cols, component_count=3)
         for node_start in range(0, n_nodes, chunk_nodes):
             node_stop = min(node_start + chunk_nodes, n_nodes)
@@ -1218,12 +1401,12 @@ class ViewerDataAdapter:
         """
         n_nodes = data_handle.shape[0] // 3
         values = {
-            "e": np.empty((n_nodes, n_cols), dtype=np.float32),
-            "n": np.empty((n_nodes, n_cols), dtype=np.float32),
-            "z": np.empty((n_nodes, n_cols), dtype=np.float32),
+            "e": np.empty((n_nodes, n_cols), dtype=self._series_cache_dtype),
+            "n": np.empty((n_nodes, n_cols), dtype=self._series_cache_dtype),
+            "z": np.empty((n_nodes, n_cols), dtype=self._series_cache_dtype),
         }
         chunk_nodes = self._series_chunk_rows(n_cols, component_count=3)
-        total_bytes = n_nodes * n_cols * 4 * 3   # 3 components × float32
+        total_bytes = n_nodes * n_cols * self._series_cache_dtype.itemsize * 3
         bytes_done = 0
         for node_start in range(0, n_nodes, chunk_nodes):
             node_stop = min(node_start + chunk_nodes, n_nodes)
@@ -1233,7 +1416,12 @@ class ViewerDataAdapter:
             values["e"][node_start:node_stop, :] = raw[0::3, :]
             values["n"][node_start:node_stop, :] = raw[1::3, :]
             values["z"][node_start:node_stop, :] = raw[2::3, :]
-            bytes_done += (node_stop - node_start) * n_cols * 4 * 3
+            bytes_done += (
+                (node_stop - node_start)
+                * n_cols
+                * self._series_cache_dtype.itemsize
+                * 3
+            )
             if progress_cb is not None:
                 progress_cb(bytes_done, total_bytes)
         return values
@@ -1255,18 +1443,19 @@ class ViewerDataAdapter:
 
     def _read_resultant_series(self, data_handle, column_selector, n_cols: int) -> np.ndarray:
         n_nodes = data_handle.shape[0] // 3
-        values = np.empty((n_nodes, n_cols), dtype=np.float32)
+        values = np.empty((n_nodes, n_cols), dtype=self._series_cache_dtype)
         chunk_nodes = self._series_chunk_rows(n_cols, component_count=4)
         for node_start in range(0, n_nodes, chunk_nodes):
             node_stop = min(node_start + chunk_nodes, n_nodes)
             row_start = node_start * 3
             row_stop = node_stop * 3
             raw = np.asarray(data_handle[row_start:row_stop, column_selector], dtype=np.float32)
-            out = values[node_start:node_stop, :]
-            np.square(raw[0::3, :], out=out)
+            out = raw[0::3, :].copy()
+            np.square(out, out=out)
             out += raw[1::3, :] * raw[1::3, :]
             out += raw[2::3, :] * raw[2::3, :]
             np.sqrt(out, out=out)
+            values[node_start:node_stop, :] = out
         return values
 
     def _column_selector(self, total_cols: int):

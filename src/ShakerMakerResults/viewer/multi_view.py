@@ -211,7 +211,7 @@ class ViewPane(QtWidgets.QWidget):
         # ── Scene ────────────────────────────────────────────────────────────
         self.scene = ViewerScene(self.plotter, session)
         try:
-            self.scene.build()
+            self.scene.build(lightweight=True)
             self.scene.set_station_tags_visible(self._show_station_tags, render=False)
             self._apply_initial_camera(label)
         except Exception:

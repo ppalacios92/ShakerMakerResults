@@ -13,6 +13,7 @@ class RevitInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
     Interaction map
     ---------------
     - Left click: pick/select a node.
+    - Ctrl + left click: add/remove a node from the comparison selection.
     - Left drag: rubber-band area selection.
     - Mouse wheel and Ctrl + mouse wheel: zoom toward the cursor.
     - Right mouse drag: default VTK dolly/zoom.
@@ -71,7 +72,11 @@ class RevitInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
         else:
             point_id, pick_pos = self._pick_from_event_position(interactor)
             if point_id >= 0 and self._on_point_picked is not None:
-                self._on_point_picked(point_id, pick_pos)
+                self._on_point_picked(
+                    point_id,
+                    pick_pos,
+                    self._control_pressed(interactor),
+                )
 
         self._clear_rubber_band()
         self._sel_drag_start = None
@@ -120,6 +125,20 @@ class RevitInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
             app = QtWidgets.QApplication.instance()
             if app is not None:
                 return bool(app.keyboardModifiers() & QtCore.Qt.ShiftModifier)
+        except Exception:
+            pass
+        return False
+
+    def _control_pressed(self, interactor) -> bool:
+        try:
+            if bool(interactor.GetControlKey()):
+                return True
+        except Exception:
+            pass
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                return bool(app.keyboardModifiers() & QtCore.Qt.ControlModifier)
         except Exception:
             pass
         return False

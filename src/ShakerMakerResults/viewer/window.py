@@ -73,7 +73,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         root.addWidget(splitter, 1)
 
         # ── Transport controls ────────────────────────────────────────────────
-        self.time_controls = TimeControls(session, on_play_toggled=self._on_play_toggled)
+        self.time_controls = TimeControls(session)
         root.addWidget(self.time_controls)
 
         # ── Playback timer ────────────────────────────────────────────────────
@@ -82,6 +82,8 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._play_timer.timeout.connect(self._advance_playback)
         self._playback_last_tick: float | None = None
         self._playback_frame_accumulator: float = 0.0
+        self._advancing_playback: bool = False
+        self._last_render_ms: float = 16.0
 
         # ── Status bar ────────────────────────────────────────────────────────
         self.status_chip_bar = StatusChipBar()
@@ -92,9 +94,8 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._space_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Space"), self)
         self._space_shortcut.activated.connect(self._toggle_play_shortcut)
 
-        # Guard flag: prevents re-entrant BusyDialog calls while one prewarm
-        # is already running (processEvents inside the dialog can re-trigger
-        # on_session_updated for unrelated reasons).
+        # Guard flag: prevents re-entrant prewarm calls while one load is
+        # already running.
         self._prewarming: bool = False
 
         # ── Startup data pre-warm ─────────────────────────────────────────────
@@ -117,6 +118,11 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self.time_controls.sync_from_state()
 
         if reason == "playback":
+            if self.session.state.is_playing:
+                self.session.adapter.open_playback_handle()
+            self._sync_play_state()
+            self.side_panel.refresh("playback")
+            return
             # Prewarm the display demand BEFORE starting the play timer so the
             # first frame is served from cache and animation is smooth.
             #
@@ -142,6 +148,41 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             self._sync_play_state()
             self.side_panel.refresh("playback")
         else:
+            if reason in ("panel_apply", "demand", "component"):
+                from .adapter import GF_DEMAND
+                demand = self.session.state.demand
+                if demand != GF_DEMAND:
+                    self._prewarm_display_field(
+                        demand, self.session.state.component, no_evict=False
+                    )
+            elif reason == "warp" and self.session.state.disp_warp_enabled:
+                from .adapter import GF_DEMAND
+                demand = self.session.state.demand
+                if demand != GF_DEMAND:
+                    one = self.session.adapter._estimated_series_bytes()
+                    if 6 * one <= self.session.adapter.max_cache_bytes:
+                        self._prewarm_demands([demand, "disp"], no_evict=False)
+            elif reason == "vector_field" and self.session.state.vector_field_enabled:
+                self._prewarm_demands(
+                    [self.session.state.vector_field_demand], no_evict=False
+                )
+            elif reason == "static_color" and self.session.current_wave_blend_enabled():
+                from .adapter import GF_DEMAND
+                demand = self.session.state.demand
+                if demand != GF_DEMAND:
+                    self._prewarm_display_field(
+                        demand, self.session.state.component, no_evict=False
+                    )
+
+            self.multi_view.on_session_updated(reason)
+            self.side_panel.refresh(reason)
+            if reason == "time" and self.session.state.is_playing:
+                self.status_chip_bar.update_time_chip(
+                    f"time {self.session.current_time():.3f}s"
+                )
+            else:
+                self._update_status()
+            return
             # Prewarm whenever the active field or warp state changes so the
             # following 3-D rebuild reads from RAM, not from HDF5.
             if reason in ("panel_apply", "demand", "component"):
@@ -197,7 +238,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
 
     def _toggle_play_shortcut(self):
         self.session.toggle_playing()
-        self._sync_play_state()
+        return
 
     def _on_play_toggled(self, _is_playing: bool):
         self._sync_play_state()
@@ -216,10 +257,18 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._update_status()
 
     def _advance_playback(self):
+        if self._advancing_playback:
+            return
+        self._advancing_playback = True
+        try:
+            return self._advance_playback_once()
+        finally:
+            self._advancing_playback = False
+
+    def _advance_playback_once(self):
         max_index = max(len(self.session.adapter.time) - 1, 0)
         if self.session.state.time_index >= max_index:
             self.session.set_playing(False)
-            self._sync_play_state()
             self.toolbar.write_frame_if_recording()
             return
 
@@ -243,7 +292,11 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         step = max(1, min(frames_to_advance, remaining))
         # step_time fires on_session_updated("time") → multi_view renders each
         # pane, side_panel throttles the active trace cursor update.
+        _t0 = time.perf_counter()
         self.session.step_time(step)
+        _render_ms = (time.perf_counter() - _t0) * 1000.0
+        self._last_render_ms = 0.75 * self._last_render_ms + 0.25 * _render_ms
+        self._play_timer.setInterval(self._play_interval_ms())
         self.toolbar.write_frame_if_recording()
 
     # ── Status bar ────────────────────────────────────────────────────────────
@@ -265,11 +318,11 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     def _cache_summary(self) -> str:
         info = self.session.adapter.cache_info
         mb = info["bytes"] / (1024 * 1024)
-        return f"cache {mb:.1f} MB"
+        budget_mb = info["budget"] / (1024 * 1024)
+        return f"cache {mb:.1f}/{budget_mb:.0f} MB"
 
-    @staticmethod
-    def _play_interval_ms() -> int:
-        return 16
+    def _play_interval_ms(self) -> int:
+        return max(16, int(self._last_render_ms * 1.1))
 
     @staticmethod
     def _base_frame_duration_s() -> float:
@@ -277,7 +330,21 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
 
     # ── Shared prewarm helper ─────────────────────────────────────────────────
 
-    def _prewarm_demands(self, demands: list) -> None:
+    def _prewarm_display_field(self, demand: str, component: str, *, no_evict: bool = False) -> None:
+        if self._closing or self._prewarming:
+            return
+        from .adapter import GF_DEMAND
+        if demand == GF_DEMAND:
+            return
+        adapter = self.session.adapter
+        try:
+            if (demand, component) in adapter._series_cache:
+                return
+            adapter.scalar_series(demand, component, no_evict=no_evict)
+        except Exception:
+            adapter.open_playback_handle()
+
+    def _prewarm_demands(self, demands: list, *, no_evict: bool = False) -> None:
         """Load *demands* E/N/Z triplets into RAM, showing a BusyDialog.
 
         Skips demands that are already fully cached, don't fit the budget, or
@@ -314,7 +381,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
 
         self._prewarming = True
         bytes_before_demand = 0
-        _last_events = [time.monotonic()]
+        last_events = [time.monotonic()]
 
         def _make_cb(label: str, demand_start_bytes: int, idx: int, count: int, t_start: float):
             def _cb(done: int, total: int) -> None:
@@ -340,16 +407,16 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                     int(global_done * 1000 // total_bytes) if total_bytes > 0 else 0
                 )
                 now = time.monotonic()
-                if now - _last_events[0] >= 0.10:
+                if now - last_events[0] >= 0.10:
                     QtWidgets.QApplication.processEvents()
-                    _last_events[0] = now
+                    last_events[0] = now
             return _cb
 
         try:
             for i, d in enumerate(to_load):
                 t0 = time.monotonic()
                 cb = _make_cb(d, bytes_before_demand, i, len(to_load), t0)
-                adapter.prewarm_component_triplet(d, progress_cb=cb)
+                adapter.prewarm_component_triplet(d, progress_cb=cb, no_evict=no_evict)
                 bytes_before_demand += triplet_bytes
                 busy.set_step(
                     int(bytes_before_demand * 1000 // total_bytes)
@@ -363,14 +430,104 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             busy.close()
             self._update_status()
 
+    def _prewarm_startup_visual_cache(self) -> None:
+        """Warm startup visual fields without forcing every demand to E/N/Z.
+
+        The visual cache should make Apply instant for the common scalar fields
+        while still preparing displacement components for warp when memory
+        allows it.  Resultant fields cost one cached matrix each; full triplets
+        cost three, so only ``disp`` gets the triplet treatment for warp.
+        """
+        if self._closing or self._prewarming:
+            return
+
+        from .adapter import GF_DEMAND
+
+        adapter = self.session.adapter
+        one_series_bytes = adapter._estimated_series_bytes()
+        if one_series_bytes <= 0 or one_series_bytes > adapter.max_cache_bytes:
+            return
+
+        active = self.session.state.demand
+        visual_demands: list[str] = []
+        for demand in (active, "accel", "vel", "disp"):
+            if demand != GF_DEMAND and demand not in visual_demands:
+                visual_demands.append(demand)
+
+        visual_jobs = [
+            (demand, "resultant")
+            for demand in visual_demands
+            if (demand, "resultant") not in adapter._series_cache
+        ]
+        disp_triplet_missing = any(
+            ("disp", comp) not in adapter._series_cache for comp in ("e", "n", "z")
+        )
+        planned_visual_bytes = len(visual_jobs) * one_series_bytes
+        free_bytes = adapter.max_cache_bytes - adapter.cache_info["bytes"]
+        disp_triplet_fits = (planned_visual_bytes + 3 * one_series_bytes) <= free_bytes
+        needs_disp_triplet = disp_triplet_missing and disp_triplet_fits
+
+        if not visual_jobs and not needs_disp_triplet:
+            return
+
+        total_units = len(visual_jobs) + (3 if needs_disp_triplet else 0)
+        busy = BusyDialog("Cargando cache visual...", self, total_steps=1000)
+        busy.show()
+        QtWidgets.QApplication.processEvents()
+
+        self._prewarming = True
+        completed_units = 0
+
+        def _set_progress(message: str, units_done: int = completed_units) -> None:
+            busy.set_message(message)
+            busy.set_step(int(units_done * 1000 // max(total_units, 1)))
+            QtWidgets.QApplication.processEvents()
+
+        try:
+            for idx, (demand, component) in enumerate(visual_jobs, start=1):
+                _set_progress(
+                    f"Cargando campo visual  {demand}/{component}  "
+                    f"[{idx}/{len(visual_jobs)}]"
+                )
+                adapter.scalar_series(demand, component, no_evict=True)
+                completed_units += 1
+                _set_progress(
+                    f"Listo  {demand}/{component}",
+                    completed_units,
+                )
+
+            if needs_disp_triplet:
+                start_units = completed_units
+
+                def _disp_cb(done: int, total: int) -> None:
+                    frac = (done / total) if total > 0 else 0.0
+                    units = start_units + int(frac * 3)
+                    gb_done = done / 1_073_741_824
+                    gb_total = total / 1_073_741_824
+                    pct = int(frac * 100)
+                    _set_progress(
+                        "Preparando warp  disp/E,N,Z\n"
+                        f"{gb_done:.2f} / {gb_total:.2f} GB  ({pct}%)",
+                        min(units, total_units),
+                    )
+
+                adapter.prewarm_component_triplet("disp", progress_cb=_disp_cb, no_evict=True)
+                completed_units = total_units
+                _set_progress("Cache visual listo", completed_units)
+        except Exception:
+            try:
+                adapter.open_playback_handle()
+            except Exception:
+                pass
+        finally:
+            self._prewarming = False
+            busy.close()
+            self._update_status()
+
     # ── Startup pre-warm ──────────────────────────────────────────────────────
 
     def _prewarm_on_show(self):
-        """Pre-warm demand triplets (E/N/Z) once the window is fully painted.
-
-        Builds a prioritised candidate list (active demand first, then ``vel``
-        and ``disp`` for instant Warp), caps it to however many full triplets
-        fit simultaneously in the budget, and delegates to ``_prewarm_demands``.
+        """Pre-warm visual fields and warp displacement once the window is painted.
 
         Skipped when closing or when the active demand is GF (GF warms lazily
         on the first Play press).
@@ -384,25 +541,13 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         if demand == GF_DEMAND:
             return
 
-        adapter = self.session.adapter
-        one_series_bytes = adapter._estimated_series_bytes()
-        triplet_bytes    = 3 * one_series_bytes
+        self._prewarm_startup_visual_cache()
 
-        # If even one triplet doesn't fit the budget, skip (per-frame reads win).
-        if triplet_bytes == 0 or triplet_bytes > adapter.max_cache_bytes:
-            return
-
-        # Build candidate list: active demand first, always add vel + disp.
-        candidates: list = [demand]
-        for _d in ("vel", "disp"):
-            if _d not in candidates:
-                candidates.append(_d)
-
-        # How many full triplets fit simultaneously?
-        n_fits = max(1, adapter.max_cache_bytes // triplet_bytes)
-        candidates = candidates[:n_fits]
-
-        self._prewarm_demands(candidates)
+        try:
+            self.session.adapter.open_playback_handle()
+        except Exception:
+            pass
+        self.multi_view.on_session_updated("panel_apply")
 
     # ── Window close / cleanup ────────────────────────────────────────────────
 

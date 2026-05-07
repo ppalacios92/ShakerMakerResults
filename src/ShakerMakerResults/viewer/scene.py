@@ -124,8 +124,8 @@ class ViewerScene:
 
     # Scene build.
 
-    def build(self):
-        self._rebuild_point_cloud()
+    def build(self, *, lightweight: bool = False):
+        self._rebuild_point_cloud(lightweight=lightweight)
         self.plotter.set_background(self.session.current_background_color())
         self.point_actor = self._add_point_actor()
         self.plotter.add_axes()
@@ -666,13 +666,16 @@ class ViewerScene:
             return None
         return self.session.adapter.node_id_from_visible_index(point_id)
 
-    def _handle_point_pick(self, point_id, _pick_pos=None):
+    def _handle_point_pick(self, point_id, _pick_pos=None, additive: bool = False):
         if point_id < 0:
             return
         node_id = self._resolve_node_id(point_id)
         if node_id is None:
             return
-        self.session.select_node(node_id)
+        if additive:
+            self.session.toggle_node_in_multi_selection(node_id)
+        else:
+            self.session.select_node(node_id)
 
     def _handle_point_double_click(self, point_id, _pick_pos=None):
         if point_id < 0:
@@ -715,14 +718,21 @@ class ViewerScene:
         if render:
             self.plotter.render()
 
-    def _rebuild_point_cloud(self):
+    def _rebuild_point_cloud(self, *, lightweight: bool = False):
         # Update _visible_node_ids so that node-picking resolves correctly after
         # this rebuild.  current_warped_points() was refactored to skip this
         # O(N) Python list-comprehension on every animation frame, so we call
         # current_visible_points() explicitly here (rebuild is not a hot path).
         self.session.current_visible_points()
         points = self.session.current_warped_points()
-        if self._gf_pin_active():
+        if lightweight:
+            scalars = self.session.adapter.visible_scalars(
+                self.session.adapter.elevation_snapshot(),
+                show_internal=self.session.state.show_internal,
+                show_external=self.session.state.show_external,
+                show_qa=self.session.state.show_qa,
+            )
+        elif self._gf_pin_active():
             scalars = self._scalars_for_gf_pin()
         else:
             scalars = self.session.current_visible_scalars()

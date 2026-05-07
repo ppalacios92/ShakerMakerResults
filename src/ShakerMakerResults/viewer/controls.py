@@ -121,10 +121,9 @@ class AppearanceButton(QtWidgets.QToolButton):
 class TimeControls(QtWidgets.QWidget):
     """Bottom transport bar with stepping, slider and playback."""
 
-    def __init__(self, session, on_play_toggled=None, parent=None):
+    def __init__(self, session, parent=None):
         super().__init__(parent)
         self.session = session
-        self.on_play_toggled = on_play_toggled
         self.setObjectName("TimeControls")
         self._pending_value = session.state.time_index
         self._dispatch_timer = QtCore.QTimer(self)
@@ -217,9 +216,6 @@ class TimeControls(QtWidgets.QWidget):
 
     def _toggle_play(self):
         self.session.toggle_playing()
-        self._sync_play_button()
-        if self.on_play_toggled is not None:
-            self.on_play_toggled(self.session.state.is_playing)
 
     def _sync_play_button(self):
         if self.session.state.is_playing:

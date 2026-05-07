@@ -152,8 +152,8 @@ class SpectrumPanel(QtWidgets.QWidget):
     def __init__(self, session, parent=None):
         super().__init__(parent)
         self.session = session
-        self._current_node = None
-        self._table_rows: list[tuple[float, float, float, float]] = []
+        self._current_nodes: tuple = tuple()
+        self._table_rows: list[tuple[object, float, float, float, float]] = []
         self._worker: _BgWorker | None = None  # background computation thread
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -183,7 +183,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         table_header_layout = QtWidgets.QHBoxLayout(table_header)
         table_header_layout.setContentsMargins(0, 0, 0, 0)
         table_header_layout.setSpacing(6)
-        table_label = QtWidgets.QLabel("T, Sa (Z), Sa (E), Sa (N)")
+        table_label = QtWidgets.QLabel("Node, T, Sa (Z), Sa (E), Sa (N)")
         table_label.setStyleSheet("color: #1e3558; font-weight: 600;")
         self.copy_table_button = QtWidgets.QPushButton("Copy")
         self.copy_table_button.setToolTip("Copy spectrum table to clipboard")
@@ -192,8 +192,8 @@ class SpectrumPanel(QtWidgets.QWidget):
         table_header_layout.addWidget(table_label, 1)
         table_header_layout.addWidget(self.copy_table_button, 0)
 
-        self.table = QtWidgets.QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["T", "Sa (Z)", "Sa (E)", "Sa (N)"])
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Node", "T", "Sa (Z)", "Sa (E)", "Sa (N)"])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -202,7 +202,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         self.table.setMaximumHeight(260)
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
-        for col in range(4):
+        for col in range(5):
             header.setSectionResizeMode(col, QtWidgets.QHeaderView.Stretch)
 
         table_layout.addWidget(table_header)
@@ -218,10 +218,10 @@ class SpectrumPanel(QtWidgets.QWidget):
         if reason == "time":
             return
 
-        node_id = self.session.state.selected_node
-        if node_id is None:
+        node_ids = tuple(self.session.selected_response_node_ids())
+        if not node_ids:
             self._cancel_worker()
-            self._current_node = None
+            self._current_nodes = tuple()
             for ax in self.axes:
                 ax.clear()
                 ax.grid(True, alpha=0.25)
@@ -231,27 +231,30 @@ class SpectrumPanel(QtWidgets.QWidget):
             self.canvas.draw_idle()
             return
 
-        if self._current_node == node_id and reason not in {"selection", "full", "init"}:
+        if self._current_nodes == node_ids and reason not in {"selection", "full", "init"}:
             return
 
-        self._current_node = node_id
+        self._current_nodes = node_ids
         self._cancel_worker()
 
         # Show a placeholder immediately so the panel doesn't look frozen.
         for ax in self.axes:
             ax.clear()
             ax.grid(True, alpha=0.25)
+        node_id = self._nodes_title(node_ids)
         self.axes[-1].set_xlabel("Period [s]")
-        self.title_label.setText(f"Node {node_id} | Computing spectrum…")
+        self.title_label.setText(f"{self._nodes_title(node_ids)} | Computing spectrum...")
         self.copy_table_button.setEnabled(False)
         self._set_table_rows([])
         self.canvas.draw_idle()
 
-        # Capture node_id so the lambda always calls adapter.spectrum for THIS node,
-        # not whatever selected_node happens to be when the thread finally runs.
-        _node_id = node_id
-        fn = lambda: self.session.adapter.spectrum(_node_id)  # noqa: E731
-        worker = _BgWorker(_node_id, fn, parent=self)
+        _node_ids = node_ids
+        def _compute():
+            return {
+                node_id: self.session.adapter.spectrum(node_id)
+                for node_id in _node_ids
+            }
+        worker = _BgWorker(_node_ids, _compute, parent=self)
         worker.finished.connect(self._on_spectrum_ready)
         self._worker = worker
         worker.start()
@@ -265,9 +268,19 @@ class SpectrumPanel(QtWidgets.QWidget):
                 pass
             self._worker = None
 
-    def _on_spectrum_ready(self, node_id, result):
+    def _on_spectrum_ready(self, node_ids, result):
         """Slot called on the main thread when the background worker finishes."""
         self._worker = None
+        node_ids = tuple(node_ids)
+        if node_ids != self._current_nodes:
+            return
+        node_id = self._nodes_title(node_ids)
+        self._current_node = node_id
+        node_ids = tuple(node_ids)
+        if node_ids != self._current_nodes:
+            return
+        node_id = self._nodes_title(node_ids)
+        self._current_node = node_id
         if node_id != self._current_node:
             return  # Node changed while computing — discard stale result.
 
@@ -276,6 +289,48 @@ class SpectrumPanel(QtWidgets.QWidget):
             for ax in self.axes:
                 ax.grid(True, alpha=0.25)
             self._set_table_rows([])
+            self.canvas.draw_idle()
+            return
+
+        if isinstance(result, dict):
+            spectra = result
+            for ax in self.axes:
+                ax.clear()
+            self.title_label.setText(f"{self._nodes_title(node_ids)} | Newmark PSa")
+            node_styles = ("-", "--", ":", "-.")
+            table_rows = []
+            for ax, label in zip(self.axes, ("z", "e", "n")):
+                for idx, nid in enumerate(node_ids):
+                    spectrum = spectra.get(nid)
+                    if spectrum is None:
+                        continue
+                    ax.plot(
+                        spectrum["T"],
+                        spectrum[f"PSa_{label}"],
+                        linewidth=1.15,
+                        color=COMPONENT_COLORS[label],
+                        linestyle=node_styles[idx % len(node_styles)],
+                        alpha=0.9,
+                        label=f"Node {nid}",
+                    )
+                ax.set_ylabel(label.upper())
+                ax.grid(True, alpha=0.25)
+                ax.legend(loc="upper right")
+            for nid in node_ids:
+                spectrum = spectra.get(nid)
+                if spectrum is None:
+                    continue
+                table_rows.extend(
+                    (nid, t, sa_z, sa_e, sa_n)
+                    for t, sa_z, sa_e, sa_n in zip(
+                        spectrum["T"],
+                        spectrum["PSa_z"],
+                        spectrum["PSa_e"],
+                        spectrum["PSa_n"],
+                    )
+                )
+            self.axes[-1].set_xlabel("Period [s]")
+            self._set_table_rows(table_rows)
             self.canvas.draw_idle()
             return
 
@@ -307,24 +362,35 @@ class SpectrumPanel(QtWidgets.QWidget):
 
     def _set_table_rows(self, rows):
         self._table_rows = [
-            (float(t), float(sa_z), float(sa_e), float(sa_n))
-            for t, sa_z, sa_e, sa_n in rows
+            (node_id, float(t), float(sa_z), float(sa_e), float(sa_n))
+            for node_id, t, sa_z, sa_e, sa_n in rows
         ]
         self.table.setRowCount(len(self._table_rows))
         for row_idx, row in enumerate(self._table_rows):
             for col_idx, value in enumerate(row):
-                item = QtWidgets.QTableWidgetItem(f"{value:.8g}")
-                item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                text = str(value) if col_idx == 0 else f"{value:.8g}"
+                item = QtWidgets.QTableWidgetItem(text)
+                align = QtCore.Qt.AlignCenter if col_idx == 0 else QtCore.Qt.AlignRight
+                item.setTextAlignment(align | QtCore.Qt.AlignVCenter)
                 self.table.setItem(row_idx, col_idx, item)
         self.copy_table_button.setEnabled(bool(self._table_rows))
 
     def _copy_table_to_clipboard(self):
-        lines = ["T\tSa (Z)\tSa (E)\tSa (N)"]
+        lines = ["Node\tT\tSa (Z)\tSa (E)\tSa (N)"]
         lines.extend(
-            f"{t:.10g}\t{sa_z:.10g}\t{sa_e:.10g}\t{sa_n:.10g}"
-            for t, sa_z, sa_e, sa_n in self._table_rows
+            f"{node_id}\t{t:.10g}\t{sa_z:.10g}\t{sa_e:.10g}\t{sa_n:.10g}"
+            for node_id, t, sa_z, sa_e, sa_n in self._table_rows
         )
         QtWidgets.QApplication.clipboard().setText("\n".join(lines))
+
+    @staticmethod
+    def _nodes_title(node_ids) -> str:
+        node_ids = tuple(node_ids)
+        if len(node_ids) == 1:
+            return f"Node {node_ids[0]}"
+        shown = ", ".join(str(nid) for nid in node_ids[:4])
+        suffix = "" if len(node_ids) <= 4 else f" +{len(node_ids) - 4}"
+        return f"Nodes {shown}{suffix}"
 
 
 class AriasIntensityPanel(QtWidgets.QWidget):
@@ -333,8 +399,8 @@ class AriasIntensityPanel(QtWidgets.QWidget):
     def __init__(self, session, parent=None):
         super().__init__(parent)
         self.session = session
-        self._current_node = None
-        self._metric_rows: list[tuple[str, float, float, float, float, float]] = []
+        self._current_nodes: tuple = tuple()
+        self._metric_rows: list[tuple[object, str, float, float, float, float, float]] = []
         self._worker: _BgWorker | None = None  # background computation thread
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -360,9 +426,9 @@ class AriasIntensityPanel(QtWidgets.QWidget):
         metrics_layout.setContentsMargins(6, 8, 6, 6)
         metrics_layout.setSpacing(6)
 
-        self.metrics_table = QtWidgets.QTableWidget(0, 6)
+        self.metrics_table = QtWidgets.QTableWidget(0, 7)
         self.metrics_table.setHorizontalHeaderLabels(
-            ["Comp.", "Ia total", "t5", "t95", "D5-95", "pot_dest"]
+            ["Node", "Comp.", "Ia total", "t5", "t95", "D5-95", "pot_dest"]
         )
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.setAlternatingRowColors(True)
@@ -372,7 +438,7 @@ class AriasIntensityPanel(QtWidgets.QWidget):
         self.metrics_table.setMaximumHeight(138)
         metrics_header = self.metrics_table.horizontalHeader()
         metrics_header.setStretchLastSection(False)
-        for col in range(6):
+        for col in range(7):
             metrics_header.setSectionResizeMode(col, QtWidgets.QHeaderView.Stretch)
         metrics_layout.addWidget(self.metrics_table)
 
@@ -386,10 +452,10 @@ class AriasIntensityPanel(QtWidgets.QWidget):
         if reason == "time":
             return
 
-        node_id = self.session.state.selected_node
-        if node_id is None:
+        node_ids = tuple(self.session.selected_response_node_ids())
+        if not node_ids:
             self._cancel_worker()
-            self._current_node = None
+            self._current_nodes = tuple()
             for ax in self.axes:
                 ax.clear()
                 ax.grid(True, alpha=0.25)
@@ -399,25 +465,29 @@ class AriasIntensityPanel(QtWidgets.QWidget):
             self.canvas.draw_idle()
             return
 
-        if self._current_node == node_id and reason not in {"selection", "full", "init"}:
+        if self._current_nodes == node_ids and reason not in {"selection", "full", "init"}:
             return
 
-        self._current_node = node_id
+        self._current_nodes = node_ids
         self._cancel_worker()
 
         # Show a placeholder immediately so the panel doesn't look frozen.
         for ax in self.axes:
             ax.clear()
             ax.grid(True, alpha=0.25)
+        node_id = self._nodes_title(node_ids)
         self.axes[-1].set_xlabel("Time [s]")
-        self.title_label.setText(f"Node {node_id} | Computing Arias…")
+        self.title_label.setText(f"{self._nodes_title(node_ids)} | Computing Arias...")
         self._set_metric_rows([])
         self.canvas.draw_idle()
 
-        # Capture node_id so the lambda always calls adapter.arias for THIS node.
-        _node_id = node_id
-        fn = lambda: self.session.adapter.arias(_node_id)  # noqa: E731
-        worker = _BgWorker(_node_id, fn, parent=self)
+        _node_ids = node_ids
+        def _compute():
+            return {
+                nid: self.session.adapter.arias(nid)
+                for nid in _node_ids
+            }
+        worker = _BgWorker(_node_ids, _compute, parent=self)
         worker.finished.connect(self._on_arias_ready)
         self._worker = worker
         worker.start()
@@ -431,9 +501,14 @@ class AriasIntensityPanel(QtWidgets.QWidget):
                 pass
             self._worker = None
 
-    def _on_arias_ready(self, node_id, result):
+    def _on_arias_ready(self, node_ids, result):
         """Slot called on the main thread when the background worker finishes."""
         self._worker = None
+        node_ids = tuple(node_ids)
+        if node_ids != self._current_nodes:
+            return
+        node_id = self._nodes_title(node_ids)
+        self._current_node = node_id
         if node_id != self._current_node:
             return  # Node changed while computing — discard stale result.
 
@@ -442,6 +517,60 @@ class AriasIntensityPanel(QtWidgets.QWidget):
             for ax in self.axes:
                 ax.grid(True, alpha=0.25)
             self._set_metric_rows([])
+            self.canvas.draw_idle()
+            return
+
+        if isinstance(result, dict):
+            arias_by_node = result
+            for ax in self.axes:
+                ax.clear()
+            self.title_label.setText(f"{self._nodes_title(node_ids)} | Arias Intensity")
+            node_styles = ("-", "--", ":", "-.")
+            metric_rows = []
+            for ax, label in zip(self.axes, ("z", "e", "n")):
+                for idx, nid in enumerate(node_ids):
+                    arias = arias_by_node.get(nid)
+                    if arias is None:
+                        continue
+                    item = arias["components"][label]
+                    ax.plot(
+                        arias["time"],
+                        item["IA_pct"],
+                        linewidth=1.15,
+                        color=COMPONENT_COLORS[label],
+                        linestyle=node_styles[idx % len(node_styles)],
+                        alpha=0.9,
+                        label=f"Node {nid}",
+                    )
+                    ax.axvline(item["t_start"], color=COMPONENT_COLORS[label], linestyle="--", linewidth=1, alpha=0.25)
+                    ax.axvline(item["t_end"], color=COMPONENT_COLORS[label], linestyle="--", linewidth=1, alpha=0.25)
+                ax.axhline(5, color="gray", linestyle=":", linewidth=1, alpha=0.6)
+                ax.axhline(95, color="gray", linestyle=":", linewidth=1, alpha=0.6)
+                ax.set_ylabel(label.upper())
+                ax.set_ylim(0, 100)
+                ax.grid(True, alpha=0.25)
+                ax.legend(loc="upper left")
+            for nid in node_ids:
+                arias = arias_by_node.get(nid)
+                if arias is None:
+                    continue
+                for label in ("z", "e", "n"):
+                    item = arias["components"][label]
+                    t5 = float(item["t_start"])
+                    t95 = float(item["t_end"])
+                    metric_rows.append(
+                        (
+                            nid,
+                            label.upper(),
+                            float(item["ia_total"]),
+                            t5,
+                            t95,
+                            t95 - t5,
+                            float(item.get("extra", 0.0)),
+                        )
+                    )
+            self.axes[-1].set_xlabel("Time [s]")
+            self._set_metric_rows(metric_rows)
             self.canvas.draw_idle()
             return
 
@@ -488,8 +617,9 @@ class AriasIntensityPanel(QtWidgets.QWidget):
         self._metric_rows = list(rows)
         self.metrics_table.setRowCount(len(self._metric_rows))
         for row_idx, row in enumerate(self._metric_rows):
-            comp, ia_total, t5, t95, duration, pot_dest = row
+            node_id, comp, ia_total, t5, t95, duration, pot_dest = row
             values = (
+                node_id,
                 comp,
                 f"{ia_total:.8g}",
                 f"{t5:.8g}",
@@ -499,9 +629,18 @@ class AriasIntensityPanel(QtWidgets.QWidget):
             )
             for col_idx, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(str(value))
-                align = QtCore.Qt.AlignCenter if col_idx == 0 else QtCore.Qt.AlignRight
+                align = QtCore.Qt.AlignCenter if col_idx in (0, 1) else QtCore.Qt.AlignRight
                 item.setTextAlignment(align | QtCore.Qt.AlignVCenter)
                 self.metrics_table.setItem(row_idx, col_idx, item)
+
+    @staticmethod
+    def _nodes_title(node_ids) -> str:
+        node_ids = tuple(node_ids)
+        if len(node_ids) == 1:
+            return f"Node {node_ids[0]}"
+        shown = ", ".join(str(nid) for nid in node_ids[:4])
+        suffix = "" if len(node_ids) <= 4 else f" +{len(node_ids) - 4}"
+        return f"Nodes {shown}{suffix}"
 
 
 class CombinedTracePanel(QtWidgets.QWidget):
@@ -1134,7 +1273,7 @@ class ResponsesPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self.session = session
         self._layout_mode: str = "stacked"
-        self._current_node = None
+        self._current_nodes: tuple = tuple()
         self._bg = None
         self._time_cursors: list = []
         self._active_checks = dict(_DEFAULT_RESPONSE_CHECKS)
@@ -1258,31 +1397,38 @@ class ResponsesPanel(QtWidgets.QWidget):
         self._time_cursors = []
         self._bg = None
 
-        if self._current_node is None or not self._active_curve_keys():
+        if not self._current_nodes or not self._active_curve_keys():
             self.canvas.draw_idle()
             return
-        self._draw_curves(self._current_node)
+        self._draw_curves(self._current_nodes)
 
-    def _draw_curves(self, node_id):
+    def _draw_curves(self, node_ids):
         self.figure.clear()
         self._time_cursors = []
         self._bg = None
 
         active_keys = self._active_curve_keys()
         if not active_keys:
-            self.title_label.setText(f"Node {node_id} (no active curves)")
+            self.title_label.setText("No active curves")
             self.canvas.draw_idle()
             return
 
+        node_ids = tuple(node_ids)
         t = self.session.adapter.time
         current_t = self.session.current_time()
-        traces: dict[str, _np.ndarray | None] = {}
-        for demand, _component in active_keys:
-            if demand not in traces:
+        traces: dict[tuple[object, str], _np.ndarray | None] = {}
+        for node_id in node_ids:
+            for demand, _component in active_keys:
+                key = (node_id, demand)
+                if key in traces:
+                    continue
                 try:
-                    traces[demand] = self.session.adapter.trace(node_id, demand)
+                    traces[key] = self.session.adapter.trace(node_id, demand)
                 except Exception:
-                    traces[demand] = None
+                    traces[key] = None
+
+        node_styles = ("-", "--", ":", "-.")
+        node_alpha = 0.95 if len(node_ids) == 1 else 0.82
 
         n = len(active_keys)
         if self._layout_mode == "stacked":
@@ -1292,13 +1438,23 @@ class ResponsesPanel(QtWidgets.QWidget):
 
             for ax, (demand, component) in zip(axes, active_keys):
                 color, linestyle, label = self._CURVE_STYLES[(demand, component)]
-                data = traces.get(demand)
                 ax.set_ylabel(label, fontsize=8)
                 ax.grid(True, alpha=0.25)
                 ax.tick_params(labelsize=7)
-                if data is not None:
-                    row = _COMP_ROW[component]
-                    ax.plot(t, data[row], linewidth=1.0, color=color, linestyle=linestyle)
+                row = _COMP_ROW[component]
+                for idx, node_id in enumerate(node_ids):
+                    data = traces.get((node_id, demand))
+                    if data is None:
+                        continue
+                    ax.plot(
+                        t,
+                        data[row],
+                        linewidth=1.0,
+                        color=color,
+                        linestyle=node_styles[idx % len(node_styles)] if len(node_ids) > 1 else linestyle,
+                        alpha=node_alpha,
+                        label=f"Node {node_id}",
+                    )
                 cursor = ax.axvline(
                     current_t, color="tab:red", alpha=0.35, linewidth=1.0, animated=True
                 )
@@ -1306,6 +1462,8 @@ class ResponsesPanel(QtWidgets.QWidget):
 
             if axes:
                 axes[-1].set_xlabel("Time [s]", fontsize=8)
+                if len(node_ids) > 1:
+                    axes[0].legend(loc="upper right", fontsize=8)
         else:
             self.canvas.setMinimumHeight(220)
             ax = self.figure.subplots(1, 1)
@@ -1316,19 +1474,21 @@ class ResponsesPanel(QtWidgets.QWidget):
             any_line = False
             for demand, component in active_keys:
                 color, linestyle, label = self._CURVE_STYLES[(demand, component)]
-                data = traces.get(demand)
-                if data is None:
-                    continue
                 row = _COMP_ROW[component]
-                ax.plot(
-                    t,
-                    data[row],
-                    linewidth=1.0,
-                    color=color,
-                    linestyle=linestyle,
-                    label=label,
-                )
-                any_line = True
+                for idx, node_id in enumerate(node_ids):
+                    data = traces.get((node_id, demand))
+                    if data is None:
+                        continue
+                    ax.plot(
+                        t,
+                        data[row],
+                        linewidth=1.0,
+                        color=color,
+                        linestyle=node_styles[idx % len(node_styles)] if len(node_ids) > 1 else linestyle,
+                        alpha=node_alpha,
+                        label=f"{label} | Node {node_id}",
+                    )
+                    any_line = True
 
             if any_line:
                 ax.legend(loc="upper right", fontsize=8)
@@ -1338,19 +1498,19 @@ class ResponsesPanel(QtWidgets.QWidget):
             )
             self._time_cursors.append(cursor)
 
-        self.title_label.setText(f"Node {node_id}")
-        self.canvas.draw()
+        if len(node_ids) == 1:
+            self.title_label.setText(f"Node {node_ids[0]}")
+        else:
+            shown = ", ".join(str(nid) for nid in node_ids[:4])
+            suffix = "" if len(node_ids) <= 4 else f" +{len(node_ids) - 4}"
+            self.title_label.setText(f"Nodes {shown}{suffix}")
+        self.canvas.draw_idle()
 
     def _on_draw(self, event):
         if not self._time_cursors:
             return
         try:
             self._bg = self.canvas.copy_from_bbox(self.figure.bbox)
-            t = self.session.current_time()
-            for ax, cur in zip(self.figure.axes, self._time_cursors):
-                cur.set_xdata([t, t])
-                ax.draw_artist(cur)
-            self.canvas.blit(self.figure.bbox)
         except Exception:
             self._bg = None
 
@@ -1370,7 +1530,7 @@ class ResponsesPanel(QtWidgets.QWidget):
 
     def refresh(self, reason: str = "full"):
         if reason == "time":
-            if self._current_node is not None and self._time_cursors:
+            if self._current_nodes and self._time_cursors:
                 t = self.session.current_time()
                 if not self._blit_cursors(t):
                     for cur in self._time_cursors:
@@ -1381,9 +1541,9 @@ class ResponsesPanel(QtWidgets.QWidget):
         if reason not in {"selection", "full", "init"}:
             return
 
-        node_id = self.session.state.selected_node
-        if node_id is None:
-            self._current_node = None
+        node_ids = self.session.selected_response_node_ids()
+        if not node_ids:
+            self._current_nodes = tuple()
             self._time_cursors = []
             self._bg = None
             self.figure.clear()
@@ -1391,8 +1551,8 @@ class ResponsesPanel(QtWidgets.QWidget):
             self.canvas.draw_idle()
             return
 
-        self._current_node = node_id
-        self._draw_curves(node_id)
+        self._current_nodes = tuple(node_ids)
+        self._draw_curves(self._current_nodes)
 
 
 # ── Green Function panel colours & display limits ─────────────────────────────

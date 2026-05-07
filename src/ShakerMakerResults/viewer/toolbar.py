@@ -448,11 +448,7 @@ class ViewerToolBar(QtWidgets.QWidget):
         widget = self._capture_widget()
         if widget is None:
             return None
-        try:
-            widget.repaint()
-            QtWidgets.QApplication.processEvents()
-        except Exception:
-            pass
+        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 1)
         try:
             window = widget.window().windowHandle()
             screen = window.screen() if window is not None else QtGui.QGuiApplication.primaryScreen()

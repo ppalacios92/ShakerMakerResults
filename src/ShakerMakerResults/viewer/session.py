@@ -75,6 +75,8 @@ class ViewerSession:
         self._qt_app = None
         self._owns_qt_app = False
         self._closing = False
+        self._warped_points_cache_key = None
+        self._warped_points_cache = None
         self._closed = False
         self._station_tags: list[dict[str, object]] = []
         self._show_station_tags = True
@@ -180,6 +182,7 @@ class ViewerSession:
 
     def set_time_index(self, time_index: int):
         self.state.set_time_index(time_index, max(len(self.adapter.time) - 1, 0))
+        self._invalidate_frame_cache()
         self._notify_window("time")
         return self.state.time_index
 
@@ -267,6 +270,57 @@ class ViewerSession:
         self._notify_window("multi_selection")
         return self.state.multi_selection
 
+    def add_node_to_multi_selection(self, node_id):
+        """Add one node to the comparison set without clearing existing nodes."""
+        selected = set(self.state.multi_selection)
+        active = self.state.selected_node
+        if active is not None:
+            selected.add(active)
+        selected.add(node_id)
+        self.state.multi_selection = frozenset(selected)
+        self.state.set_selected_node(node_id)
+        self.state.set_selection_visibility("all")
+        self._notify_window("selection")
+        self._notify_window("multi_selection")
+        return self.state.multi_selection
+
+    def toggle_node_in_multi_selection(self, node_id):
+        """Ctrl-click helper: add/remove one node from the comparison set."""
+        selected = set(self.state.multi_selection)
+        active = self.state.selected_node
+        if active is not None:
+            selected.add(active)
+
+        if node_id in selected and node_id != active:
+            selected.remove(node_id)
+        else:
+            selected.add(node_id)
+            self.state.set_selected_node(node_id)
+
+        if not selected:
+            self.state.set_selected_node(None)
+        elif self.state.selected_node not in selected:
+            self.state.set_selected_node(node_id)
+
+        self.state.multi_selection = frozenset(selected)
+        self.state.set_selection_visibility("all")
+        self._notify_window("selection")
+        self._notify_window("multi_selection")
+        return self.state.multi_selection
+
+    def selected_response_node_ids(self) -> tuple:
+        selected = set(self.state.multi_selection)
+        active = self.state.selected_node
+        if active is not None:
+            selected.add(active)
+        if not selected:
+            return tuple()
+        ordered = []
+        if active in selected:
+            ordered.append(active)
+        ordered.extend(sorted((node for node in selected if node != active), key=lambda x: str(x)))
+        return tuple(ordered)
+
     def has_multi_selection(self) -> bool:
         return bool(self.state.multi_selection)
 
@@ -323,6 +377,9 @@ class ViewerSession:
     def set_warp_enabled(self, enabled: bool):
         """Enable or disable 3-D displacement warp."""
         self.state.set_warp_enabled(enabled)
+        if enabled:
+            self._prepare_component_triplet("disp")
+        self._invalidate_frame_cache()
         self._notify_window("warp")
         return self.state.disp_warp_enabled
 
@@ -336,12 +393,14 @@ class ViewerSession:
         if z is not None:
             axes[2] = bool(z)
         self.state.set_warp_axes(tuple(axes))
+        self._invalidate_frame_cache()
         self._notify_window("warp")
         return self.state.warp_axes
 
     def set_warp_scale(self, scale: float | None):
         """Set the displacement exaggeration factor (None = auto)."""
         self.state.set_warp_scale(scale)
+        self._invalidate_frame_cache()
         self._notify_window("warp")
         return self.state.warp_scale
 
@@ -395,9 +454,18 @@ class ViewerSession:
         self._static_user_vmax = None if vmax is None else float(vmax)
         self._static_clamp_enabled = bool(clamp_enabled)
         self._wave_blend_enabled = bool(wave_blend_enabled)
-        self._wave_blend_strength = max(0.01, min(1.0, float(wave_blend_strength)))
+        self._wave_blend_strength = max(0.0, min(1.0, float(wave_blend_strength)))
         self._notify_window("static_color")
         return self._static_color_by, self._static_color_map
+
+    def apply_static_color_by(self, color_by: str) -> str:
+        self._static_color_by = self._validate_static_color_by(color_by)
+        self._static_color_map = self.state.colormap
+        self._notify_window("static_color")
+        return self._static_color_by
+
+    def current_color_by(self) -> str:
+        return self._static_color_by if self._static_color_by is not None else "field"
 
     # ── Wave-blend getters ────────────────────────────────────────────────────
 
@@ -593,8 +661,10 @@ class ViewerSession:
 
     def set_playing(self, is_playing: bool):
         had_static_color_override = bool(self._static_color_by)
-        # Wave-blend keeps the elevation active during playback — don't clear it.
-        if is_playing and not self._wave_blend_enabled:
+        elevation_base_active = self._static_color_by == "elevation_z"
+        # Elevation is the playback base: keep it alive and let current_scalars()
+        # blend the active wave onto it while the animation runs.
+        if is_playing and not self._wave_blend_enabled and not elevation_base_active:
             self._static_color_by = None
         if is_playing and not self.state.is_playing:
             if self.state.demand == GF_DEMAND:
@@ -613,6 +683,13 @@ class ViewerSession:
                 # triplet), open a persistent HDF5 handle so per-frame reads skip
                 # the ~1-5 ms file-open overhead on every animation tick.
                 demand = self.state.demand
+                if self.window is None:
+                    try:
+                        self.adapter.scalar_series(demand, self.state.component)
+                    except Exception:
+                        pass
+                    if self.state.disp_warp_enabled:
+                        self._prepare_component_triplet("disp")
                 if not any((demand, _c) in self.adapter._series_cache for _c in ("e", "n", "z")):
                     self.adapter.open_playback_handle()
 
@@ -626,9 +703,10 @@ class ViewerSession:
 
         # Only force a scene rebuild for static-color → wave transition when
         # blend mode is OFF (blend mode keeps elevation alive during playback).
-        if had_static_color_override and is_playing and not self._wave_blend_enabled:
+        if had_static_color_override and is_playing and not self._wave_blend_enabled and not elevation_base_active:
             self._notify_window("static_color")
         self.state.set_playing(is_playing)
+        self._invalidate_frame_cache()
         self._notify_window("playback")
         return self.state.is_playing
 
@@ -648,10 +726,18 @@ class ViewerSession:
 
     def current_scalars(self):
         if self._static_color_by == "elevation_z":
-            # Wave-blend: during playback, modulate elevation with the wave field
-            if self._wave_blend_enabled and self.state.is_playing:
+            if self.state.is_playing:
                 return self._elevation_wave_blend()
             return self.adapter.elevation_snapshot()
+        gf_subfault = self._display_gf_subfault if self.state.demand == GF_DEMAND else 0
+        return self.adapter.scalar_snapshot(
+            self.state.time_index,
+            self.state.demand,
+            self.state.component,
+            subfault_id=gf_subfault,
+        )
+
+    def current_wave_scalars(self):
         gf_subfault = self._display_gf_subfault if self.state.demand == GF_DEMAND else 0
         return self.adapter.scalar_snapshot(
             self.state.time_index,
@@ -737,23 +823,43 @@ class ViewerSession:
         base = self.adapter._display_points[mask]
 
         if not self.state.disp_warp_enabled:
+            key = ("base", self.state.show_internal, self.state.show_external, self.state.show_qa)
+            if self._warped_points_cache_key == key and self._warped_points_cache is not None:
+                return self._warped_points_cache
+            self._warped_points_cache_key = key
+            self._warped_points_cache = base
             return base
 
         scale = self.state.warp_scale
         if scale is None:
             scale = self.adapter.suggested_warp_scale()
         scale = float(scale)
+        key = (
+            "warp",
+            self.state.time_index,
+            scale,
+            tuple(self.state.warp_axes),
+            self.state.show_internal,
+            self.state.show_external,
+            self.state.show_qa,
+        )
+        if self._warped_points_cache_key == key and self._warped_points_cache is not None:
+            return self._warped_points_cache
 
         t = self.state.time_index
         disp_all = self.adapter.displacement_snapshot(t)   # (N_display, 3)
+        disp_all = self.adapter.display_points_from_model_xyz_m(disp_all)
         disp_visible = disp_all[mask]                      # (N_visible, 3) [E, N, Z]
 
         axes = self.state.warp_axes                        # (x_enable, y_enable, z_enable)
         axis_mask = _np.array([float(axes[0]), float(axes[1]), float(axes[2])])
         try:
-            return base + scale * disp_visible * axis_mask[_np.newaxis, :]
+            warped = base + scale * disp_visible * axis_mask[_np.newaxis, :]
         except Exception:
-            return base
+            warped = base
+        self._warped_points_cache_key = key
+        self._warped_points_cache = warped
+        return warped
 
     def current_visible_scalars(self):
         return self.adapter.visible_scalars(
@@ -954,3 +1060,23 @@ class ViewerSession:
                 f"Use one of {', '.join(VALID_STATIC_COLOR_BY)}."
             )
         return color_by
+
+    def _invalidate_frame_cache(self) -> None:
+        self._warped_points_cache_key = None
+        self._warped_points_cache = None
+
+    def _prepare_component_triplet(self, demand: str) -> None:
+        try:
+            keys = tuple((demand, comp) for comp in ("e", "n", "z"))
+            if all(key in self.adapter._series_cache for key in keys):
+                return
+            one = self.adapter._estimated_series_bytes_for_demand(demand)
+            if one > 0 and one * 3 <= self.adapter.max_cache_bytes:
+                self.adapter.prewarm_component_triplet(demand)
+            if not all(key in self.adapter._series_cache for key in keys):
+                self.adapter.open_playback_handle()
+        except Exception:
+            try:
+                self.adapter.open_playback_handle()
+            except Exception:
+                pass
