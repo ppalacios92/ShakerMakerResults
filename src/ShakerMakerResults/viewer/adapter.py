@@ -997,10 +997,17 @@ class ViewerDataAdapter:
         data_handle = handle[self._data_path_for_demand(demand)]
         source_col  = self._source_column_index(time_index, data_handle.shape[1])
 
+        # One contiguous HDF5 read → NumPy strided slice.
+        # Reading the full column (all_data) and slicing in NumPy is
+        # dramatically faster than a strided HDF5 read (data_handle[row::3, col])
+        # because HDF5 can serve the contiguous column in a single pass without
+        # the overhead of a strided hyperslab selection across many chunks.
+        # This mirrors the approach proven for the resultant path and extends it
+        # to individual E / N / Z components — critical for per-frame warp reads
+        # (displacement_snapshot calls this 3× per frame when disp isn't cached).
+        all_data = np.asarray(data_handle[:, source_col], dtype=np.float32)
+
         if component == "resultant":
-            # One contiguous HDF5 read → NumPy strided slice (3× faster than
-            # three separate strided reads against HDF5 chunks).
-            all_data = np.asarray(data_handle[:, source_col], dtype=np.float32)
             e = all_data[0::3]
             n = all_data[1::3]
             z = all_data[2::3]
@@ -1008,7 +1015,7 @@ class ViewerDataAdapter:
             qa_scalar = self._read_qa_resultant_snapshot(handle, demand, source_col)
         else:
             row       = {"e": 0, "n": 1, "z": 2}[component]
-            values    = np.asarray(data_handle[row::3, source_col], dtype=np.float32)
+            values    = all_data[row::3]
             qa_scalar = self._read_qa_component_snapshot(handle, demand, component, source_col)
 
         if qa_scalar is not None:

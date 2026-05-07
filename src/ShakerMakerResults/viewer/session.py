@@ -474,6 +474,17 @@ class ViewerSession:
         self.state.set_warp_axes(tuple(bool(v) for v in warp_axes))
         self.state.set_warp_scale(warp_scale)
 
+        # Keep an open HDF5 handle while warp is active so every animation
+        # frame's displacement_snapshot (3 × scalar_snapshot) uses the
+        # persistent handle instead of reopening the file per call.
+        if warp_enabled and not was_warp_enabled:
+            # Warp just enabled — open handle if disp series not in cache.
+            if not any(("disp", _c) in self.adapter._series_cache for _c in ("e", "n", "z")):
+                self.adapter.open_playback_handle()
+        elif not warp_enabled and not self.state.is_playing:
+            # Warp disabled and not playing — nobody needs the handle.
+            self.adapter.close_playback_handle()
+
         self._notify_window("warp")
         return self.state.disp_warp_enabled, self.state.warp_axes, self.state.warp_scale
 
@@ -606,8 +617,12 @@ class ViewerSession:
                     self.adapter.open_playback_handle()
 
         elif not is_playing and self.state.is_playing:
-            # Stopping: release the persistent handle (no-op if never opened).
-            self.adapter.close_playback_handle()
+            # Stopping: release the persistent handle only when warp is also
+            # off.  When warp is active the handle must stay open so each
+            # animation frame's displacement_snapshot uses the fast path
+            # instead of reopening the HDF5 file per call.
+            if not self.state.disp_warp_enabled:
+                self.adapter.close_playback_handle()
 
         # Only force a scene rebuild for static-color → wave transition when
         # blend mode is OFF (blend mode keeps elevation alive during playback).
