@@ -207,26 +207,23 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Startup pre-warm ──────────────────────────────────────────────────────
 
     def _prewarm_on_show(self):
-        """Pre-warm the active scalar series once the window is on screen.
+        """Pre-warm demand triplets (E/N/Z) once the window is fully painted.
 
-        Runs synchronously on the main thread (one HDF5 read).  The status bar
-        shows "Ladruno warming data…" for the duration so the user knows why
-        the UI is briefly unresponsive for large datasets.
+        Strategy
+        --------
+        1. Build a load order: active demand first, then ``vel``, then ``disp``
+           (deduped).  ``disp`` is always included so Warp is instant.
+        2. A full E/N/Z triplet (3 × series_bytes) must fit in the cache budget
+           simultaneously.  If it does not, per-frame HDF5 reads handle the
+           animation instead (fast on SSD with the persistent handle).
+        3. Determine how many triplets fit (``n_fits``); only load the first
+           ``n_fits`` demands so we never evict a just-loaded triplet while
+           loading the next one.
+        4. Show a BusyDialog with real-time GB/s and ETA so the user always
+           knows what is happening.
 
-        Skipped when:
-        - The window is already closing.
-        - The active demand is GF (GF warms lazily / on Play press).
-        - The full series would exceed the cache budget (large models fall back
-          to per-frame single-column HDF5 reads, which is already fast).
-        - The series is already cached (viewer was re-shown after a close).
-
-        Load strategy:
-        1. Always try to warm the active demand/component first (primary).
-        2. Optionally warm disp for instant Warp — but only when the combined
-           total of primary + disp fits within the cache budget.  This prevents
-           silent MemoryError on machines where one series fits but six do not.
-        3. When the session was opened with field=, skip the disp bonus entirely
-           so only the requested field is loaded.
+        Skipped when closing or when the active demand is GF (GF warms lazily
+        on the first Play press).
         """
         if self._closing:
             return
@@ -235,60 +232,85 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
 
         demand = self.session.state.demand
         if demand == GF_DEMAND:
-            return  # GF warmed lazily on first Play press
+            return
 
-        one_series_bytes = self.session.adapter._estimated_series_bytes()
+        adapter = self.session.adapter
+        one_series_bytes = adapter._estimated_series_bytes()
+        triplet_bytes    = 3 * one_series_bytes
 
-        # ── Build primary load list (active demand + component) ───────────────
-        comp = self.session.state.component
-        if comp == "resultant":
-            primary: list[tuple[str, str]] = [(demand, "e"), (demand, "n"), (demand, "z")]
-        else:
-            primary = [(demand, comp)]
+        # If even one triplet doesn't fit the budget, skip (per-frame reads win).
+        if triplet_bytes == 0 or triplet_bytes > adapter.max_cache_bytes:
+            return
 
-        # Skip already-cached entries so restarts are instant.
-        primary = [
-            (d, c) for (d, c) in primary
-            if (d, c) not in self.session.adapter._series_cache
+        # Build candidate list: active demand first, always add vel + disp.
+        candidates: list[str] = [demand]
+        for _d in ("vel", "disp"):
+            if _d not in candidates:
+                candidates.append(_d)
+
+        # How many full triplets fit simultaneously?
+        n_fits = max(1, adapter.max_cache_bytes // triplet_bytes)
+        candidates = candidates[:n_fits]
+
+        # Skip already fully-cached demands.
+        to_load = [
+            d for d in candidates
+            if any((d, c) not in adapter._series_cache for c in ("e", "n", "z"))
         ]
+        if not to_load:
+            return
 
-        primary_bytes = len(primary) * one_series_bytes
-        if primary_bytes > self.session.adapter.max_cache_bytes:
-            return  # Even the primary series doesn't fit — per-frame reads are the correct path
-
-        # ── Optionally add disp for instant Warp ─────────────────────────────
-        # Only include disp when the COMBINED total (primary + disp) fits within
-        # the cache budget.  A per-series check (old behaviour) passed even when
-        # loading all six series would exceed available RAM.
-        # Skipped entirely when the session was opened with field= so the user
-        # gets only what they asked for and nothing extra is loaded.
-        series_to_load: list[tuple[str, str]] = list(primary)
-        if demand != "disp" and not self.session._field_only:
-            disp_candidates = [
-                (d, c) for (d, c) in [("disp", "e"), ("disp", "n"), ("disp", "z")]
-                if (d, c) not in self.session.adapter._series_cache
-            ]
-            disp_bytes = len(disp_candidates) * one_series_bytes
-            combined_bytes = primary_bytes + disp_bytes
-            if combined_bytes <= self.session.adapter.max_cache_bytes:
-                series_to_load += disp_candidates
-
-        if not series_to_load:
-            return  # Everything already cached
-
-        # ── Show the unified busy dialog ──────────────────────────────────────
-        busy = BusyDialog("Loading simulation data...", self, total_steps=len(series_to_load))
+        total_bytes = len(to_load) * triplet_bytes
+        busy = BusyDialog(
+            "Cargando datos de simulación...",
+            self,
+            total_steps=1000,   # 0-1000 scale → smooth progress bar
+        )
         busy.show()
         QtWidgets.QApplication.processEvents()
 
-        try:
-            for i, (d, c) in enumerate(series_to_load):
-                busy.set_message(
-                    f"Loading simulation data...\n"
-                    f"Series {i + 1} / {len(series_to_load)}  -  {d} · {c}"
+        bytes_before_demand = 0
+        _last_events = [time.monotonic()]
+
+        def _make_cb(label: str, demand_start_bytes: int, idx: int, count: int, t_start: float):
+            def _cb(done: int, total: int) -> None:
+                global_done = demand_start_bytes + done
+                elapsed     = time.monotonic() - t_start
+                rate        = done / elapsed if elapsed > 0.1 else 0.0
+                remaining   = (total - done) / rate if rate > 0 else 0.0
+
+                gb_done  = done  / 1_073_741_824
+                gb_total = total / 1_073_741_824
+                pct      = done * 100 // total if total > 0 else 0
+
+                speed_str = (
+                    f"{rate / 1_048_576:.0f} MB/s  —  ETA {int(remaining)}s"
+                    if rate > 0 else "midiendo velocidad..."
                 )
-                self.session.adapter.scalar_series(d, c)
-                busy.set_step(i + 1)
+                busy.set_message(
+                    f"Cargando  {label}  [{idx + 1}/{count}]\n"
+                    f"{gb_done:.2f} / {gb_total:.2f} GB  ({pct}%)\n"
+                    f"{speed_str}"
+                )
+                global_pct = int(global_done * 1000 // total_bytes) if total_bytes > 0 else 0
+                busy.set_step(global_pct)
+
+                now = time.monotonic()
+                if now - _last_events[0] >= 0.10:
+                    QtWidgets.QApplication.processEvents()
+                    _last_events[0] = now
+            return _cb
+
+        try:
+            for i, d in enumerate(to_load):
+                t0 = time.monotonic()
+                cb = _make_cb(d, bytes_before_demand, i, len(to_load), t0)
+                adapter.prewarm_component_triplet(d, progress_cb=cb)
+                bytes_before_demand += triplet_bytes
+                busy.set_step(
+                    int(bytes_before_demand * 1000 // total_bytes)
+                    if total_bytes > 0 else 1000
+                )
                 QtWidgets.QApplication.processEvents()
         except Exception:
             pass

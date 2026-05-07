@@ -76,13 +76,26 @@ class ViewerDataAdapter:
         model,
         *,
         cache_time_series: bool = True,
-        max_cache_bytes: int = 4 * 1024 * 1024 * 1024,
-        max_cache_entries: int = 6,
+        max_cache_bytes: int | None = None,
+        max_cache_entries: int = 8,  # kept for API compat; byte-budget LRU is used instead
     ):
         self.model = model
         self.cache_time_series = bool(cache_time_series)
+
+        # Auto-detect cache budget: 50 % of available RAM, at least 1 GB.
+        # No hard upper cap — large-RAM workstations benefit from caching
+        # multiple full demand triplets simultaneously.
+        if max_cache_bytes is None:
+            try:
+                import psutil as _psutil
+                _available = int(_psutil.virtual_memory().available)
+            except Exception:
+                _available = 4 * 1024 * 1024 * 1024
+            max_cache_bytes = max(1 * 1024 * 1024 * 1024, int(_available * 0.5))
         self.max_cache_bytes = int(max_cache_bytes)
-        self.max_cache_entries = max(1, int(max_cache_entries))
+        # Running total of bytes currently held in _series_cache.
+        # Maintained by _cache_insert / _cache_touch / clear_runtime_caches.
+        self._total_cache_bytes: int = 0
         self._display_transform = DEFAULT_DISPLAY_TRANSFORM.copy()
 
         self._points = np.empty((0, 3), dtype=float)
@@ -259,6 +272,7 @@ class ViewerDataAdapter:
         """Release viewer-only cached arrays and derived analysis results."""
         self.close_playback_handle()
         self._series_cache.clear()
+        self._total_cache_bytes = 0
         self._series_cache_hits = 0
         self._spectrum_cache.clear()
         self._arias_cache.clear()
@@ -267,11 +281,11 @@ class ViewerDataAdapter:
 
     @property
     def cache_info(self) -> dict[str, int]:
-        """Return lightweight scalar-series cache statistics."""
-        total_bytes = sum(arr.nbytes for arr in self._series_cache.values())
+        """Return scalar-series cache statistics (regular + GF combined)."""
         return {
-            "entries": len(self._series_cache),
-            "bytes": int(total_bytes),
+            "entries": len(self._series_cache) + len(self._gf_series_cache),
+            "bytes": int(self._total_cache_bytes),
+            "budget": int(self.max_cache_bytes),
             "hits": int(self._series_cache_hits),
         }
 
@@ -493,35 +507,93 @@ class ViewerDataAdapter:
 
         if key in self._series_cache:
             self._series_cache_hits += 1
-            values = self._series_cache.pop(key)
-            self._series_cache[key] = values
-            return values
+            self._cache_touch(key)
+            return self._series_cache[key]
 
         # ── Resultant fast path: derive from already-cached E/N/Z ─────────────
         # When _prewarm_on_show (or a prior warm cycle) has already loaded the
         # three component series, resultant is free NumPy arithmetic — no HDF5
-        # I/O, no _read_resultant_series loop.  This eliminates the biggest
-        # single-threaded delay on first Play press.
+        # I/O.  This eliminates the biggest single-threaded delay on first Play.
         if component == "resultant":
             e_k, n_k, z_k = (demand, "e"), (demand, "n"), (demand, "z")
             if all(k in self._series_cache for k in (e_k, n_k, z_k)):
                 self._series_cache_hits += 1
-                e = self._series_cache[e_k]
-                n = self._series_cache[n_k]
-                z = self._series_cache[z_k]
-                values = np.sqrt(e ** 2 + n ** 2 + z ** 2).astype(np.float32, copy=False)
-                if self._can_cache(values):
-                    self._series_cache[key] = values
-                    while len(self._series_cache) > self.max_cache_entries:
-                        self._series_cache.popitem(last=False)
+                for _k in (e_k, n_k, z_k):
+                    self._cache_touch(_k)
+                values = self._resultant_from_cached_components(demand)
+                self._cache_insert(key, values)
                 return values
 
         values = self._build_scalar_series(demand, component)
-        if self._can_cache(values):
-            self._series_cache[key] = values
-            while len(self._series_cache) > self.max_cache_entries:
-                self._series_cache.popitem(last=False)
+        self._cache_insert(key, values)
         return values
+
+    def prewarm_component_triplet(
+        self, demand: str, *, progress_cb=None
+    ) -> tuple[tuple[str, str], ...]:
+        """Load E/N/Z full series for *demand* into cache with one HDF5 pass.
+
+        A full triplet (E + N + Z) must fit in the byte budget simultaneously
+        for the animation fast-path to work (resultant derived from cached trio).
+        If the triplet does not fit the budget the method returns an empty tuple
+        and lets per-frame single-column HDF5 reads handle animation instead.
+
+        Parameters
+        ----------
+        progress_cb:
+            Optional ``(bytes_done: int, bytes_total: int) -> None`` callable
+            invoked after each node-chunk is read.  Use it to update a progress
+            dialog.  Called from the main thread — do not block.
+        """
+        demand = self._validate_demand(demand)
+        if demand == GF_DEMAND:
+            return tuple()
+        keys = tuple((demand, comp) for comp in ("e", "n", "z"))
+        missing = [key for key in keys if key not in self._series_cache]
+        if not missing:
+            self._series_cache_hits += len(keys)
+            for key in keys:
+                self._cache_touch(key)
+            return keys
+        if not self.cache_time_series:
+            return tuple()
+
+        # Guard: the FULL triplet must fit in the budget at the same time.
+        # If even one component doesn't fit, the animation resultant fast-path
+        # (which requires all three) cannot work — skip caching entirely and
+        # let the persistent HDF5 handle deliver per-frame snapshots.
+        one_series = self._estimated_series_bytes_for_demand(demand)
+        if one_series * 3 > self.max_cache_bytes:
+            return tuple()
+
+        if self._supports_direct_series():
+            try:
+                import h5py
+                with h5py.File(self.model.filename, "r") as handle:
+                    data_handle = handle[self._data_path_for_demand(demand)]
+                    column_selector, n_cols = self._column_selector(data_handle.shape[1])
+                    series_by_component = self._read_component_triplet_series(
+                        data_handle, column_selector, n_cols, progress_cb=progress_cb
+                    )
+                    for comp, values in series_by_component.items():
+                        qa = self._read_qa_component_series(
+                            handle, demand, comp, column_selector
+                        )
+                        if qa is not None:
+                            values = np.vstack([values, qa[None, :]])
+                        self._cache_insert((demand, comp), values)
+                return keys
+            except Exception:
+                pass
+
+        loaded: list[tuple[str, str]] = []
+        for comp in ("e", "n", "z"):
+            try:
+                self.scalar_series(demand, comp)
+                loaded.append((demand, comp))
+            except Exception:
+                pass
+        return tuple(loaded)
 
     def trace(self, node_id: int | str, demand: str = "accel") -> np.ndarray:
         """Return the selected node trace as ``[z, e, n]``.
@@ -771,14 +843,12 @@ class ViewerDataAdapter:
         *,
         subfault_id: int = 0,
     ) -> tuple[float, float]:
-        """Return default color limits using ShakerMakerData._vmax when available."""
+        """Return cheap default color limits without scanning the full HDF5 file."""
         demand = self._validate_demand(demand)
         component = self._validate_component(component)
         if demand == GF_DEMAND:
             return self._gf_default_scalar_limits(component, int(subfault_id))
         try:
-            if getattr(self.model, "_vmax", None) is None and hasattr(self.model, "_compute_vmax"):
-                self.model._compute_vmax()
             vmax_by_type = getattr(self.model, "_vmax", None)
             if vmax_by_type is not None and demand in vmax_by_type and component in vmax_by_type[demand]:
                 vmax = float(vmax_by_type[demand][component])
@@ -788,7 +858,7 @@ class ViewerDataAdapter:
         except Exception:
             pass
 
-        snapshot = self.scalar_snapshot(0, demand, component)
+        snapshot = self.scalar_snapshot(len(self.model.time) // 2, demand, component)
         return scalar_limits(snapshot, component)
 
     def node_info(self, node_id: int | str) -> dict[str, object]:
@@ -1055,12 +1125,111 @@ class ViewerDataAdapter:
             cols = len(self.model.time)
         return rows * cols * np.dtype(np.float32).itemsize
 
-    def _can_cache(self, values: np.ndarray) -> bool:
-        return self.cache_time_series and values.nbytes <= self.max_cache_bytes
+    def _cache_insert(self, key: tuple[str, str], values: np.ndarray) -> bool:
+        """Insert *values* into the series cache using a global byte-budget LRU.
+
+        The total in-memory cost of all cached series is tracked in
+        ``_total_cache_bytes``.  LRU eviction (oldest entry first) runs until
+        the new entry fits within ``max_cache_bytes``.
+
+        Returns ``True`` when stored, ``False`` when the entry alone exceeds
+        the entire budget (will never fit regardless of evictions).
+        """
+        if not self.cache_time_series:
+            return False
+        incoming = int(np.asarray(values, dtype=np.float32).nbytes)
+        if incoming > self.max_cache_bytes:
+            return False   # Single series larger than the whole budget
+
+        # Re-insertion: remove old version to refresh LRU position.
+        if key in self._series_cache:
+            old = self._series_cache.pop(key)
+            self._total_cache_bytes -= int(old.nbytes)
+
+        # Evict globally least-recently-used entries until there is room.
+        while self._total_cache_bytes + incoming > self.max_cache_bytes:
+            if not self._series_cache:
+                return False
+            _, evicted = self._series_cache.popitem(last=False)
+            self._total_cache_bytes -= int(evicted.nbytes)
+
+        self._series_cache[key] = np.asarray(values, dtype=np.float32)
+        self._total_cache_bytes += incoming
+        return True
+
+    def _cache_touch(self, key: tuple[str, str]) -> None:
+        """Move *key* to the MRU (most-recently-used) end of the LRU queue."""
+        if key in self._series_cache:
+            val = self._series_cache.pop(key)
+            self._series_cache[key] = val
+
+    def _resultant_from_cached_components(self, demand: str) -> np.ndarray:
+        e = self._series_cache[(demand, "e")]
+        n = self._series_cache[(demand, "n")]
+        z = self._series_cache[(demand, "z")]
+        values = np.empty_like(e, dtype=np.float32)
+        chunk_rows = self._series_chunk_rows(e.shape[1], component_count=4)
+        for start in range(0, e.shape[0], chunk_rows):
+            stop = min(start + chunk_rows, e.shape[0])
+            out = values[start:stop, :]
+            np.square(e[start:stop, :], out=out)
+            out += n[start:stop, :] * n[start:stop, :]
+            out += z[start:stop, :] * z[start:stop, :]
+            np.sqrt(out, out=out)
+        return values
 
     def _read_component_series(self, data_handle, component: str, column_selector) -> np.ndarray:
         row = {"e": 0, "n": 1, "z": 2}[component]
-        return np.asarray(data_handle[row::3, column_selector], dtype=np.float32)
+        n_nodes = data_handle.shape[0] // 3
+        if isinstance(column_selector, slice):
+            start = int(column_selector.start or 0)
+            stop = int(column_selector.stop if column_selector.stop is not None else data_handle.shape[1])
+            n_cols = max(0, stop - start)
+        else:
+            n_cols = len(column_selector)
+        values = np.empty((n_nodes, n_cols), dtype=np.float32)
+        chunk_nodes = self._series_chunk_rows(n_cols, component_count=3)
+        for node_start in range(0, n_nodes, chunk_nodes):
+            node_stop = min(node_start + chunk_nodes, n_nodes)
+            row_start = node_start * 3
+            row_stop = node_stop * 3
+            raw = np.asarray(data_handle[row_start:row_stop, column_selector], dtype=np.float32)
+            values[node_start:node_stop, :] = raw[row::3, :]
+        return values
+
+    def _read_component_triplet_series(
+        self, data_handle, column_selector, n_cols: int, *, progress_cb=None
+    ) -> dict[str, np.ndarray]:
+        """Read E/N/Z for all nodes in node-row chunks with optional progress.
+
+        Reads contiguous row blocks ``data_handle[row_start:row_stop, cols]``
+        (HDF5-friendly rectangular access) then slices E/N/Z in NumPy.  This
+        avoids strided HDF5 reads which would be ~10× slower.
+
+        Each chunk reports ``(bytes_done, bytes_total)`` to *progress_cb* after
+        the HDF5 read so the calling dialog can update in real time.
+        """
+        n_nodes = data_handle.shape[0] // 3
+        values = {
+            "e": np.empty((n_nodes, n_cols), dtype=np.float32),
+            "n": np.empty((n_nodes, n_cols), dtype=np.float32),
+            "z": np.empty((n_nodes, n_cols), dtype=np.float32),
+        }
+        chunk_nodes = self._series_chunk_rows(n_cols, component_count=3)
+        total_bytes = n_nodes * n_cols * 4 * 3   # 3 components × float32
+        bytes_done = 0
+        for node_start in range(0, n_nodes, chunk_nodes):
+            node_stop = min(node_start + chunk_nodes, n_nodes)
+            row_start = node_start * 3
+            row_stop = node_stop * 3
+            raw = np.asarray(data_handle[row_start:row_stop, column_selector], dtype=np.float32)
+            values["e"][node_start:node_stop, :] = raw[0::3, :]
+            values["n"][node_start:node_stop, :] = raw[1::3, :]
+            values["z"][node_start:node_stop, :] = raw[2::3, :]
+            bytes_done += (node_stop - node_start) * n_cols * 4 * 3
+            if progress_cb is not None:
+                progress_cb(bytes_done, total_bytes)
+        return values
 
     def _read_qa_component_series(self, handle, demand: str, component: str, column_selector) -> np.ndarray | None:
         if not self.has_qa:
@@ -1080,32 +1249,17 @@ class ViewerDataAdapter:
     def _read_resultant_series(self, data_handle, column_selector, n_cols: int) -> np.ndarray:
         n_nodes = data_handle.shape[0] // 3
         values = np.empty((n_nodes, n_cols), dtype=np.float32)
-        chunk_cols = self._resultant_chunk_cols(n_nodes)
-
-        if isinstance(column_selector, slice):
-            start = int(column_selector.start or 0)
-            stop = int(column_selector.stop if column_selector.stop is not None else data_handle.shape[1])
-            local = 0
-            for chunk_start in range(start, stop, chunk_cols):
-                chunk_stop = min(chunk_start + chunk_cols, stop)
-                ex = np.asarray(data_handle[0::3, chunk_start:chunk_stop], dtype=np.float32)
-                ny = np.asarray(data_handle[1::3, chunk_start:chunk_stop], dtype=np.float32)
-                zz = np.asarray(data_handle[2::3, chunk_start:chunk_stop], dtype=np.float32)
-                width = chunk_stop - chunk_start
-                values[:, local:local + width] = np.sqrt(ex ** 2 + ny ** 2 + zz ** 2).astype(np.float32, copy=False)
-                local += width
-            return values
-
-        col_idx = np.asarray(column_selector, dtype=np.int64)
-        local = 0
-        for chunk_start in range(0, len(col_idx), chunk_cols):
-            chunk_cols_idx = col_idx[chunk_start:chunk_start + chunk_cols]
-            ex = np.asarray(data_handle[0::3, chunk_cols_idx], dtype=np.float32)
-            ny = np.asarray(data_handle[1::3, chunk_cols_idx], dtype=np.float32)
-            zz = np.asarray(data_handle[2::3, chunk_cols_idx], dtype=np.float32)
-            width = len(chunk_cols_idx)
-            values[:, local:local + width] = np.sqrt(ex ** 2 + ny ** 2 + zz ** 2).astype(np.float32, copy=False)
-            local += width
+        chunk_nodes = self._series_chunk_rows(n_cols, component_count=4)
+        for node_start in range(0, n_nodes, chunk_nodes):
+            node_stop = min(node_start + chunk_nodes, n_nodes)
+            row_start = node_start * 3
+            row_stop = node_stop * 3
+            raw = np.asarray(data_handle[row_start:row_stop, column_selector], dtype=np.float32)
+            out = values[node_start:node_stop, :]
+            np.square(raw[0::3, :], out=out)
+            out += raw[1::3, :] * raw[1::3, :]
+            out += raw[2::3, :] * raw[2::3, :]
+            np.sqrt(out, out=out)
         return values
 
     def _column_selector(self, total_cols: int):
@@ -1129,6 +1283,12 @@ class ViewerDataAdapter:
         target_bytes = 64 * 1024 * 1024
         bytes_per_col = max(n_nodes * np.dtype(np.float32).itemsize * 3, 1)
         return max(16, target_bytes // bytes_per_col)
+
+    @staticmethod
+    def _series_chunk_rows(n_cols: int, *, component_count: int) -> int:
+        target_bytes = 256 * 1024 * 1024
+        bytes_per_node = max(int(n_cols) * np.dtype(np.float32).itemsize * int(component_count), 1)
+        return max(1024, target_bytes // bytes_per_node)
 
     def _data_path_for_demand(self, demand: str) -> str:
         return {

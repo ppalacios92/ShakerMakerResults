@@ -24,8 +24,8 @@ class ViewerSession:
         selected_node=None,
         title: str | None = None,
         cache_time_series: bool = True,
-        max_cache_bytes: int = 4 * 1024 * 1024 * 1024,
-        max_cache_entries: int = 6,
+        max_cache_bytes: int | None = None,
+        max_cache_entries: int = 8,
     ) -> None:
         # ── field= shorthand ──────────────────────────────────────────────────
         # ``field='vel'`` is sugar for ``demand='vel', component='resultant'``
@@ -321,16 +321,10 @@ class ViewerSession:
         """Enable or disable 3-D displacement warp."""
         self.state.set_warp_enabled(enabled)
         if enabled:
-            # Pre-warm displacement series only when they fit in cache.
-            # For large models the series won't cache anyway, and running the
-            # slow O(T) series-build loop just delays the UI response.
-            fits = self.adapter._estimated_series_bytes() <= self.adapter.max_cache_bytes
-            if fits:
-                try:
-                    for _comp in ("e", "n", "z"):
-                        self.adapter.scalar_series("disp", _comp)
-                except Exception:
-                    pass
+            try:
+                self.adapter.prewarm_component_triplet("disp")
+            except Exception:
+                pass
         self._notify_window("warp")
         return self.state.disp_warp_enabled
 
@@ -383,22 +377,16 @@ class ViewerSession:
         # Pre-warm the requested series so the scene rebuild is pure NumPy
         # (no HDF5 I/O during the VTK render call that follows).
         if demand != GF_DEMAND:
-            fits = (
-                self.adapter._estimated_series_bytes_for_demand(demand)
-                <= self.adapter.max_cache_bytes
-            )
-            if fits:
-                if component == "resultant":
-                    for _c in ("e", "n", "z"):
-                        try:
-                            self.adapter.scalar_series(demand, _c)
-                        except Exception:
-                            pass
-                else:
-                    try:
-                        self.adapter.scalar_series(demand, component)
-                    except Exception:
-                        pass
+            if component == "resultant":
+                try:
+                    self.adapter.prewarm_component_triplet(demand)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.adapter.scalar_series(demand, component)
+                except Exception:
+                    pass
 
         # "panel_apply" triggers a full scalar-actor rebuild that picks up every
         # state change above in one render pass.
@@ -490,13 +478,10 @@ class ViewerSession:
         self.state.set_warp_scale(warp_scale)
 
         if warp_enabled and not was_warp_enabled:
-            fits = self.adapter._estimated_series_bytes() <= self.adapter.max_cache_bytes
-            if fits:
-                try:
-                    for _comp in ("e", "n", "z"):
-                        self.adapter.scalar_series("disp", _comp)
-                except Exception:
-                    pass
+            try:
+                self.adapter.prewarm_component_triplet("disp")
+            except Exception:
+                pass
 
         self._notify_window("warp")
         return self.state.disp_warp_enabled, self.state.warp_axes, self.state.warp_scale
@@ -524,11 +509,10 @@ class ViewerSession:
         self.state.vector_field_scale = max(0.01, float(scale))
         self.state.vector_field_colormap = str(colormap) or "viridis"
         if enabled:
-            for _comp in ("e", "n", "z"):
-                try:
-                    self.adapter.scalar_series(demand_lower, _comp)
-                except Exception:
-                    pass
+            try:
+                self.adapter.prewarm_component_triplet(demand_lower)
+            except Exception:
+                pass
         self._notify_window("vector_field")
 
     def current_vector_data(self):
@@ -598,13 +582,10 @@ class ViewerSession:
         self.state.set_warp_scale(warp_scale)
 
         if warp_enabled and not was_warp_enabled:
-            fits = self.adapter._estimated_series_bytes() <= self.adapter.max_cache_bytes
-            if fits:
-                try:
-                    for _comp in ("e", "n", "z"):
-                        self.adapter.scalar_series("disp", _comp)
-                except Exception:
-                    pass
+            try:
+                self.adapter.prewarm_component_triplet("disp")
+            except Exception:
+                pass
 
         self._notify_window("panel_apply")
         return {
@@ -640,23 +621,18 @@ class ViewerSession:
                 # each frame via a fast single-column HDF5 read.  Calling
                 # scalar_series() on an oversized dataset just runs the slow
                 # O(T) loop and then discards the result.
-                fits = (
-                    self.adapter._estimated_series_bytes_for_demand(self.state.demand)
-                    <= self.adapter.max_cache_bytes
-                )
-                if fits:
-                    demand = self.state.demand
+                demand = self.state.demand
+                if self.adapter.cache_time_series:
                     if self.state.component == "resultant":
                         # Warm E, N, Z individually.  scalar_snapshot derives
                         # resultant from the cached trio on every frame (free
                         # NumPy sqrt, no I/O).  scalar_series("resultant") would
                         # also work after Fix A in adapter, but this is more
                         # direct and avoids an unnecessary cache entry.
-                        for _c in ("e", "n", "z"):
-                            try:
-                                self.adapter.scalar_series(demand, _c)
-                            except Exception:
-                                pass
+                        try:
+                            self.adapter.prewarm_component_triplet(demand)
+                        except Exception:
+                            pass
                     else:
                         try:
                             self.adapter.scalar_series(demand, self.state.component)
@@ -665,11 +641,10 @@ class ViewerSession:
                     # Pre-warm displacement series when warp is active.
                     if self.state.disp_warp_enabled:
                         try:
-                            for _comp in ("e", "n", "z"):
-                                self.adapter.scalar_series("disp", _comp)
+                            self.adapter.prewarm_component_triplet("disp")
                         except Exception:
                             pass
-                else:
+                if not any((demand, _c) in self.adapter._series_cache for _c in ("e", "n", "z")):
                     # Series too large to cache — keep an HDF5 handle open for
                     # the duration of playback so _try_direct_component_snapshot
                     # avoids the ~1-5 ms file-open cost on every animation frame.
