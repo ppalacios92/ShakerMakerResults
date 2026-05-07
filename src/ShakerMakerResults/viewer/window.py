@@ -117,15 +117,27 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self.time_controls.sync_from_state()
 
         if reason == "playback":
-            # Prewarm BEFORE starting the play timer so the first frame is
-            # served from cache and animation is smooth from tick one.
+            # Prewarm the display demand BEFORE starting the play timer so the
+            # first frame is served from cache and animation is smooth.
+            #
+            # NOTE: displacement (disp) for warp is intentionally NOT included
+            # here.  For large models a single E/N/Z triplet already fills the
+            # cache budget, so adding "disp" would evict the display demand via
+            # LRU on the next load — causing infinite thrashing.  Instead,
+            # apply_warp_settings opens a persistent HDF5 handle that makes
+            # per-frame displacement reads just as fast as a cache hit.
             if self.session.state.is_playing:
                 from .adapter import GF_DEMAND
                 demand = self.session.state.demand
                 if demand != GF_DEMAND:
                     needs = [demand]
+                    # Only include disp alongside the display demand when the
+                    # cache budget can hold both triplets simultaneously
+                    # (budget ≥ 6 × one_series_bytes).
                     if self.session.state.disp_warp_enabled and demand != "disp":
-                        needs.append("disp")
+                        one = self.session.adapter._estimated_series_bytes()
+                        if 6 * one <= self.session.adapter.max_cache_bytes:
+                            needs.append("disp")
                     self._prewarm_demands(needs)
             self._sync_play_state()
             self.side_panel.refresh("playback")
@@ -137,22 +149,35 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                 demand = self.session.state.demand
                 if demand != GF_DEMAND:
                     needs = [demand]
+                    # Same "2-triplet coexistence" guard as above.
                     if self.session.state.disp_warp_enabled and demand != "disp":
-                        needs.append("disp")
+                        one = self.session.adapter._estimated_series_bytes()
+                        if 6 * one <= self.session.adapter.max_cache_bytes:
+                            needs.append("disp")
                     self._prewarm_demands(needs)
             elif reason == "warp" and self.session.state.disp_warp_enabled:
-                self._prewarm_demands(["disp"])
+                # Only prewarm disp when it can coexist with the display
+                # demand in the cache (budget ≥ 6 × one_series_bytes).
+                # When it doesn't fit, the persistent HDF5 handle opened in
+                # apply_warp_settings is used for fast per-frame reads instead.
+                from .adapter import GF_DEMAND
+                demand = self.session.state.demand
+                if demand != GF_DEMAND:
+                    one = self.session.adapter._estimated_series_bytes()
+                    if 6 * one <= self.session.adapter.max_cache_bytes:
+                        self._prewarm_demands([demand, "disp"])
             elif reason == "vector_field" and self.session.state.vector_field_enabled:
                 self._prewarm_demands([self.session.state.vector_field_demand])
             elif reason == "static_color" and self.session.current_wave_blend_enabled():
-                # Wave blend just activated — prewarm the wave demand so the
-                # first Play press is instant rather than showing a BusyDialog.
+                # Wave blend just activated — prewarm the wave demand.
                 from .adapter import GF_DEMAND
                 demand = self.session.state.demand
                 if demand != GF_DEMAND:
                     needs = [demand]
                     if self.session.state.disp_warp_enabled and demand != "disp":
-                        needs.append("disp")
+                        one = self.session.adapter._estimated_series_bytes()
+                        if 6 * one <= self.session.adapter.max_cache_bytes:
+                            needs.append("disp")
                     self._prewarm_demands(needs)
 
             self.multi_view.on_session_updated(reason)
