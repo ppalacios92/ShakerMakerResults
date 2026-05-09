@@ -535,6 +535,8 @@ class DisplaySection(_SectionBase):
     })
     _STATIC_COLOR_LABELS = {
         "elevation_z": "Elevation Z",
+        "newmark_sa": "Sa / Newmark",
+        "arias": "Arias",
     }
 
     def __init__(self, session, parent=None):
@@ -651,7 +653,7 @@ class DisplaySection(_SectionBase):
                 self._STATIC_COLOR_LABELS.get(color_by_value, color_by_value),
                 color_by_value,
             )
-        self.static_color_combo.currentIndexChanged.connect(lambda *_: self._set_static_color_dirty())
+        self.static_color_combo.currentIndexChanged.connect(self._on_static_color_source_changed)
 
         self.static_cmap_combo = QtWidgets.QComboBox()
         for cmap in COLORMAP_OPTIONS:
@@ -669,6 +671,38 @@ class DisplaySection(_SectionBase):
 
         self.static_reset_btn = QtWidgets.QPushButton("Reset to auto")
         self.static_reset_btn.clicked.connect(self._reset_static_range)
+
+        self.newmark_T_spin = QtWidgets.QDoubleSpinBox()
+        self.newmark_T_spin.setDecimals(3)
+        self.newmark_T_spin.setRange(0.0, 20.0)
+        self.newmark_T_spin.setSingleStep(0.05)
+        self.newmark_T_spin.setValue(0.0)
+        self.newmark_T_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
+
+        self.newmark_component_combo = QtWidgets.QComboBox()
+        for component in ("resultant", "z", "e", "n"):
+            self.newmark_component_combo.addItem(component, component)
+        self.newmark_component_combo.currentIndexChanged.connect(lambda *_: self._set_static_color_dirty())
+
+        self.newmark_data_combo = QtWidgets.QComboBox()
+        for demand in ("accel", "vel", "disp"):
+            self.newmark_data_combo.addItem(demand, demand)
+        self.newmark_data_combo.currentIndexChanged.connect(lambda *_: self._set_static_color_dirty())
+
+        self.newmark_spectral_combo = QtWidgets.QComboBox()
+        for spectral_type in ("PSa", "Sa", "PSv", "Sv", "Sd"):
+            self.newmark_spectral_combo.addItem(spectral_type, spectral_type)
+        self.newmark_spectral_combo.currentIndexChanged.connect(lambda *_: self._set_static_color_dirty())
+
+        self.newmark_factor_spin = self._value_spin()
+        self.newmark_factor_spin.setValue(1.0 / 9.81)
+        self.newmark_factor_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
+
+        self.newmark_jobs_spin = QtWidgets.QSpinBox()
+        self.newmark_jobs_spin.setRange(-32, 128)
+        self.newmark_jobs_spin.setValue(-2)
+        self.newmark_jobs_spin.setToolTip("-1 uses all CPUs; -2 uses all minus one.")
+        self.newmark_jobs_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
 
         # ── Wave blend controls ───────────────────────────────────────────
         self.wave_blend_cb = QtWidgets.QCheckBox("Blend wave propagation")
@@ -695,9 +729,7 @@ class DisplaySection(_SectionBase):
 
         self.static_apply_btn = QtWidgets.QPushButton("Apply")
         self.static_apply_btn.setEnabled(False)
-        self.static_apply_btn.clicked.connect(
-            lambda: self._run_heavy(self._apply_static_color, "Applying color by…")
-        )
+        self.static_apply_btn.clicked.connect(self._apply_static_color_with_busy)
 
         static_color_form.addRow("Source", self.static_color_combo)
         static_color_form.addRow("Color ramp", self.static_cmap_combo)
@@ -706,6 +738,12 @@ class DisplaySection(_SectionBase):
         static_color_form.addRow("User max", self.static_vmax_spin)
         static_color_form.addRow("", self.static_clamp_cb)
         static_color_form.addRow("", self.static_reset_btn)
+        static_color_form.addRow("T target", self.newmark_T_spin)
+        static_color_form.addRow("Component", self.newmark_component_combo)
+        static_color_form.addRow("Data", self.newmark_data_combo)
+        static_color_form.addRow("Sa type", self.newmark_spectral_combo)
+        static_color_form.addRow("Factor", self.newmark_factor_spin)
+        static_color_form.addRow("Jobs", self.newmark_jobs_spin)
         static_color_form.addRow("", self.wave_blend_cb)
         static_color_form.addRow("Blend strength", self.wave_blend_strength_spin)
         static_color_form.addRow("", self.static_apply_btn)
@@ -798,6 +836,13 @@ class DisplaySection(_SectionBase):
                 self.static_vmin_spin.setValue(float(static_vmin))
                 self.static_vmax_spin.setValue(float(static_vmax))
                 self.static_clamp_cb.setChecked(self.session.current_static_clamp_enabled())
+                newmark = self.session.current_newmark_static_settings()
+                self.newmark_T_spin.setValue(float(newmark["T_target"]))
+                self._set_combo_data(self.newmark_component_combo, newmark["component"])
+                self._set_combo_data(self.newmark_data_combo, newmark["data_type"])
+                self._set_combo_data(self.newmark_spectral_combo, newmark["spectral_type"])
+                self.newmark_factor_spin.setValue(float(newmark["factor"]))
+                self.newmark_jobs_spin.setValue(int(newmark["n_jobs"]))
                 # Wave blend controls
                 b = self.wave_blend_cb.blockSignals(True)
                 self.wave_blend_cb.setChecked(self.session.current_wave_blend_enabled())
@@ -814,6 +859,17 @@ class DisplaySection(_SectionBase):
             self.static_vmax_spin.setEnabled(allow_static)
             self.static_clamp_cb.setEnabled(allow_static)
             self.static_reset_btn.setEnabled(allow_static)
+            source = self.static_color_combo.currentData()
+            analysis_active = source in ("newmark_sa", "arias")
+            for widget in (
+                self.newmark_component_combo,
+                self.newmark_data_combo,
+                self.newmark_factor_spin,
+                self.newmark_jobs_spin,
+            ):
+                widget.setEnabled(allow_static and analysis_active)
+            self.newmark_T_spin.setEnabled(allow_static and source == "newmark_sa")
+            self.newmark_spectral_combo.setEnabled(allow_static and source == "newmark_sa")
             self.wave_blend_cb.setEnabled(allow_static)
             self.wave_blend_strength_spin.setEnabled(
                 allow_static and self.session.current_wave_blend_enabled()
@@ -832,6 +888,22 @@ class DisplaySection(_SectionBase):
     def _clear_static_color_dirty(self):
         self._static_color_dirty = False
         self.static_apply_btn.setEnabled(False)
+
+    def _on_static_color_source_changed(self, *_):
+        if self._syncing:
+            return
+        source = self.static_color_combo.currentData()
+        analysis_active = source in ("newmark_sa", "arias")
+        for widget in (
+            self.newmark_component_combo,
+            self.newmark_data_combo,
+            self.newmark_factor_spin,
+            self.newmark_jobs_spin,
+        ):
+            widget.setEnabled(analysis_active and not self.session.state.is_playing)
+        self.newmark_T_spin.setEnabled(source == "newmark_sa" and not self.session.state.is_playing)
+        self.newmark_spectral_combo.setEnabled(source == "newmark_sa" and not self.session.state.is_playing)
+        self._set_static_color_dirty(True)
 
     def _reset_static_range(self):
         lo, hi = self.session.current_static_auto_limits()
@@ -894,8 +966,30 @@ class DisplaySection(_SectionBase):
                 if self.wave_blend_cb.isChecked()
                 else 0.0
             ),
+            newmark_T_target=self.newmark_T_spin.value(),
+            newmark_component=str(self.newmark_component_combo.currentData()),
+            newmark_data_type=str(self.newmark_data_combo.currentData()),
+            newmark_spectral_type=str(self.newmark_spectral_combo.currentData()),
+            newmark_factor=self.newmark_factor_spin.value(),
+            newmark_n_jobs=self.newmark_jobs_spin.value(),
         )
         self._clear_static_color_dirty()
+
+    def _apply_static_color_with_busy(self):
+        source = self.static_color_combo.currentData()
+        if source == "newmark_sa":
+            msg = (
+                "Computing Newmark surface color...\n"
+                "This uses the same parallel cached spectrum path as plot_surface_newmark."
+            )
+        elif source == "arias":
+            msg = (
+                "Computing Arias surface color...\n"
+                "This uses the same parallel cached intensity path as plot_surface_arias."
+            )
+        else:
+            msg = "Applying color by..."
+        self._run_heavy(self._apply_static_color, msg)
 
     def _on_demand_changed(self):
         if self._syncing:

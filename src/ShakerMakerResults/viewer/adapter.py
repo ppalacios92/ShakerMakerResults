@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from collections import OrderedDict
 
@@ -48,6 +49,37 @@ DISPLAY_COMPONENT_LABELS = {
     "resultant": "resultant",
     **{comp: comp.upper() for comp in GF_COMPONENTS},
 }
+
+
+def _format_parallel_elapsed(seconds: float) -> str:
+    if seconds >= 60.0:
+        return f"{seconds / 60.0:5.1f}min"
+    return f"{seconds:6.1f}s"
+
+
+def _parallel_with_total(*, n_jobs: int, total_tasks: int, verbose: int = 5):
+    from joblib import Parallel
+
+    class _ParallelWithTotal(Parallel):
+        def __init__(self, *args, total_tasks: int, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._total_tasks = int(total_tasks)
+
+        def print_progress(self):
+            if self._total_tasks <= 0 or self.n_completed_tasks <= 0:
+                return super().print_progress()
+            start_time = getattr(self, "_start_time", time.time())
+            elapsed = time.time() - start_time
+            self._print(
+                f"Done {self.n_completed_tasks:5d} tasks of {self._total_tasks}"
+                f" | elapsed: {_format_parallel_elapsed(elapsed)}"
+            )
+
+    return _ParallelWithTotal(
+        n_jobs=n_jobs,
+        verbose=verbose,
+        total_tasks=total_tasks,
+    )
 
 
 @dataclass(frozen=True)
@@ -217,6 +249,239 @@ class ViewerDataAdapter:
         if vmax <= vmin:
             return vmin, vmin + 1.0
         return vmin, vmax
+
+    def newmark_surface_snapshot(
+        self,
+        *,
+        T_target: float = 0.0,
+        component: str = "resultant",
+        data_type: str = "accel",
+        spectral_type: str = "PSa",
+        factor: float = 1.0 / 9.81,
+        n_jobs: int = -2,
+    ) -> np.ndarray:
+        """Return a cached Newmark spectral map as one value per displayed node."""
+        from joblib import delayed
+
+        model = self.model
+        data_type = str(data_type).lower()
+        component = str(component).lower()
+        spectral_type = str(spectral_type)
+        T_target = float(T_target)
+        factor = float(factor)
+        n_jobs = int(n_jobs)
+
+        if not hasattr(model, "_newmark_cache"):
+            model._newmark_cache = {}
+        cache_key = (data_type,)
+
+        if cache_key in model._newmark_cache:
+            T_array, sa_full = model._newmark_cache[cache_key]
+        else:
+            dt = float(model.time[1] - model.time[0])
+            n = int(getattr(model, "_n_nodes", len(getattr(model, "xyz", []))))
+            try:
+                import psutil as _psutil
+                mem_available = _psutil.virtual_memory().available
+            except Exception:
+                mem_available = 0
+            bytes_per_node = int(getattr(model, "_bytes_per_node", 3 * len(model.time) * 8))
+            data_needed = bytes_per_node * n
+            use_safe_mode = bool(getattr(model, "_large_file", False)) or (
+                mem_available > 0 and data_needed > mem_available * 0.6
+            )
+
+            if use_safe_mode:
+                filename = model.filename
+                data_grp = model._data_grp
+                hdf5_path = {
+                    "accel": f"{data_grp}/acceleration",
+                    "vel": f"{data_grp}/velocity",
+                    "disp": f"{data_grp}/displacement",
+                }[data_type]
+                window_mask = getattr(model, "_window_mask", None)
+                resample_cache = getattr(model, "_resample_cache", None)
+                time_len = len(model.time)
+
+                def _compute_spectrum(i):
+                    from scipy.interpolate import interp1d as _interp1d
+                    from ShakerMakerResults.analysis.newmark import NewmarkSpectrumAnalyzer as _NSA
+                    import h5py as _h5py
+                    import numpy as _np
+
+                    with _h5py.File(filename, "r") as handle:
+                        data = handle[hdf5_path][3 * i : 3 * i + 3, :]
+                    data = data[[2, 0, 1], :]
+                    if window_mask is not None:
+                        data = data[:, window_mask]
+                    elif resample_cache is not None:
+                        t_orig = resample_cache["time_orig"]
+                        resampled = _np.zeros((3, time_len))
+                        target_t = _np.linspace(t_orig[0], t_orig[-1], time_len)
+                        for k in range(3):
+                            resampled[k] = _interp1d(
+                                t_orig, data[k], kind="linear", fill_value="extrapolate"
+                            )(target_t)
+                        data = resampled
+                    specs = [_NSA.compute(data[k], dt) for k in range(3)]
+                    T = specs[0]["T"]
+                    spectra = {
+                        qty: _np.array([sp[qty] for sp in specs])
+                        for qty in ("PSa", "Sa", "PSv", "Sv", "Sd")
+                    }
+                    return T, spectra
+            else:
+                all_data = np.zeros((n, 3, len(model.time)))
+                for i in range(n):
+                    all_data[i] = model.get_node_data(i, data_type)
+
+                def _compute_spectrum(i):
+                    from ShakerMakerResults.analysis.newmark import NewmarkSpectrumAnalyzer as _NSA
+                    import numpy as _np
+
+                    data = all_data[i]
+                    specs = [_NSA.compute(data[k], dt) for k in range(3)]
+                    T = specs[0]["T"]
+                    spectra = {
+                        qty: _np.array([sp[qty] for sp in specs])
+                        for qty in ("PSa", "Sa", "PSv", "Sv", "Sd")
+                    }
+                    return T, spectra
+
+            results = _parallel_with_total(n_jobs=n_jobs, total_tasks=n, verbose=5)(
+                delayed(_compute_spectrum)(i) for i in range(n)
+            )
+            T_array = results[0][0]
+            sa_full = {
+                qty: np.array([result[1][qty] for result in results])
+                for qty in ("PSa", "Sa", "PSv", "Sv", "Sd")
+            }
+            model._newmark_cache[cache_key] = (T_array, sa_full)
+
+        sp_data = sa_full[spectral_type]
+        n_nodes = int(getattr(model, "_n_nodes", len(sp_data)))
+        if component == "resultant":
+            values = np.array([
+                np.mean([
+                    np.interp(T_target, T_array, sp_data[i][k])
+                    for k in range(3)
+                ])
+                for i in range(n_nodes)
+            ])
+        else:
+            k_idx = {"z": 0, "e": 1, "n": 2}[component]
+            values = np.array([
+                np.interp(T_target, T_array, sp_data[i][k_idx])
+                for i in range(n_nodes)
+            ])
+        values = np.nan_to_num(values * factor, nan=0.0)
+        if self.has_qa:
+            values = np.concatenate([values, np.array([0.0])])
+        return values.astype(float, copy=False)
+
+    def arias_surface_snapshot(
+        self,
+        *,
+        component: str = "z",
+        data_type: str = "accel",
+        factor: float = 1.0,
+        n_jobs: int = -2,
+    ) -> np.ndarray:
+        """Return a cached Arias intensity map as one value per displayed node."""
+        from joblib import delayed
+        from ShakerMakerResults.analysis.arias_intensity import AriasIntensityAnalyzer
+
+        model = self.model
+        component = str(component).lower()
+        data_type = str(data_type).lower()
+        factor = float(factor)
+        n_jobs = int(n_jobs)
+
+        if not hasattr(model, "_newmark_cache"):
+            model._newmark_cache = {}
+        cache_key = (data_type, "arias")
+
+        if cache_key in model._newmark_cache:
+            ia_full = model._newmark_cache[cache_key]
+        else:
+            dt = float(model.time[1] - model.time[0])
+            n = int(getattr(model, "_n_nodes", len(getattr(model, "xyz", []))))
+            try:
+                import psutil as _psutil
+                mem_available = _psutil.virtual_memory().available
+            except Exception:
+                mem_available = 0
+            bytes_per_node = int(getattr(model, "_bytes_per_node", 3 * len(model.time) * 8))
+            data_needed = bytes_per_node * n
+            use_safe_mode = bool(getattr(model, "_large_file", False)) or (
+                mem_available > 0 and data_needed > mem_available * 0.6
+            )
+
+            if use_safe_mode:
+                filename = model.filename
+                data_grp = model._data_grp
+                hdf5_path = {
+                    "accel": f"{data_grp}/acceleration",
+                    "vel": f"{data_grp}/velocity",
+                    "disp": f"{data_grp}/displacement",
+                }[data_type]
+                window_mask = getattr(model, "_window_mask", None)
+                resample_cache = getattr(model, "_resample_cache", None)
+                time_len = len(model.time)
+
+                def _compute_arias(i):
+                    from scipy.interpolate import interp1d as _interp1d
+                    from ShakerMakerResults.analysis.arias_intensity import AriasIntensityAnalyzer as _AIA
+                    import h5py as _h5py
+                    import numpy as _np
+
+                    with _h5py.File(filename, "r") as handle:
+                        data = handle[hdf5_path][3 * i : 3 * i + 3, :]
+                    data = data[[2, 0, 1], :]
+                    if window_mask is not None:
+                        data = data[:, window_mask]
+                    elif resample_cache is not None:
+                        t_orig = resample_cache["time_orig"]
+                        resampled = _np.zeros((3, time_len))
+                        target_t = _np.linspace(t_orig[0], t_orig[-1], time_len)
+                        for k in range(3):
+                            resampled[k] = _interp1d(
+                                t_orig, data[k], kind="linear", fill_value="extrapolate"
+                            )(target_t)
+                        data = resampled
+                    ia = _np.zeros(3)
+                    for k in range(3):
+                        _, _, _, ia_total, _ = _AIA.compute(data[k] / 9.81, dt)
+                        ia[k] = ia_total
+                    return ia
+            else:
+                all_data = np.zeros((n, 3, len(model.time)))
+                for i in range(n):
+                    all_data[i] = model.get_node_data(i, data_type)
+
+                def _compute_arias(i):
+                    data = all_data[i]
+                    ia = np.zeros(3)
+                    for k in range(3):
+                        _, _, _, ia_total, _ = AriasIntensityAnalyzer.compute(data[k] / 9.81, dt)
+                        ia[k] = ia_total
+                    return ia
+
+            results = _parallel_with_total(n_jobs=n_jobs, total_tasks=n, verbose=5)(
+                delayed(_compute_arias)(i) for i in range(n)
+            )
+            ia_full = np.array(results)
+            model._newmark_cache[cache_key] = ia_full
+
+        if component == "resultant":
+            values = np.mean(ia_full, axis=1) * factor
+        else:
+            k_idx = {"z": 0, "e": 1, "n": 2}[component]
+            values = ia_full[:, k_idx] * factor
+        values = np.nan_to_num(values, nan=0.0)
+        if self.has_qa:
+            values = np.concatenate([values, np.array([0.0])])
+        return values.astype(float, copy=False)
 
     @property
     def trace_components(self) -> tuple[str, ...]:

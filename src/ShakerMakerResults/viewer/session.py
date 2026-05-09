@@ -6,7 +6,7 @@ from .adapter import GF_DEMAND, REGULAR_DEMANDS, ViewerDataAdapter
 from .colors import BACKGROUND_PRESETS, colormap_for_component, scalar_limits
 from .state import ViewerState
 
-VALID_STATIC_COLOR_BY = ("elevation_z",)
+VALID_STATIC_COLOR_BY = ("elevation_z", "newmark_sa", "arias")
 
 
 class ViewerSession:
@@ -51,6 +51,12 @@ class ViewerSession:
         self._static_clamp_enabled: bool = False
         self._static_user_vmin: float | None = None
         self._static_user_vmax: float | None = None
+        self._newmark_static_T_target: float = 0.0
+        self._newmark_static_component: str = "resultant"
+        self._newmark_static_data_type: str = "accel"
+        self._newmark_static_spectral_type: str = "PSa"
+        self._newmark_static_factor: float = 1.0 / 9.81
+        self._newmark_static_n_jobs: int = -2
         # ── Wave-blend: modulate elevation Z coloring with wave amplitude ─────
         self._wave_blend_enabled: bool = False
         self._wave_blend_strength: float = 0.5   # 0 = pure elevation, 1 = full shift
@@ -447,6 +453,12 @@ class ViewerSession:
         clamp_enabled: bool,
         wave_blend_enabled: bool = False,
         wave_blend_strength: float = 0.5,
+        newmark_T_target: float | None = None,
+        newmark_component: str | None = None,
+        newmark_data_type: str | None = None,
+        newmark_spectral_type: str | None = None,
+        newmark_factor: float | None = None,
+        newmark_n_jobs: int | None = None,
     ):
         self._static_color_by = self._validate_static_color_by(color_by)
         self._static_color_map = str(colormap).strip() or self._static_color_map
@@ -455,6 +467,18 @@ class ViewerSession:
         self._static_clamp_enabled = bool(clamp_enabled)
         self._wave_blend_enabled = bool(wave_blend_enabled)
         self._wave_blend_strength = max(0.0, min(1.0, float(wave_blend_strength)))
+        if newmark_T_target is not None:
+            self._newmark_static_T_target = float(newmark_T_target)
+        if newmark_component is not None:
+            self._newmark_static_component = str(newmark_component).lower()
+        if newmark_data_type is not None:
+            self._newmark_static_data_type = str(newmark_data_type).lower()
+        if newmark_spectral_type is not None:
+            self._newmark_static_spectral_type = str(newmark_spectral_type)
+        if newmark_factor is not None:
+            self._newmark_static_factor = float(newmark_factor)
+        if newmark_n_jobs is not None:
+            self._newmark_static_n_jobs = int(newmark_n_jobs)
         self._notify_window("static_color")
         return self._static_color_by, self._static_color_map
 
@@ -481,6 +505,10 @@ class ViewerSession:
     def current_static_auto_limits(self) -> tuple[float, float]:
         if self._static_color_by == "elevation_z":
             return self.adapter.elevation_limits()
+        if self._static_color_by == "newmark_sa":
+            return scalar_limits(self._newmark_surface_scalars(), "resultant")
+        if self._static_color_by == "arias":
+            return scalar_limits(self._arias_surface_scalars(), "resultant")
         return self.adapter.elevation_limits()
 
     def current_static_color_limits(self, scalars=None) -> tuple[float, float]:
@@ -492,6 +520,10 @@ class ViewerSession:
             return vmin, vmax
         if scalars is None:
             return self.current_static_auto_limits()
+        if self._static_color_by == "newmark_sa":
+            return scalar_limits(scalars, "resultant")
+        if self._static_color_by == "arias":
+            return scalar_limits(scalars, "resultant")
         return self.current_static_auto_limits()
 
     def apply_data_settings(self, *, demand: str, component: str):
@@ -661,10 +693,10 @@ class ViewerSession:
 
     def set_playing(self, is_playing: bool):
         had_static_color_override = bool(self._static_color_by)
-        elevation_base_active = self._static_color_by == "elevation_z"
+        persistent_static_color = self._static_color_by in ("elevation_z", "newmark_sa", "arias")
         # Elevation is the playback base: keep it alive and let current_scalars()
         # blend the active wave onto it while the animation runs.
-        if is_playing and not self._wave_blend_enabled and not elevation_base_active:
+        if is_playing and not self._wave_blend_enabled and not persistent_static_color:
             self._static_color_by = None
         if is_playing and not self.state.is_playing:
             if self.state.demand == GF_DEMAND:
@@ -703,7 +735,7 @@ class ViewerSession:
 
         # Only force a scene rebuild for static-color → wave transition when
         # blend mode is OFF (blend mode keeps elevation alive during playback).
-        if had_static_color_override and is_playing and not self._wave_blend_enabled and not elevation_base_active:
+        if had_static_color_override and is_playing and not self._wave_blend_enabled and not persistent_static_color:
             self._notify_window("static_color")
         self.state.set_playing(is_playing)
         self._invalidate_frame_cache()
@@ -729,6 +761,10 @@ class ViewerSession:
             if self.state.is_playing:
                 return self._elevation_wave_blend()
             return self.adapter.elevation_snapshot()
+        if self._static_color_by == "newmark_sa":
+            return self._newmark_surface_scalars()
+        if self._static_color_by == "arias":
+            return self._arias_surface_scalars()
         gf_subfault = self._display_gf_subfault if self.state.demand == GF_DEMAND else 0
         return self.adapter.scalar_snapshot(
             self.state.time_index,
@@ -849,6 +885,7 @@ class ViewerSession:
         t = self.state.time_index
         disp_all = self.adapter.displacement_snapshot(t)   # (N_display, 3)
         disp_all = self.adapter.display_points_from_model_xyz_m(disp_all)
+        disp_all[:, 2] *= -1.0
         disp_visible = disp_all[mask]                      # (N_visible, 3) [E, N, Z]
 
         axes = self.state.warp_axes                        # (x_enable, y_enable, z_enable)
@@ -872,6 +909,10 @@ class ViewerSession:
     def default_color_limits(self) -> tuple[float, float]:
         if self._static_color_by == "elevation_z":
             return self.adapter.elevation_limits()
+        if self._static_color_by == "newmark_sa":
+            return scalar_limits(self._newmark_surface_scalars(), "resultant")
+        if self._static_color_by == "arias":
+            return scalar_limits(self._arias_surface_scalars(), "resultant")
         gf_subfault = self._display_gf_subfault if self.state.demand == GF_DEMAND else 0
         return self.adapter.default_scalar_limits(
             self.state.demand,
@@ -1032,9 +1073,27 @@ class ViewerSession:
     def current_static_user_range(self) -> tuple[float | None, float | None]:
         return self._static_user_vmin, self._static_user_vmax
 
+    def current_newmark_static_settings(self) -> dict[str, object]:
+        return {
+            "T_target": self._newmark_static_T_target,
+            "component": self._newmark_static_component,
+            "data_type": self._newmark_static_data_type,
+            "spectral_type": self._newmark_static_spectral_type,
+            "factor": self._newmark_static_factor,
+            "n_jobs": self._newmark_static_n_jobs,
+        }
+
     def current_scalar_bar_title(self) -> str:
         if self._static_color_by == "elevation_z":
             return "Elevation Z [m]"
+        if self._static_color_by == "newmark_sa":
+            return (
+                f"{self._newmark_static_spectral_type}"
+                f"(T={self._newmark_static_T_target:g}s) "
+                f"{self._newmark_static_data_type}/{self._newmark_static_component}"
+            )
+        if self._static_color_by == "arias":
+            return f"Arias {self._newmark_static_data_type}/{self._newmark_static_component}"
         return f"{self.state.demand}/{self.state.component}"
 
     def suggested_point_size(self) -> float:
@@ -1084,3 +1143,21 @@ class ViewerSession:
                 self.adapter.open_playback_handle()
             except Exception:
                 pass
+
+    def _newmark_surface_scalars(self):
+        return self.adapter.newmark_surface_snapshot(
+            T_target=self._newmark_static_T_target,
+            component=self._newmark_static_component,
+            data_type=self._newmark_static_data_type,
+            spectral_type=self._newmark_static_spectral_type,
+            factor=self._newmark_static_factor,
+            n_jobs=self._newmark_static_n_jobs,
+        )
+
+    def _arias_surface_scalars(self):
+        return self.adapter.arias_surface_snapshot(
+            component=self._newmark_static_component,
+            data_type=self._newmark_static_data_type,
+            factor=self._newmark_static_factor,
+            n_jobs=self._newmark_static_n_jobs,
+        )

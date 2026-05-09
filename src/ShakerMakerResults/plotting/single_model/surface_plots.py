@@ -5,12 +5,45 @@ from __future__ import annotations
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
+import time
 
 from ...utils import _rotate
 
-def plot_surface(self, 
-                time=0.0, 
-                component='z', 
+
+def _format_parallel_elapsed(seconds: float) -> str:
+    if seconds >= 60.0:
+        return f"{seconds / 60.0:5.1f}min"
+    return f"{seconds:6.1f}s"
+
+
+def _parallel_with_total(*, n_jobs: int, total_tasks: int, verbose: int = 5):
+    from joblib import Parallel
+
+    class _ParallelWithTotal(Parallel):
+        def __init__(self, *args, total_tasks: int, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._total_tasks = int(total_tasks)
+
+        def print_progress(self):
+            if self._total_tasks <= 0 or self.n_completed_tasks <= 0:
+                return super().print_progress()
+            start_time = getattr(self, "_start_time", time.time())
+            elapsed = time.time() - start_time
+            self._print(
+                f"Done {self.n_completed_tasks:5d} tasks of {self._total_tasks}"
+                f" | elapsed: {_format_parallel_elapsed(elapsed)}"
+            )
+
+    return _ParallelWithTotal(
+        n_jobs=n_jobs,
+        verbose=verbose,
+        total_tasks=total_tasks,
+    )
+
+
+def plot_surface(self,
+                time=0.0,
+                component='z',
                 data_type='vel',
                 cmap='RdBu_r', 
                 figsize=(12,8),
@@ -139,7 +172,7 @@ def plot_surface_newmark(self,
     """
 
 
-    from joblib import Parallel, delayed
+    from joblib import delayed
 
     dt        = self.time[1] - self.time[0]
     n         = self._n_nodes
@@ -222,7 +255,7 @@ def plot_surface_newmark(self,
                       for qty in ('PSa', 'Sa', 'PSv', 'Sv', 'Sd')}
                 return T, sa
 
-        results = Parallel(n_jobs=n_jobs, verbose=5)(
+        results = _parallel_with_total(n_jobs=n_jobs, total_tasks=n, verbose=5)(
             delayed(_compute_spectrum)(i) for i in range(n))
 
         T_array = results[0][0]
@@ -305,7 +338,7 @@ def plot_surface_arias(self,
     axis_equal : bool, default False
     n_jobs : int, default -1
     """
-    from joblib import Parallel, delayed
+    from joblib import delayed
     from ...analysis.arias_intensity import AriasIntensityAnalyzer
 
     dt        = self.time[1] - self.time[0]
@@ -377,7 +410,7 @@ def plot_surface_arias(self,
                     ia[k] = ia_total
                 return ia
 
-        results = Parallel(n_jobs=n_jobs, verbose=5)(
+        results = _parallel_with_total(n_jobs=n_jobs, total_tasks=n, verbose=5)(
             delayed(_compute_arias)(i) for i in range(n))
 
         ia_full = np.array(results)
