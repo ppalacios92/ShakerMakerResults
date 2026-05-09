@@ -258,7 +258,7 @@ class StatusChipBar(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
         self._chips = []
-        for _ in range(5):
+        for _ in range(6):
             label = QtWidgets.QLabel()
             label.setObjectName("StatusChip")
             layout.addWidget(label)
@@ -266,8 +266,8 @@ class StatusChipBar(QtWidgets.QWidget):
         layout.addStretch(1)
 
     def update_values(self, values):
-        for label, text in zip(self._chips, values):
-            label.setText(str(text))
+        for idx, label in enumerate(self._chips):
+            label.setText(str(values[idx]) if idx < len(values) else "")
 
     def update_time_chip(self, text: str) -> None:
         """Update only the time chip (index 0) — zero-cost during playback."""

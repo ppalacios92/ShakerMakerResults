@@ -232,7 +232,7 @@ class _SectionBase(QtWidgets.QWidget):
 
     @staticmethod
     def _set_combo_data(combo, value):
-        idx = combo.findData(value)
+        idx = 0 if value is None else combo.findData(value)
         if idx < 0:
             idx = combo.findText(str(value))
         if idx < 0:
@@ -645,6 +645,7 @@ class DisplaySection(_SectionBase):
         static_color_form.setContentsMargins(6, 4, 6, 6)
 
         self.static_color_combo = QtWidgets.QComboBox()
+        self.static_color_combo.addItem("Default", None)
         for color_by_value in VALID_STATIC_COLOR_BY:
             self.static_color_combo.addItem(
                 self._STATIC_COLOR_LABELS.get(color_by_value, color_by_value),
@@ -786,7 +787,7 @@ class DisplaySection(_SectionBase):
                 self._sync_vector_ui()
                 self._clear_vector_dirty()
             if sync_static:
-                current_static = self.session.current_static_color_by() or VALID_STATIC_COLOR_BY[0]
+                current_static = self.session.current_static_color_by()
                 self._set_combo_data(self.static_color_combo, current_static)
                 self._set_combo(self.static_cmap_combo, self.session.current_static_colormap())
                 lo, hi = self.session.current_static_auto_limits()
@@ -882,7 +883,7 @@ class DisplaySection(_SectionBase):
         if self._syncing:
             return
         self.session.apply_static_color_settings(
-            color_by=str(self.static_color_combo.currentData()),
+            color_by=self.static_color_combo.currentData(),
             colormap=self.static_cmap_combo.currentText(),
             vmin=self.static_vmin_spin.value(),
             vmax=self.static_vmax_spin.value(),

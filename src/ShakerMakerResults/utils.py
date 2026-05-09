@@ -95,11 +95,11 @@ def _get_name(obj):
     """Return a short display name from any supported model object.
 
     StationData returns obj.name or 'Station'.
-    ShakerMakerData returns obj.model_name.
+    ShakerMakerData returns obj.name.
     """
     if _is_station(obj):
         return obj.name if obj.name else "Station"
-    return obj.model_name
+    return obj.name if getattr(obj, "name", None) else "Model"
 
 
 def _fk_tensor_rotation(gf_tensor, strike, dip, rake, azimuth):

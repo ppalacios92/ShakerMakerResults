@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from collections import OrderedDict
 
@@ -238,8 +239,12 @@ class ViewerDataAdapter:
         return "Station"
 
     def summary(self) -> DatasetSummary:
+        name = getattr(self.model, "name", None)
+        if not name:
+            filename = getattr(self.model, "filename", None)
+            name = os.path.splitext(os.path.basename(str(filename)))[0] if filename else "Model"
         return DatasetSummary(
-            name=str(getattr(self.model, "name", getattr(self.model, "filename", "Model"))),
+            name=str(name),
             dataset_type=self.dataset_type,
             node_count=len(self._points),
             display_node_count=len(self._display_points),

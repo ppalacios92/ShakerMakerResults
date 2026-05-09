@@ -36,7 +36,8 @@ def get_window(model, t_start, t_end):
             new._n_time_gf = 0
             new.gf_time = gf_time.copy()
 
-    new.name = f"{model.name} [{t_start}-{t_end}s]"
+    new.name = model.name
+    new.window_label = f"{t_start}-{t_end}s"
     new._node_cache = {}
     new._gf_cache = {}
     new._spectrum_cache = {}

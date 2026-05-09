@@ -156,12 +156,12 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                         demand, self.session.state.component, no_evict=False
                     )
             elif reason == "warp" and self.session.state.disp_warp_enabled:
-                from .adapter import GF_DEMAND
-                demand = self.session.state.demand
-                if demand != GF_DEMAND:
-                    one = self.session.adapter._estimated_series_bytes()
-                    if 6 * one <= self.session.adapter.max_cache_bytes:
-                        self._prewarm_demands([demand, "disp"], no_evict=False)
+                disp_ready = all(
+                    ("disp", component) in self.session.adapter._series_cache
+                    for component in ("e", "n", "z")
+                )
+                if not disp_ready:
+                    self._prewarm_demands(["disp"], no_evict=True)
             elif reason == "vector_field" and self.session.state.vector_field_enabled:
                 self._prewarm_demands(
                     [self.session.state.vector_field_demand], no_evict=False
@@ -312,6 +312,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             f"{mode} [{vmin:.3g}, {vmax:.3g}]",
             selected_label,
             self._cache_summary(),
+            self._cache_contents_summary(),
         ]
         self.status_chip_bar.update_values(chips)
 
@@ -320,6 +321,29 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         mb = info["bytes"] / (1024 * 1024)
         budget_mb = info["budget"] / (1024 * 1024)
         return f"cache {mb:.1f}/{budget_mb:.0f} MB"
+
+    def _cache_contents_summary(self) -> str:
+        adapter = self.session.adapter
+        cache = getattr(adapter, "_series_cache", {})
+        component_labels = (("e", "e"), ("n", "n"), ("z", "z"), ("resultant", "r"))
+        parts = []
+        for demand in ("accel", "vel", "disp"):
+            loaded = [short for component, short in component_labels if (demand, component) in cache]
+            if loaded:
+                parts.append(f"{demand}/{','.join(loaded)}")
+
+        disp_triplet = [short for component, short in component_labels[:3] if ("disp", component) in cache]
+        if len(disp_triplet) == 3:
+            warp = "warp ready"
+        elif disp_triplet:
+            warp = f"warp {','.join(disp_triplet)}"
+        elif getattr(adapter, "_disp_window_cache", None) is not None:
+            warp = "warp window"
+        else:
+            warp = "warp -"
+
+        loaded = " ".join(parts) if parts else "-"
+        return f"loaded {loaded} | {warp}"
 
     def _play_interval_ms(self) -> int:
         return max(16, int(self._last_render_ms * 1.1))
@@ -372,7 +396,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
 
         total_bytes = len(to_load) * triplet_bytes
         busy = BusyDialog(
-            "Cargando datos de simulación...",
+            "Preparing simulation data cache...",
             self,
             total_steps=1000,
         )
@@ -393,15 +417,19 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                 gb_done  = done  / 1_073_741_824
                 gb_total = total / 1_073_741_824
                 pct      = done * 100 // total if total > 0 else 0
+                cache = adapter.cache_info
+                cache_gb = cache["bytes"] / 1_073_741_824
+                budget_gb = cache["budget"] / 1_073_741_824
 
                 speed_str = (
-                    f"{rate / 1_048_576:.0f} MB/s  —  ETA {int(remaining)}s"
-                    if rate > 0 else "midiendo velocidad..."
+                    f"{rate / 1_048_576:.0f} MB/s | ETA {int(remaining)}s"
+                    if rate > 0 else "Measuring read speed..."
                 )
                 busy.set_message(
-                    f"Cargando  {label}  [{idx + 1}/{count}]\n"
-                    f"{gb_done:.2f} / {gb_total:.2f} GB  ({pct}%)\n"
-                    f"{speed_str}"
+                    f"Loading {label} vector components [{idx + 1}/{count}]\n"
+                    f"Read: {gb_done:.2f} / {gb_total:.2f} GiB ({pct}%)\n"
+                    f"{speed_str}\n"
+                    f"Cache: {cache_gb:.2f} / {budget_gb:.2f} GiB | precision: float16"
                 )
                 busy.set_step(
                     int(global_done * 1000 // total_bytes) if total_bytes > 0 else 0
@@ -471,12 +499,18 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             return
 
         total_units = len(visual_jobs) + (3 if needs_disp_triplet else 0)
-        busy = BusyDialog("Cargando cache visual...", self, total_steps=1000)
+        busy = BusyDialog("Preparing visual cache...", self, total_steps=1000)
         busy.show()
         QtWidgets.QApplication.processEvents()
 
         self._prewarming = True
         completed_units = 0
+
+        def _cache_line() -> str:
+            info = adapter.cache_info
+            used = info["bytes"] / 1_073_741_824
+            budget = info["budget"] / 1_073_741_824
+            return f"Cache: {used:.2f} / {budget:.2f} GiB | precision: float16"
 
         def _set_progress(message: str, units_done: int = completed_units) -> None:
             busy.set_message(message)
@@ -486,13 +520,15 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         try:
             for idx, (demand, component) in enumerate(visual_jobs, start=1):
                 _set_progress(
-                    f"Cargando campo visual  {demand}/{component}  "
-                    f"[{idx}/{len(visual_jobs)}]"
+                    f"Loading visual field {demand}/{component} [{idx}/{len(visual_jobs)}]\n"
+                    f"Estimated field size: {one_series_bytes / 1_073_741_824:.2f} GiB\n"
+                    f"{_cache_line()}"
                 )
                 adapter.scalar_series(demand, component, no_evict=True)
                 completed_units += 1
                 _set_progress(
-                    f"Listo  {demand}/{component}",
+                    f"Ready: {demand}/{component}\n"
+                    f"{_cache_line()}",
                     completed_units,
                 )
 
@@ -506,14 +542,19 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                     gb_total = total / 1_073_741_824
                     pct = int(frac * 100)
                     _set_progress(
-                        "Preparando warp  disp/E,N,Z\n"
-                        f"{gb_done:.2f} / {gb_total:.2f} GB  ({pct}%)",
+                        "Preparing warp displacement vectors: disp/E,N,Z\n"
+                        f"Read: {gb_done:.2f} / {gb_total:.2f} GiB ({pct}%)\n"
+                        f"{_cache_line()}",
                         min(units, total_units),
                     )
 
                 adapter.prewarm_component_triplet("disp", progress_cb=_disp_cb, no_evict=True)
                 completed_units = total_units
-                _set_progress("Cache visual listo", completed_units)
+                _set_progress(
+                    "Visual cache ready\n"
+                    f"{_cache_line()}",
+                    completed_units,
+                )
         except Exception:
             try:
                 adapter.open_playback_handle()

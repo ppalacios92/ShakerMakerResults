@@ -57,7 +57,7 @@ def compare_node_response(models, node_id, data_type='vel',
     Returns
     -------
     dict
-        Nested ``{model_name: {component: {metric: value}}}`` dictionary.
+        Nested ``{name: {component: {metric: value}}}`` dictionary.
     """
     n          = len(models)
     components = ['Z', 'E', 'N']
@@ -135,7 +135,7 @@ def compare_spectra(models, node_id, data_type='accel',
     Returns
     -------
     dict
-        Nested ``{model_name: {component: {metric: value}}}`` dictionary.
+        Nested ``{name: {component: {metric: value}}}`` dictionary.
     """
     n          = len(models)
     components = [('Z', 0), ('E', 1), ('N', 2)]

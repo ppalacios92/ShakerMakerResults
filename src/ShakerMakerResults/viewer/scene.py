@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from ._imports import require_viewer_dependencies
 from .interaction import RevitInteractorStyle
 
@@ -758,7 +760,7 @@ class ViewerScene:
             bar_title = str(self._gf_component_pin).upper()   # e.g. "G11"
         else:
             clim = self.session.current_color_limits(scalars)
-            bar_title = self.session.current_scalar_bar_title()
+            bar_title = self._scalar_bar_title()
         actor = self.plotter.add_points(
             self.point_cloud,
             scalars="active_scalars",
@@ -767,7 +769,11 @@ class ViewerScene:
             render_points_as_spheres=True,
             point_size=self._point_size(),
             show_scalar_bar=self.session.state.show_scalar_bar,
-            scalar_bar_args={"title": bar_title},
+            scalar_bar_args={
+                "title": bar_title,
+                "title_font_size": 12,
+                "label_font_size": 11,
+            },
             render=False,
         )
         try:
@@ -776,14 +782,47 @@ class ViewerScene:
             pass
         return actor
 
+    def _scalar_bar_title(self) -> str:
+        title = self.session.current_scalar_bar_title()
+        state = self.session.state
+        if not state.disp_warp_enabled:
+            return title
+        components = [
+            label
+            for enabled, label in zip(state.warp_axes, ("e", "n", "z"))
+            if enabled
+        ]
+        component_text = ", ".join(components) if components else "none"
+        scale = state.warp_scale
+        if scale is None:
+            scale = self.session.suggested_warp_scale()
+        return f"{title}  + warp / {component_text} x{self._format_warp_scale(scale)}"
+
+    @staticmethod
+    def _format_warp_scale(scale) -> str:
+        try:
+            value = float(scale)
+        except (TypeError, ValueError):
+            return "auto"
+        if not math.isfinite(value):
+            return "auto"
+        sign = "-" if value < 0 else ""
+        value = abs(value)
+        if value >= 1000.0:
+            scaled = value / 1000.0
+            return f"{sign}{scaled:g}k"
+        return f"{sign}{value:g}"
+
     def _add_branding(self):
         """Add a small title block to the upper-left corner of the 3-D viewport."""
+        project_name = self.session.adapter.summary().name
         lines = [
             "ShakerMaker Results",
             "By: Ladruno Team",
             "2026 - V 1.0.0",
             "An Interactive View for ShakerMaker Tool",
             ".h5drm files supported",
+            f"PRY: {project_name}",
         ]
         try:
             self.plotter.add_text(

@@ -440,7 +440,7 @@ class ViewerSession:
     def apply_static_color_settings(
         self,
         *,
-        color_by: str,
+        color_by: str | None,
         colormap: str,
         vmin: float | None,
         vmax: float | None,
@@ -458,7 +458,7 @@ class ViewerSession:
         self._notify_window("static_color")
         return self._static_color_by, self._static_color_map
 
-    def apply_static_color_by(self, color_by: str) -> str:
+    def apply_static_color_by(self, color_by: str | None) -> str | None:
         self._static_color_by = self._validate_static_color_by(color_by)
         self._static_color_map = self.state.colormap
         self._notify_window("static_color")
@@ -547,7 +547,7 @@ class ViewerSession:
         # persistent handle instead of reopening the file per call.
         if warp_enabled and not was_warp_enabled:
             # Warp just enabled — open handle if disp series not in cache.
-            if not any(("disp", _c) in self.adapter._series_cache for _c in ("e", "n", "z")):
+            if not all(("disp", _c) in self.adapter._series_cache for _c in ("e", "n", "z")):
                 self.adapter.open_playback_handle()
         elif not warp_enabled and not self.state.is_playing:
             # Warp disabled and not playing — nobody needs the handle.
@@ -690,7 +690,7 @@ class ViewerSession:
                         pass
                     if self.state.disp_warp_enabled:
                         self._prepare_component_triplet("disp")
-                if not any((demand, _c) in self.adapter._series_cache for _c in ("e", "n", "z")):
+                if not all((demand, _c) in self.adapter._series_cache for _c in ("e", "n", "z")):
                     self.adapter.open_playback_handle()
 
         elif not is_playing and self.state.is_playing:
@@ -1035,7 +1035,7 @@ class ViewerSession:
     def current_scalar_bar_title(self) -> str:
         if self._static_color_by == "elevation_z":
             return "Elevation Z [m]"
-        return self.state.demand
+        return f"{self.state.demand}/{self.state.component}"
 
     def suggested_point_size(self) -> float:
         if self.state.point_size is not None:
@@ -1052,12 +1052,16 @@ class ViewerSession:
             self.window.on_session_updated(reason)
 
     @staticmethod
-    def _validate_static_color_by(color_by: str) -> str:
+    def _validate_static_color_by(color_by: str | None) -> str | None:
+        if color_by is None:
+            return None
         color_by = str(color_by).strip().lower()
+        if color_by in ("", "default", "field"):
+            return None
         if color_by not in VALID_STATIC_COLOR_BY:
             raise KeyError(
                 f"Unknown static color source '{color_by}'. "
-                f"Use one of {', '.join(VALID_STATIC_COLOR_BY)}."
+                f"Use default or one of {', '.join(VALID_STATIC_COLOR_BY)}."
             )
         return color_by
 
@@ -1072,7 +1076,7 @@ class ViewerSession:
                 return
             one = self.adapter._estimated_series_bytes_for_demand(demand)
             if one > 0 and one * 3 <= self.adapter.max_cache_bytes:
-                self.adapter.prewarm_component_triplet(demand)
+                self.adapter.prewarm_component_triplet(demand, no_evict=True)
             if not all(key in self.adapter._series_cache for key in keys):
                 self.adapter.open_playback_handle()
         except Exception:

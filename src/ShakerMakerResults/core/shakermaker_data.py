@@ -75,11 +75,7 @@ class ShakerMakerData:
             dt_orig = float(f[f'{meta_grp}/dt'][()])
             tstart  = float(f[f'{meta_grp}/tstart'][()])
 
-            try:
-                raw = f[f'{meta_grp}/name'][()]
-                self.name = raw.decode() if isinstance(raw, bytes) else str(raw)
-            except KeyError:
-                self.name = filename
+            self.name = os.path.splitext(os.path.basename(filename))[0]
 
             n_nodes     = len(self.xyz)
             n_time_data = f[f'{data_grp}/velocity'].shape[1]
@@ -116,7 +112,6 @@ class ShakerMakerData:
         h_z = _spacing(xyz_t[:, 2])
 
         self.spacing    = (h_x, h_y, h_z)
-        self.model_name = f"{h_x:.1f}m"
 
         self._dt_orig    = dt_orig; self._tstart     = tstart
         self._n_nodes    = n_nodes; self._n_subfaults = n_subfaults
@@ -211,7 +206,7 @@ class ShakerMakerData:
         print('--' * 50)
         print(f"ShakerMakerData  :  {filename}")
         print(f"  Type     : {type_str}")
-        print(f"  Model    : {self.model_name}  |  Spacing: {h_x:.1f}m x {h_y:.1f}m x {h_z:.1f}m")
+        print(f"  Model    : {self.name}  |  Spacing: {h_x:.1f}m x {h_y:.1f}m x {h_z:.1f}m")
         print(f"  Domain   : Lx={Lx:.1f}m  Ly={Ly:.1f}m  Lz={Lz:.1f}m")
         print(f"  Nodes    : {n_nodes}  |  Internal: {self.internal.sum()}  |  External: {(~self.internal).sum()}")
         print(f"  QA       : {'yes  ->  ' + str(self.xyz_qa[0] * 1000) + ' m' if self.xyz_qa is not None else 'no'}")
