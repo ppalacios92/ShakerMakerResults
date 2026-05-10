@@ -18,6 +18,7 @@ class ViewerScene:
         self.session = session
         self.point_cloud = None
         self.point_actor = None
+        self._point_actor_rgb = False
         self.selection_actor = None
         self.multi_selection_actor = None   # red spheres for selection-mode set
         self.vector_actor = None            # line overlay for vector field
@@ -148,6 +149,10 @@ class ViewerScene:
         if domain_idx is not None:
             scalars = scalars[domain_idx]
         if self.point_cloud is None or len(scalars) != self.point_cloud.n_points:
+            self.rebuild_scalar_actor(render=render)
+            return
+        rgb_scalars = self._scalars_are_rgb(scalars)
+        if self.point_actor is not None and rgb_scalars != self._point_actor_rgb:
             self.rebuild_scalar_actor(render=render)
             return
         self.point_cloud.point_data["active_scalars"] = scalars
@@ -755,32 +760,42 @@ class ViewerScene:
         if self.point_cloud is None or self.point_cloud.n_points == 0:
             return None
         scalars = self.point_cloud.point_data["active_scalars"]
+        rgb_scalars = self._scalars_are_rgb(scalars)
         if self._gf_pin_active():
             clim = self._color_limits_for_gf_pin(scalars)
             bar_title = str(self._gf_component_pin).upper()   # e.g. "G11"
         else:
             clim = self.session.current_color_limits(scalars)
             bar_title = self._scalar_bar_title()
-        actor = self.plotter.add_points(
-            self.point_cloud,
-            scalars="active_scalars",
-            cmap=self.session.current_colormap(),
-            clim=clim,
-            render_points_as_spheres=True,
-            point_size=self._point_size(),
-            show_scalar_bar=self.session.state.show_scalar_bar,
-            scalar_bar_args={
+        kwargs = {
+            "scalars": "active_scalars",
+            "render_points_as_spheres": True,
+            "point_size": self._point_size(),
+            "render": False,
+        }
+        if rgb_scalars:
+            kwargs["rgb"] = True
+            kwargs["show_scalar_bar"] = False
+        else:
+            kwargs["cmap"] = self.session.current_colormap()
+            kwargs["clim"] = clim
+            kwargs["show_scalar_bar"] = self.session.state.show_scalar_bar
+            kwargs["scalar_bar_args"] = {
                 "title": bar_title,
                 "title_font_size": 12,
                 "label_font_size": 11,
-            },
-            render=False,
-        )
+            }
+        actor = self.plotter.add_points(self.point_cloud, **kwargs)
+        self._point_actor_rgb = rgb_scalars
         try:
             actor.GetProperty().SetOpacity(self.session.state.node_opacity)
         except Exception:
             pass
         return actor
+
+    @staticmethod
+    def _scalars_are_rgb(scalars) -> bool:
+        return getattr(scalars, "ndim", 1) == 2 and scalars.shape[1] in (3, 4)
 
     def _scalar_bar_title(self) -> str:
         title = self.session.current_scalar_bar_title()

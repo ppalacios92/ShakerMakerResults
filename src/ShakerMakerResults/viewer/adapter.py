@@ -64,14 +64,20 @@ def _parallel_with_total(*, n_jobs: int, total_tasks: int, verbose: int = 5):
         def __init__(self, *args, total_tasks: int, **kwargs):
             super().__init__(*args, **kwargs)
             self._total_tasks = int(total_tasks)
+            self._next_progress_report = 500
 
         def print_progress(self):
-            if self._total_tasks <= 0 or self.n_completed_tasks <= 0:
+            completed = int(self.n_completed_tasks)
+            if self._total_tasks <= 0 or completed <= 0:
                 return super().print_progress()
+            if completed < self._total_tasks and completed < self._next_progress_report:
+                return
+            while self._next_progress_report <= completed:
+                self._next_progress_report += 500
             start_time = getattr(self, "_start_time", time.time())
             elapsed = time.time() - start_time
             self._print(
-                f"Done {self.n_completed_tasks:5d} tasks of {self._total_tasks}"
+                f"Done {completed:5d} tasks of {self._total_tasks}"
                 f" | elapsed: {_format_parallel_elapsed(elapsed)}"
             )
 

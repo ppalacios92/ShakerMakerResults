@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .adapter import GF_DEMAND, REGULAR_DEMANDS, ViewerDataAdapter
-from .colors import BACKGROUND_PRESETS, colormap_for_component, scalar_limits
+from .colors import BACKGROUND_PRESETS, colormap_for_component, scalar_limits, scalars_to_rgb
 from .state import ViewerState
 
 VALID_STATIC_COLOR_BY = ("elevation_z", "newmark_sa", "arias")
@@ -60,6 +60,11 @@ class ViewerSession:
         # ── Wave-blend: modulate elevation Z coloring with wave amplitude ─────
         self._wave_blend_enabled: bool = False
         self._wave_blend_strength: float = 0.5   # 0 = pure elevation, 1 = full shift
+        self._wave_blend_gamma: float = 1.5
+        self._blend_base_rgb_key = None
+        self._blend_base_rgb = None
+        self._wave_global_max_key = None
+        self._wave_global_max = None
         max_index = max(len(self.adapter.time) - 1, 0)
         self.state = ViewerState(
             time_index=time_index,
@@ -467,6 +472,8 @@ class ViewerSession:
         self._static_clamp_enabled = bool(clamp_enabled)
         self._wave_blend_enabled = bool(wave_blend_enabled)
         self._wave_blend_strength = max(0.0, min(1.0, float(wave_blend_strength)))
+        self._blend_base_rgb_key = None
+        self._blend_base_rgb = None
         if newmark_T_target is not None:
             self._newmark_static_T_target = float(newmark_T_target)
         if newmark_component is not None:
@@ -485,6 +492,8 @@ class ViewerSession:
     def apply_static_color_by(self, color_by: str | None) -> str | None:
         self._static_color_by = self._validate_static_color_by(color_by)
         self._static_color_map = self.state.colormap
+        self._blend_base_rgb_key = None
+        self._blend_base_rgb = None
         self._notify_window("static_color")
         return self._static_color_by
 
@@ -498,6 +507,13 @@ class ViewerSession:
 
     def current_wave_blend_strength(self) -> float:
         return self._wave_blend_strength
+
+    def current_wave_blend_active(self) -> bool:
+        return bool(
+            self._static_color_by == "elevation_z"
+            and self._wave_blend_enabled
+            and self.state.is_playing
+        )
 
     def current_display_gf_subfault(self) -> int:
         return int(self._display_gf_subfault)
@@ -758,8 +774,8 @@ class ViewerSession:
 
     def current_scalars(self):
         if self._static_color_by == "elevation_z":
-            if self.state.is_playing:
-                return self._elevation_wave_blend()
+            if self.current_wave_blend_active():
+                return self._elevation_wave_rgb_blend()
             return self.adapter.elevation_snapshot()
         if self._static_color_by == "newmark_sa":
             return self._newmark_surface_scalars()
@@ -782,7 +798,19 @@ class ViewerSession:
             subfault_id=gf_subfault,
         )
 
-    def _elevation_wave_blend(self):
+    def _elevation_wave_rgb_blend(self):
+        import numpy as np
+
+        base_rgb = self._elevation_base_rgb()
+        wave = self.current_wave_scalars()
+        w_min, w_max = self._current_wave_color_limits(wave)
+        wave_rgb = scalars_to_rgb(wave, self._current_wave_colormap(), w_min, w_max)
+        w_abs = self._wave_global_maximum(wave)
+        amp = np.clip(np.abs(wave) / w_abs, 0.0, 1.0)
+        alpha = (float(self._wave_blend_strength) * (amp ** float(self._wave_blend_gamma)))[:, None]
+        blended = (1.0 - alpha) * base_rgb.astype(np.float32) + alpha * wave_rgb.astype(np.float32)
+        return np.clip(blended, 0.0, 255.0).astype(np.uint8)
+
         """Return scalars that blend elevation Z with the current wave frame.
 
         The elevation values are kept in their original units (e.g. metres) and
@@ -826,6 +854,42 @@ class ViewerSession:
         strength = float(self._wave_blend_strength)
         shift = w_norm * e_range * strength * 0.5
         return (elev + shift).astype(np.float32)
+
+    def _elevation_base_rgb(self):
+        elev = self.adapter.elevation_snapshot()
+        vmin, vmax = self.current_static_color_limits(elev)
+        key = (
+            "elevation_z",
+            self._static_color_map,
+            float(vmin),
+            float(vmax),
+            len(elev),
+        )
+        if self._blend_base_rgb_key != key or self._blend_base_rgb is None:
+            self._blend_base_rgb = scalars_to_rgb(elev, self._static_color_map, vmin, vmax)
+            self._blend_base_rgb_key = key
+        return self._blend_base_rgb
+
+    def _wave_global_maximum(self, wave=None) -> float:
+        key = (self.state.demand, self.state.component)
+        if self._wave_global_max_key == key and self._wave_global_max is not None:
+            return self._wave_global_max
+        try:
+            w_min, w_max = self.adapter.default_scalar_limits(
+                self.state.demand,
+                self.state.component,
+                subfault_id=self._display_gf_subfault if self.state.demand == GF_DEMAND else 0,
+            )
+            w_abs = max(abs(float(w_min)), abs(float(w_max)), 1.0e-12)
+        except Exception:
+            import numpy as np
+
+            if wave is None:
+                wave = self.current_wave_scalars()
+            w_abs = max(float(np.max(np.abs(wave))), 1.0e-12)
+        self._wave_global_max_key = key
+        self._wave_global_max = w_abs
+        return w_abs
 
     def current_visible_points(self):
         return self.adapter.visible_points(
@@ -920,7 +984,31 @@ class ViewerSession:
             subfault_id=gf_subfault,
         )
 
+    def _current_wave_color_limits(self, scalars=None) -> tuple[float, float]:
+        if self.state.clamp_enabled and self.state.user_vmin is not None and self.state.user_vmax is not None:
+            vmin = float(self.state.user_vmin)
+            vmax = float(self.state.user_vmax)
+            if vmax <= vmin:
+                return vmin, vmin + 1.0
+            return vmin, vmax
+        try:
+            gf_subfault = self._display_gf_subfault if self.state.demand == GF_DEMAND else 0
+            return self.adapter.default_scalar_limits(
+                self.state.demand,
+                self.state.component,
+                subfault_id=gf_subfault,
+            )
+        except Exception:
+            if scalars is None:
+                scalars = self.current_wave_scalars()
+            return scalar_limits(scalars, self.state.component)
+
+    def _current_wave_colormap(self) -> str:
+        return self.state.colormap or colormap_for_component(self.state.component)
+
     def current_color_limits(self, scalars=None) -> tuple[float, float]:
+        if self.current_wave_blend_active():
+            return self._current_wave_color_limits(None)
         if self._static_color_by is not None:
             return self.current_static_color_limits(scalars)
         if self.state.clamp_enabled and self.state.user_vmin is not None and self.state.user_vmax is not None:
@@ -1057,6 +1145,8 @@ class ViewerSession:
         return BACKGROUND_PRESETS[self.state.background]
 
     def current_colormap(self) -> str:
+        if self.current_wave_blend_active():
+            return self._current_wave_colormap()
         if self._static_color_by is not None:
             return self._static_color_map
         return self.state.colormap or colormap_for_component(self.state.component)
@@ -1084,6 +1174,8 @@ class ViewerSession:
         }
 
     def current_scalar_bar_title(self) -> str:
+        if self.current_wave_blend_active():
+            return f"{self.state.demand}/{self.state.component}"
         if self._static_color_by == "elevation_z":
             return "Elevation Z [m]"
         if self._static_color_by == "newmark_sa":

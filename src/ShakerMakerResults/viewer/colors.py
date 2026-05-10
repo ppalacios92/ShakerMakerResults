@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 
 BACKGROUND_PRESETS = {
@@ -35,3 +37,24 @@ def scalar_limits(values: np.ndarray, component: str) -> tuple[float, float]:
     if vmax <= 0.0:
         vmax = 1.0
     return -vmax, vmax
+
+
+@lru_cache(maxsize=16)
+def _matplotlib_cmap(name: str):
+    import matplotlib.pyplot as plt
+
+    return plt.get_cmap(name)
+
+
+def scalars_to_rgb(values: np.ndarray, cmap_name: str, vmin: float, vmax: float) -> np.ndarray:
+    """Map scalar values to RGB uint8 colors using a Matplotlib colormap."""
+    values = np.asarray(values, dtype=np.float32)
+    vmin = float(vmin)
+    vmax = float(vmax)
+    if vmax > vmin:
+        norm = (values - vmin) / (vmax - vmin)
+    else:
+        norm = np.zeros_like(values, dtype=np.float32)
+    norm = np.clip(norm, 0.0, 1.0)
+    rgba = _matplotlib_cmap(str(cmap_name))(norm)
+    return (rgba[:, :3] * 255.0).astype(np.uint8, copy=False)

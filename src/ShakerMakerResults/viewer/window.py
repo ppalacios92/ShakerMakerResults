@@ -120,6 +120,11 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         if reason == "playback":
             if self.session.state.is_playing:
                 self.session.adapter.open_playback_handle()
+            if (
+                self.session.current_static_color_by() == "elevation_z"
+                and self.session.current_wave_blend_enabled()
+            ):
+                self.multi_view.on_session_updated("static_color")
             self._sync_play_state()
             self.side_panel.refresh("playback")
             return
