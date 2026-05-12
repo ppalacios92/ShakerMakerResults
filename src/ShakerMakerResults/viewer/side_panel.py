@@ -1006,6 +1006,36 @@ class DisplaySection(_SectionBase):
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(8)
 
+        # ── Apply target selector ────────────────────────────────────────
+        # Drives where _apply() writes the values:
+        #   "all"  → session global (current behaviour; clears overrides
+        #            on every pane so the global change is visible)
+        #   "tab"  → every pane in the currently visible MultiViewArea
+        #            (writes overrides on each pane.pane_state)
+        #   "pane" → only the active pane (writes overrides on its
+        #            pane_state)
+        # ``window.set_apply_target_for_display(...)`` lets the Scene
+        # Browser flip the combo when the user picks a tab / pane in the
+        # tree.
+        target_box = QtWidgets.QWidget()
+        target_lay = QtWidgets.QHBoxLayout(target_box)
+        target_lay.setContentsMargins(0, 0, 0, 0)
+        target_lay.setSpacing(6)
+        target_lbl = QtWidgets.QLabel("Apply to")
+        target_lbl.setToolTip(
+            "Which viewports the Apply button writes to.\n"
+            "All panes  — writes to the global state; every pane sees it.\n"
+            "Current tab — only panes in the visible tab.\n"
+            "Active pane — only the pane you last clicked."
+        )
+        target_lay.addWidget(target_lbl)
+        self.apply_target_combo = QtWidgets.QComboBox()
+        self.apply_target_combo.addItem("All panes", "all")
+        self.apply_target_combo.addItem("Current tab", "tab")
+        self.apply_target_combo.addItem("Active pane", "pane")
+        target_lay.addWidget(self.apply_target_combo, 1)
+        outer.addWidget(target_box)
+
         # ── Field group ───────────────────────────────────────────────────
         field_box = QtWidgets.QGroupBox("Field")
         field_form = QtWidgets.QFormLayout(field_box)
@@ -1169,21 +1199,111 @@ class DisplaySection(_SectionBase):
             show_background=values.show_background,
         )
 
+    # ── Apply target plumbing ─────────────────────────────────────────────
+
+    def _resolve_apply_target(self) -> str:
+        """Return the active "Apply to" target string."""
+        try:
+            return str(self.apply_target_combo.currentData() or "all")
+        except Exception:
+            return "all"
+
+    def _target_panes(self) -> list:
+        """Resolve the current "Apply to" selection to a list of ViewPanes.
+
+        Returns an empty list for the ``"all"`` target — that path stays
+        on the global session.apply_display_settings codepath unchanged.
+        """
+        target = self._resolve_apply_target()
+        if target == "all":
+            return []
+        window = self.window()
+        multi = getattr(window, "multi_view", None) if window is not None else None
+        if multi is None:
+            return []
+        if target == "tab":
+            current = getattr(multi, "current", None) or multi
+            return list(getattr(current, "_panes", []) or [])
+        # "pane"
+        pane = getattr(multi, "active_pane", None)
+        return [pane] if pane is not None else []
+
     # ── Single atomic apply ───────────────────────────────────────────────
 
     def _apply(self):
         if self._syncing:
             return
-        self.session.apply_display_settings(
-            demand=str(self.demand_combo.currentData()),
-            component=str(self.component_combo.currentData()),
-            gf_subfault_id=self.gf_subfault_spin.value(),
-            colormap=self.cmap_combo.currentText(),
-            vmin=self.vmin_spin.value(),
-            vmax=self.vmax_spin.value(),
-            clamp_enabled=self.clamp_cb.isChecked(),
-        )
+        target = self._resolve_apply_target()
+        cmap_value = self.cmap_combo.currentText()
+        vmin = self.vmin_spin.value()
+        vmax = self.vmax_spin.value()
+        clamp = self.clamp_cb.isChecked()
+        demand = str(self.demand_combo.currentData())
+        component = str(self.component_combo.currentData())
+        gf_subfault = self.gf_subfault_spin.value()
+
+        if target == "all":
+            # Global path — also drop every per-pane override for these
+            # attributes so the global value is what every pane actually
+            # shows after this Apply.
+            window = self.window()
+            multi = getattr(window, "multi_view", None) if window is not None else None
+            if multi is not None:
+                for pane in self._iter_all_panes(multi):
+                    pane_state = getattr(pane, "pane_state", None)
+                    if pane_state is not None:
+                        pane_state.clear_overrides(
+                            ("colormap", "user_vmin", "user_vmax",
+                             "clamp_enabled", "component")
+                        )
+            self.session.apply_display_settings(
+                demand=demand,
+                component=component,
+                gf_subfault_id=gf_subfault,
+                colormap=cmap_value,
+                vmin=vmin,
+                vmax=vmax,
+                clamp_enabled=clamp,
+            )
+            self._clear_dirty()
+            return
+
+        # Per-pane / per-tab path: write to each pane's overlay.
+        panes = self._target_panes()
+        if not panes:
+            self._clear_dirty()
+            return
+        for pane in panes:
+            pane_state = getattr(pane, "pane_state", None)
+            if pane_state is None:
+                continue
+            pane_state.colormap = cmap_value
+            pane_state.user_vmin = vmin
+            pane_state.user_vmax = vmax
+            pane_state.clamp_enabled = clamp
+            pane_state.component = component
+            # Force this pane to re-render with the new overlay.
+            scene = getattr(pane, "scene", None)
+            if scene is not None:
+                try:
+                    scene.rebuild_scalar_actor(render=False)
+                    pane.plotter.render()
+                except Exception:
+                    pass
         self._clear_dirty()
+
+    @staticmethod
+    def _iter_all_panes(multi):
+        """Yield every pane across every tab of *multi* (tabbed or not)."""
+        tabs = getattr(multi, "_tabs", None)
+        if tabs is None:
+            for pane in getattr(multi, "_panes", []) or []:
+                yield pane
+            return
+        for i in range(tabs.count()):
+            area = tabs.widget(i)
+            for pane in getattr(area, "_panes", []) or []:
+                yield pane
 
     def _on_demand_changed(self):
         if self._syncing:

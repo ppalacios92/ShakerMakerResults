@@ -1235,6 +1235,21 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
         self._tabs.setTabsClosable(self._tabs.count() > 1)
 
     def _on_tab_changed(self, _index: int) -> None:
+        # Flush any reasons this tab missed while it was in the background.
+        # Combining them into a single broadcast keeps the wake-up cheap:
+        # ``rebuild_scalar_actor`` already handles every reason that touches
+        # the field / color map / warp; we send each accumulated reason in
+        # sequence and let the scene de-duplicate redundant work.
+        new_area = self.current
+        if isinstance(new_area, MultiViewArea):
+            pending = getattr(new_area, "_pending_reasons", None)
+            if pending:
+                for reason in list(pending):
+                    try:
+                        new_area.on_session_updated(reason)
+                    except Exception:
+                        pass
+                pending.clear()
         self._proxy_active_pane_changed(self.active_pane)
 
     def _proxy_active_pane_changed(self, pane) -> None:
@@ -1300,14 +1315,31 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
             c.set_camera_apply_to_all(enabled)
 
     def on_session_updated(self, reason: str) -> None:
-        """Broadcast *reason* to every tab so background tabs stay in sync."""
+        """Broadcast *reason* to the active tab; defer hidden tabs.
+
+        Each hidden tab accumulates the set of reasons it missed in a
+        local ``_pending_reasons`` set; when the user switches to that
+        tab :meth:`_on_tab_changed` flushes the union and the tab
+        catches up in a single rebuild.  This keeps a 3-tab session
+        with 4 panes each from triggering 12 renders on every cmap
+        change — only the 4 visible panes work.
+        """
+        current = self.current
         for i in range(self._tabs.count()):
             area = self._tabs.widget(i)
-            if isinstance(area, MultiViewArea):
+            if not isinstance(area, MultiViewArea):
+                continue
+            if area is current:
                 try:
                     area.on_session_updated(reason)
                 except Exception:
                     pass
+            else:
+                pending = getattr(area, "_pending_reasons", None)
+                if pending is None:
+                    pending = set()
+                    area._pending_reasons = pending
+                pending.add(reason)
 
     def dispose(self) -> None:
         while self._tabs.count() > 0:
