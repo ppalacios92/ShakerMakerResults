@@ -45,14 +45,7 @@ class InformationPanel(QtWidgets.QWidget):
         layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
 
         self._labels: dict[str, QtWidgets.QLabel] = {}
-        palette = active_palette()
-        label_style = (
-            f"color: {palette.text_muted}; font-size: 11px; font-weight: 600;"
-        )
-        value_style = (
-            f"color: {palette.text}; font-size: 11px; "
-            f'font-family: Consolas, "SF Mono", "Cascadia Mono", monospace;'
-        )
+        self._name_labels: list[QtWidgets.QLabel] = []
 
         rows = (
             ("type",         "Type"),
@@ -68,15 +61,17 @@ class InformationPanel(QtWidgets.QWidget):
         )
         for key, label in rows:
             name_lbl = QtWidgets.QLabel(label)
-            name_lbl.setStyleSheet(label_style)
             value_lbl = QtWidgets.QLabel("—")
-            value_lbl.setStyleSheet(value_style)
             value_lbl.setWordWrap(True)
             value_lbl.setTextInteractionFlags(
                 QtCore.Qt.TextSelectableByMouse | QtCore.Qt.TextSelectableByKeyboard
             )
             self._labels[key] = value_lbl
+            self._name_labels.append(name_lbl)
             layout.addRow(name_lbl, value_lbl)
+        # Apply colours after the labels exist so a theme switch can
+        # re-tint them in one place.
+        self._apply_label_styles()
 
         layout.addItem(QtWidgets.QSpacerItem(
             10, 10, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding
@@ -85,11 +80,33 @@ class InformationPanel(QtWidgets.QWidget):
 
     # ── Refresh ─────────────────────────────────────────────────────────────
 
+    def _apply_label_styles(self) -> None:
+        """(Re)apply label colours from the active palette.
+
+        Called from :meth:`__init__` and again from :meth:`refresh` on a
+        ``"full"`` reason so a runtime theme switch retints every row.
+        """
+        palette = active_palette()
+        label_style = (
+            f"color: {palette.text_muted}; font-size: 11px; font-weight: 600;"
+        )
+        value_style = (
+            f"color: {palette.text}; font-size: 11px; "
+            f'font-family: Consolas, "SF Mono", "Cascadia Mono", monospace;'
+        )
+        for lbl in self._name_labels:
+            lbl.setStyleSheet(label_style)
+        for lbl in self._labels.values():
+            lbl.setStyleSheet(value_style)
+
     def refresh(self, reason: str = "full") -> None:
         if reason == "time":
             # Just update the time field — cheap, runs every playback tick.
             self._labels["time"].setText(self._time_text())
             return
+        if reason == "full":
+            # Theme might have changed — retint the rows.
+            self._apply_label_styles()
         try:
             self._labels["type"].setText(self._type_text())
             self._labels["source"].setText(self._source_text())

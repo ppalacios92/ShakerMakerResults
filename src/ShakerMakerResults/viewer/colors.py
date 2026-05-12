@@ -9,7 +9,9 @@ import numpy as np
 BACKGROUND_PRESETS = {
     "White": "#ffffff",
     "Gray": "#d7d9dd",
-    "Dark": "#1f2430",
+    # Warm charcoal — matches the "hueso" dark theme so the renderer
+    # background reads consistently with the rest of the UI in dark mode.
+    "Dark": "#2a2724",
 }
 
 COLORMAP_OPTIONS = (

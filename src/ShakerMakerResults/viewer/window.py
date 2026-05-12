@@ -132,6 +132,19 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._current_theme = saved_theme_name()
         self.setStyleSheet(build_stylesheet(palette_by_name(self._current_theme)))
 
+        # Sync the renderer background with the persisted theme on startup
+        # so a dark-themed window doesn't open with a bright white viewport.
+        # Only adjust when the current preset is theme-tied (White / Dark)
+        # — keep "Gray" or anything else as the user left it.
+        try:
+            current_bg = getattr(session.state, "background", "White")
+            if current_bg in ("White", "Dark"):
+                session.state.set_background(
+                    "Dark" if self._current_theme == "dark" else "White"
+                )
+        except Exception:
+            pass
+
         # ── Central area: header + tabbed multi-view + transport ─────────────
         central = QtWidgets.QWidget()
         central.setObjectName("ViewerCentral")
@@ -396,17 +409,37 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Theme switching ─────────────────────────────────────────────────────
 
     def set_theme(self, name: str) -> None:
-        """Apply *name* (``"light"`` or ``"dark"``) to the entire UI."""
+        """Apply *name* (``"light"`` or ``"dark"``) to the entire UI.
+
+        The renderer background is also flipped so the 3-D viewport never
+        stays bright white inside a dark window (or pitch-charcoal inside
+        a light window).  Side-panel sections that style themselves through
+        the palette at construction time get a fresh ``"full"`` refresh so
+        their hard-coded label colours pick up the new theme.
+        """
         name = str(name).lower()
         save_theme_name(name)
         self._current_theme = name
         palette = palette_by_name(name)
         self.setStyleSheet(build_stylesheet(palette))
+
         # Widget-owned colours that bypass the stylesheet.
         try:
             self.multi_view.refresh_theme()
         except Exception:
             pass
+
+        # Renderer background follows the theme.  Only override when the
+        # current background is one of the "theme-tied" presets (White / Dark)
+        # — leave a custom "Gray" alone so the user's explicit pick is
+        # respected.
+        try:
+            current_bg = getattr(self.session.state, "background", "White")
+            if current_bg in ("White", "Dark"):
+                self.session.set_background("Dark" if name == "dark" else "White")
+        except Exception:
+            pass
+
         # Pipeline browser repaints its icons against the new palette.
         try:
             pipe = self._docks.get("pipeline")
@@ -414,12 +447,25 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                 pipe.refresh("full")
         except Exception:
             pass
+
+        # Side panels that bake palette colours into setStyleSheet at
+        # construction time (Information, Appearance) need a "full" refresh
+        # so they read the new active_palette() values.
+        for key, page in self._side_pages.items():
+            if not hasattr(page, "refresh"):
+                continue
+            try:
+                page.refresh("full")
+            except Exception:
+                pass
+
         for n, act in getattr(self, "_theme_actions", {}).items():
             block = act.blockSignals(True)
             act.setChecked(n == name)
             act.blockSignals(block)
+
         # 3-D viewports — rebroadcast so scalar-bar / branding pick up the
-        # new luminance-aware foreground colour.
+        # new luminance-aware foreground colour and the new background.
         try:
             self.multi_view.on_session_updated("appearance")
         except Exception:
