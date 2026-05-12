@@ -11,11 +11,26 @@ pv, _, vtk, _, _, _ = require_viewer_dependencies()
 
 
 class ViewerScene:
-    """Build and refresh the 3D PyVista representation."""
+    """Build and refresh the 3D PyVista representation.
 
-    def __init__(self, plotter, session):
+    Every visual attribute read goes through ``self.state`` — a
+    :class:`PaneDisplayState` that defaults to the session's global
+    state but transparently swaps in per-pane overrides when the user
+    has applied Display settings to this pane only.  The session is
+    kept around for data access (``session.adapter``), selection
+    mutation (``session.select_node`` …) and the few helper methods
+    that compute against state (``current_color_limits`` and friends —
+    those accept an optional ``state=`` keyword which we pass through).
+    """
+
+    def __init__(self, plotter, session, pane_state=None):
         self.plotter = plotter
         self.session = session
+        # ``state`` is the per-pane overlay (with fall-through to
+        # session.state for non-overridden attributes).  Falling back to
+        # session.state when ``pane_state`` is None keeps the legacy
+        # signature working for any caller that has not yet been updated.
+        self.state = pane_state if pane_state is not None else session.state
         self.point_cloud = None
         self.point_actor = None
         self._point_actor_rgb = False
@@ -85,28 +100,28 @@ class ViewerScene:
             self.session.current_static_color_by() is None
             and
             self._gf_component_pin is not None
-            and self.session.state.demand == GF_DEMAND
+            and self.state.demand == GF_DEMAND
         )
 
     def _scalars_for_gf_pin(self):
         """Compute visible scalars using the pinned GF component (no I/O when warm)."""
         comp = self._gf_component_pin
-        demand = self.session.state.demand
+        demand = self.state.demand
         sf = int(getattr(self.session, "_display_gf_subfault", 0))
         raw = self.session.adapter.scalar_snapshot(
-            self.session.state.time_index, demand, comp, subfault_id=sf
+            self.state.time_index, demand, comp, subfault_id=sf
         )
         return self.session.adapter.visible_scalars(
             raw,
-            show_internal=self.session.state.show_internal,
-            show_external=self.session.state.show_external,
-            show_qa=self.session.state.show_qa,
+            show_internal=self.state.show_internal,
+            show_external=self.state.show_external,
+            show_qa=self.state.show_qa,
         )
 
     def _color_limits_for_gf_pin(self, scalars=None) -> tuple:
         """Color limits for the pinned GF component."""
         comp = self._gf_component_pin
-        state = self.session.state
+        state = self.state
         if state.clamp_enabled and state.user_vmin is not None and state.user_vmax is not None:
             vmin = float(state.user_vmin)
             vmax = float(state.user_vmax)
@@ -114,7 +129,7 @@ class ViewerScene:
         sf = int(getattr(self.session, "_display_gf_subfault", 0))
         try:
             return self.session.adapter.default_scalar_limits(
-                self.session.state.demand, comp, subfault_id=sf
+                self.state.demand, comp, subfault_id=sf
             )
         except Exception:
             pass
@@ -133,7 +148,7 @@ class ViewerScene:
 
     def build(self, *, lightweight: bool = False):
         self._rebuild_point_cloud(lightweight=lightweight)
-        self.plotter.set_background(self.session.current_background_color())
+        self.plotter.set_background(self.session.current_background_color(state=self.state))
         self.point_actor = self._add_point_actor()
         self.plotter.add_axes()
         self._sync_axes_grid()
@@ -165,13 +180,13 @@ class ViewerScene:
         if self.point_actor is not None:
             # Skip color-range recalculation during playback; the range was
             # fixed when the actor was built, so every frame is free.
-            if not self.session.state.is_playing:
+            if not self.state.is_playing:
                 if self._gf_pin_active():
                     self.point_actor.mapper.scalar_range = self._color_limits_for_gf_pin(scalars)
                 else:
-                    self.point_actor.mapper.scalar_range = self.session.current_color_limits(scalars)
+                    self.point_actor.mapper.scalar_range = self.session.current_color_limits(scalars, state=self.state)
         # Update point geometry for warp mode; pure NumPy when cache is warm.
-        if self.session.state.disp_warp_enabled:
+        if self.state.disp_warp_enabled:
             self.refresh_geometry(render=False)
         if render:
             self.plotter.render()
@@ -183,7 +198,7 @@ class ViewerScene:
         O(N) NumPy arithmetic with no I/O when the displacement series is
         pre-warmed in the cache.
         """
-        if not self.session.state.disp_warp_enabled:
+        if not self.state.disp_warp_enabled:
             if render:
                 self.plotter.render()
             return
@@ -208,8 +223,8 @@ class ViewerScene:
                 pass
             self.ghost_actor = None
         if not (
-            self.session.state.ghost_warp_reference
-            and self.session.state.disp_warp_enabled
+            self.state.ghost_warp_reference
+            and self.state.disp_warp_enabled
         ):
             if render:
                 self.plotter.render()
@@ -254,7 +269,7 @@ class ViewerScene:
         if self.point_actor is not None:
             self.plotter.remove_actor(self.point_actor, render=False)
         self.point_actor = self._add_point_actor()
-        if self.session.state.vector_field_enabled:
+        if self.state.vector_field_enabled:
             self.refresh_vector_field(render=False)
         # Branding doubles as the in-scene HUD (field / range / warp);
         # rebuild it so a demand-or-warp switch reflects in the corner
@@ -276,7 +291,7 @@ class ViewerScene:
             self.plotter.remove_actor(self.selection_actor, render=False)
             self.selection_actor = None
 
-        node_id = self.session.state.selected_node
+        node_id = self.state.selected_node
         if node_id is None or not self._domain_contains(node_id):
             if render:
                 self.plotter.render()
@@ -313,7 +328,7 @@ class ViewerScene:
                 pass
             self.multi_selection_label_actor = None
 
-        state = self.session.state
+        state = self.state
         if not state.multi_selection:
             if render:
                 self.plotter.render()
@@ -390,7 +405,7 @@ class ViewerScene:
         """Build a live all-lines overlay: shaft + V-tip, coloured by magnitude."""
         self._teardown_vector_pipeline()
 
-        if not self.session.state.vector_field_enabled:
+        if not self.state.vector_field_enabled:
             if render:
                 self.plotter.render()
             return
@@ -422,7 +437,7 @@ class ViewerScene:
             domain_diag = max((dx**2 + dy**2 + dz**2) ** 0.5, 1.0)
             n = max(len(points), 1)
             factor = (
-                self.session.state.vector_field_scale
+                self.state.vector_field_scale
                 * domain_diag
                 * 0.05
                 / (n ** 0.33 * max_mag)
@@ -431,7 +446,7 @@ class ViewerScene:
             self._vec_N = len(points)
             self._vec_max_mag = max_mag
 
-            lut = self._build_vec_lut(self.session.state.vector_field_colormap, max_mag)
+            lut = self._build_vec_lut(self.state.vector_field_colormap, max_mag)
             all_pts, lines, scalars = self._build_vec_geometry(
                 points, vectors, magnitudes, factor
             )
@@ -574,7 +589,7 @@ class ViewerScene:
         if self.point_actor is not None:
             try:
                 self.point_actor.GetProperty().SetOpacity(
-                    self.session.state.node_opacity
+                    self.state.node_opacity
                 )
             except Exception:
                 pass
@@ -727,8 +742,8 @@ class ViewerScene:
             self.plotter.render()
 
     def _current_selection_ids(self) -> set:
-        selected = set(self.session.state.multi_selection)
-        node_id = self.session.state.selected_node
+        selected = set(self.state.multi_selection)
+        node_id = self.state.selected_node
         if node_id is not None:
             selected.add(node_id)
         return selected
@@ -776,7 +791,7 @@ class ViewerScene:
         self.center_on_node(node_id)
 
     def apply_appearance(self, render: bool = True):
-        self.plotter.set_background(self.session.current_background_color())
+        self.plotter.set_background(self.session.current_background_color(state=self.state))
         # VTK text actors bake their colour at creation time — the branding
         # block and the GF component label keep their *original* foreground
         # colour even after the renderer background changes.  Re-create the
@@ -813,7 +828,7 @@ class ViewerScene:
         else:
             scalars = self.session.current_visible_scalars()
         if self.point_actor is not None:
-            self.point_actor.mapper.scalar_range = self.session.current_color_limits(scalars)
+            self.point_actor.mapper.scalar_range = self.session.current_color_limits(scalars, state=self.state)
         if render:
             self.plotter.render()
 
@@ -844,9 +859,9 @@ class ViewerScene:
         if lightweight:
             scalars = self.session.adapter.visible_scalars(
                 self.session.adapter.elevation_snapshot(),
-                show_internal=self.session.state.show_internal,
-                show_external=self.session.state.show_external,
-                show_qa=self.session.state.show_qa,
+                show_internal=self.state.show_internal,
+                show_external=self.state.show_external,
+                show_qa=self.state.show_qa,
             )
         elif self._gf_pin_active():
             scalars = self._scalars_for_gf_pin()
@@ -874,7 +889,7 @@ class ViewerScene:
             clim = self._color_limits_for_gf_pin(scalars)
             bar_title = str(self._gf_component_pin).upper()   # e.g. "G11"
         else:
-            clim = self.session.current_color_limits(scalars)
+            clim = self.session.current_color_limits(scalars, state=self.state)
             bar_title = self._scalar_bar_title()
         # PyVista keeps every scalar bar it has ever added in a per-plotter
         # registry keyed by title.  Calling ``.clear()`` only empties the
@@ -912,48 +927,48 @@ class ViewerScene:
             kwargs["rgb"] = True
             kwargs["show_scalar_bar"] = False
         else:
-            kwargs["cmap"] = self.session.current_colormap()
+            kwargs["cmap"] = self.session.current_colormap(state=self.state)
             kwargs["clim"] = clim
             kwargs["n_colors"] = (
-                self.session.state.colormap_bins
-                if self.session.state.colormap_discrete
+                self.state.colormap_bins
+                if self.state.colormap_discrete
                 else 256
             )
-            kwargs["nan_color"] = self.session.state.nan_color
-            if self.session.state.use_below_range_color:
-                kwargs["below_color"] = self.session.state.below_range_color
-            if self.session.state.use_above_range_color:
-                kwargs["above_color"] = self.session.state.above_range_color
-            kwargs["show_scalar_bar"] = self.session.state.show_scalar_bar
+            kwargs["nan_color"] = self.state.nan_color
+            if self.state.use_below_range_color:
+                kwargs["below_color"] = self.state.below_range_color
+            if self.state.use_above_range_color:
+                kwargs["above_color"] = self.state.above_range_color
+            kwargs["show_scalar_bar"] = self.state.show_scalar_bar
             # Build the scalar-bar configuration from the user-controllable
             # state (position, orientation, fonts, outline …) and inject
             # sane defaults (numeric format, no shadow, theme-aware text
             # colour) so the bar reads against both light and dark scenes.
             scalar_bar_args = {
                 "title": bar_title,
-                "title_font_size": self.session.state.legend_title_font_size,
-                "label_font_size": self.session.state.legend_label_font_size,
-                "n_labels": self.session.state.legend_label_count,
-                "vertical": self.session.state.legend_orientation == "vertical",
-                "outline": self.session.state.legend_show_outline,
+                "title_font_size": self.state.legend_title_font_size,
+                "label_font_size": self.state.legend_label_font_size,
+                "n_labels": self.state.legend_label_count,
+                "vertical": self.state.legend_orientation == "vertical",
+                "outline": self.state.legend_show_outline,
                 "fmt": "%.3g",
                 "shadow": False,
                 "italic": False,
                 "color": self._foreground_color(),
             }
-            if self.session.state.legend_position == "left":
+            if self.state.legend_position == "left":
                 scalar_bar_args.update({"position_x": 0.03, "position_y": 0.18})
-            elif self.session.state.legend_position == "top":
+            elif self.state.legend_position == "top":
                 scalar_bar_args.update({"position_x": 0.28, "position_y": 0.88})
-            elif self.session.state.legend_position == "bottom":
+            elif self.state.legend_position == "bottom":
                 scalar_bar_args.update({"position_x": 0.28, "position_y": 0.04})
             else:
                 scalar_bar_args.update({"position_x": 0.86, "position_y": 0.18})
-            if self.session.state.legend_orientation == "horizontal":
+            if self.state.legend_orientation == "horizontal":
                 scalar_bar_args.update({"width": 0.42, "height": 0.08})
             else:
                 scalar_bar_args.update({"width": 0.08, "height": 0.56})
-            if self.session.state.legend_show_background:
+            if self.state.legend_show_background:
                 # Use a colour that contrasts with the renderer background
                 # without being pure white in dark mode (which used to leave
                 # a glaring white box around the colormap).  Light bg → off
@@ -965,16 +980,16 @@ class ViewerScene:
         actor = self.plotter.add_points(self.point_cloud, **kwargs)
         self._point_actor_rgb = rgb_scalars
         try:
-            actor.GetProperty().SetOpacity(self.session.state.node_opacity)
+            actor.GetProperty().SetOpacity(self.state.node_opacity)
         except Exception:
             pass
         return actor
 
     def _sync_axes_grid(self):
         try:
-            if self.session.state.show_axes_grid:
+            if self.state.show_axes_grid:
                 self.plotter.show_grid(
-                    color=self.session.state.axes_grid_color,
+                    color=self.state.axes_grid_color,
                     render=False,
                 )
             else:
@@ -987,8 +1002,8 @@ class ViewerScene:
         return getattr(scalars, "ndim", 1) == 2 and scalars.shape[1] in (3, 4)
 
     def _scalar_bar_title(self) -> str:
-        title = self.session.current_scalar_bar_title()
-        state = self.session.state
+        title = self.session.current_scalar_bar_title(state=self.state)
+        state = self.state
         if not state.disp_warp_enabled:
             return title
         components = [
@@ -1031,7 +1046,7 @@ class ViewerScene:
         to ``Help → About`` (paper / poster captures stay clean).
         """
         project_name = self.session.adapter.summary().name or "model"
-        state = self.session.state
+        state = self.state
         demand = state.demand or "—"
         component = state.component or "—"
         try:
@@ -1089,7 +1104,7 @@ class ViewerScene:
         except Exception:
             rgb = None
         if rgb is None:
-            bg_name = getattr(self.session.state, "background", "White")
+            bg_name = getattr(self.state, "background", "White")
             rgb = _hex_to_rgb(BACKGROUND_PRESETS.get(bg_name, "#ffffff"))
 
         # Rec. 709 luminance.  Dark renderer background → bone-tinted text

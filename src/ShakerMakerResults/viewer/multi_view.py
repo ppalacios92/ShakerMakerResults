@@ -199,6 +199,14 @@ class ViewPane(QtWidgets.QWidget):
         self._show_station_tags = True
         self._label = str(label)
 
+        # Per-pane visual override layer.  Reads fall through to the
+        # session global state when no override is set, so a brand-new
+        # pane renders exactly like every other pane until the user hits
+        # "Apply to active pane" on the Display dock and writes a per-
+        # pane override.
+        from .pane_state import PaneDisplayState
+        self.pane_state = PaneDisplayState(session)
+
         self.setMinimumSize(80, 80)
 
         outer = QtWidgets.QVBoxLayout(self)
@@ -210,7 +218,7 @@ class ViewPane(QtWidgets.QWidget):
         outer.addWidget(self.plotter.interactor, 1)
 
         # ── Scene ────────────────────────────────────────────────────────────
-        self.scene = ViewerScene(self.plotter, session)
+        self.scene = ViewerScene(self.plotter, session, pane_state=self.pane_state)
         try:
             self.scene.build(lightweight=True)
             self.scene.set_station_tags_visible(self._show_station_tags, render=False)

@@ -1096,21 +1096,31 @@ class ViewerSession:
             inverted=self.state.colormap_inverted,
         )
 
-    def current_color_limits(self, scalars=None) -> tuple[float, float]:
+    def current_color_limits(self, scalars=None, *, state=None) -> tuple[float, float]:
+        """Return the active color range.
+
+        ``state`` is an optional :class:`PaneDisplayState` (or anything
+        with the same attribute names) used to resolve display-only
+        attributes — when ``None`` we fall back to the global
+        :data:`self.state`.  Callers from a per-pane scene pass their
+        pane's overlay so panes with their own ``user_vmin`` / colormap
+        inversion / percentile clip still get sane limits.
+        """
+        st = state if state is not None else self.state
         if self.current_wave_blend_active():
             return self._current_wave_color_limits(None)
         if self._static_color_by is not None:
             return self.current_static_color_limits(scalars)
-        if self.state.clamp_enabled and self.state.user_vmin is not None and self.state.user_vmax is not None:
-            vmin = float(self.state.user_vmin)
-            vmax = float(self.state.user_vmax)
+        if st.clamp_enabled and st.user_vmin is not None and st.user_vmax is not None:
+            vmin = float(st.user_vmin)
+            vmax = float(st.user_vmax)
             if vmax <= vmin:
                 return vmin, vmin + 1.0
             return vmin, vmax
         if scalars is None:
             try:
                 lo, hi = self.default_color_limits()
-                if self.state.symmetric_color_range:
+                if st.symmetric_color_range:
                     vmax = max(abs(float(lo)), abs(float(hi)))
                     return -vmax, vmax
                 return lo, hi
@@ -1121,14 +1131,14 @@ class ViewerSession:
 
             arr = np.asarray(scalars, dtype=float)
             arr = arr[np.isfinite(arr)]
-            if arr.size and self.state.percentile_clip > 0.0:
-                lo = float(np.percentile(arr, self.state.percentile_clip))
-                hi = float(np.percentile(arr, 100.0 - self.state.percentile_clip))
+            if arr.size and st.percentile_clip > 0.0:
+                lo = float(np.percentile(arr, st.percentile_clip))
+                hi = float(np.percentile(arr, 100.0 - st.percentile_clip))
             else:
-                lo, hi = scalar_limits(arr, self.state.component)
+                lo, hi = scalar_limits(arr, st.component)
         except Exception:
-            lo, hi = scalar_limits(scalars, self.state.component)
-        if self.state.symmetric_color_range:
+            lo, hi = scalar_limits(scalars, st.component)
+        if st.symmetric_color_range:
             vmax = max(abs(float(lo)), abs(float(hi)))
             return -vmax, vmax
         return lo, hi
@@ -1250,20 +1260,22 @@ class ViewerSession:
             return 0.0
         return float(self.adapter.time[self.state.time_index])
 
-    def current_background_color(self) -> str:
-        return BACKGROUND_PRESETS[self.state.background]
+    def current_background_color(self, *, state=None) -> str:
+        st = state if state is not None else self.state
+        return BACKGROUND_PRESETS[st.background]
 
-    def current_colormap(self) -> str:
+    def current_colormap(self, *, state=None) -> str:
+        st = state if state is not None else self.state
         if self.current_wave_blend_active():
             return self._current_wave_colormap()
         if self._static_color_by is not None:
             return effective_colormap_name(
                 self._static_color_map,
-                inverted=self.state.colormap_inverted,
+                inverted=st.colormap_inverted,
             )
         return effective_colormap_name(
-            self.state.colormap or colormap_for_component(self.state.component),
-            inverted=self.state.colormap_inverted,
+            st.colormap or colormap_for_component(st.component),
+            inverted=st.colormap_inverted,
         )
 
     def current_static_color_by(self) -> str | None:
@@ -1288,11 +1300,12 @@ class ViewerSession:
             "n_jobs": self._newmark_static_n_jobs,
         }
 
-    def current_scalar_bar_title(self) -> str:
-        if self.state.legend_title_override:
-            return self.state.legend_title_override
+    def current_scalar_bar_title(self, *, state=None) -> str:
+        st = state if state is not None else self.state
+        if st.legend_title_override:
+            return st.legend_title_override
         if self.current_wave_blend_active():
-            return f"{self.state.demand}/{self.state.component}"
+            return f"{st.demand}/{st.component}"
         if self._static_color_by == "elevation_z":
             return "Elevation Z [m]"
         if self._static_color_by == "newmark_sa":
@@ -1303,7 +1316,7 @@ class ViewerSession:
             )
         if self._static_color_by == "arias":
             return f"Arias {self._newmark_static_data_type}/{self._newmark_static_component}"
-        return f"{self.state.demand}/{self.state.component}"
+        return f"{st.demand}/{st.component}"
 
     def suggested_point_size(self) -> float:
         if self.state.point_size is not None:
