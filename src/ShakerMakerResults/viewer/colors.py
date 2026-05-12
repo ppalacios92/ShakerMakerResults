@@ -58,3 +58,17 @@ def scalars_to_rgb(values: np.ndarray, cmap_name: str, vmin: float, vmax: float)
     norm = np.clip(norm, 0.0, 1.0)
     rgba = _matplotlib_cmap(str(cmap_name))(norm)
     return (rgba[:, :3] * 255.0).astype(np.uint8, copy=False)
+
+
+@lru_cache(maxsize=64)
+def colormap_strip_bytes(name: str, width: int = 160, height: int = 14) -> bytes:
+    """Return raw RGBA bytes for a horizontal 0→1 strip of *name*.
+
+    The result is cached so the colormap preview widget can rebuild its
+    pixmap quickly on every paint.
+    """
+    cmap = _matplotlib_cmap(str(name))
+    gradient = np.linspace(0.0, 1.0, max(int(width), 2), dtype=np.float32)
+    row = (cmap(gradient)[:, :4] * 255.0).astype(np.uint8, copy=False)
+    img = np.broadcast_to(row[None, :, :], (max(int(height), 1), row.shape[0], 4))
+    return np.ascontiguousarray(img).tobytes()

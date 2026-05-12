@@ -67,8 +67,8 @@ class ViewerScene:
                 self._gf_label_actor = self.plotter.add_text(
                     label,
                     position="upper_right",
-                    font_size=7,
-                    color="#1565C0",
+                    font_size=9,
+                    color=self._foreground_color(),
                     render=False,
                 )
             except Exception:
@@ -780,10 +780,23 @@ class ViewerScene:
             kwargs["cmap"] = self.session.current_colormap()
             kwargs["clim"] = clim
             kwargs["show_scalar_bar"] = self.session.state.show_scalar_bar
+            # Anchor the bar to the bottom-left as a thin horizontal strip so
+            # it never overlaps the upper-left branding block, the upper-right
+            # GF label, or the orientation axes widget at bottom-right.
             kwargs["scalar_bar_args"] = {
                 "title": bar_title,
-                "title_font_size": 12,
-                "label_font_size": 11,
+                "title_font_size": 11,
+                "label_font_size": 10,
+                "n_labels": 5,
+                "fmt": "%.3g",
+                "vertical": False,
+                "position_x": 0.04,
+                "position_y": 0.04,
+                "width": 0.45,
+                "height": 0.045,
+                "shadow": False,
+                "italic": False,
+                "color": self._foreground_color(),
             }
         actor = self.plotter.add_points(self.point_cloud, **kwargs)
         self._point_actor_rgb = rgb_scalars
@@ -844,13 +857,54 @@ class ViewerScene:
                 "\n".join(lines),
                 position="upper_left",
                 font_size=7,
-                color="#555555",
+                color=self._foreground_color(secondary=True),
                 shadow=False,
                 name="branding",
                 render=False,
             )
         except Exception:
             pass
+
+    def _foreground_color(self, *, secondary: bool = False) -> str:
+        """Return a text color that reads against the active renderer background.
+
+        Uses the perceived luminance of the plotter's clear color (or the
+        background named in the session state when the plotter cannot report
+        its color) to pick light text on dark scenes and vice-versa.  The
+        ``secondary`` flag dims the result so the branding text never competes
+        with the scalar bar labels for visual weight.
+        """
+
+        from .colors import BACKGROUND_PRESETS
+
+        def _hex_to_rgb(value: str) -> tuple[float, float, float]:
+            value = value.lstrip("#")
+            if len(value) == 3:
+                value = "".join(ch * 2 for ch in value)
+            if len(value) != 6:
+                return 1.0, 1.0, 1.0
+            return (
+                int(value[0:2], 16) / 255.0,
+                int(value[2:4], 16) / 255.0,
+                int(value[4:6], 16) / 255.0,
+            )
+
+        rgb: tuple[float, float, float] | None = None
+        try:
+            renderer = getattr(self.plotter, "renderer", None)
+            if renderer is not None and hasattr(renderer, "GetBackground"):
+                rgb = tuple(float(c) for c in renderer.GetBackground())  # type: ignore[assignment]
+        except Exception:
+            rgb = None
+        if rgb is None:
+            bg_name = getattr(self.session.state, "background", "White")
+            rgb = _hex_to_rgb(BACKGROUND_PRESETS.get(bg_name, "#ffffff"))
+
+        # Rec. 709 luminance.
+        luminance = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+        if luminance < 0.45:
+            return "#9aa4b1" if secondary else "#e7ebf2"
+        return "#555555" if secondary else "#172033"
 
 
     def _vtk_interactor(self):
