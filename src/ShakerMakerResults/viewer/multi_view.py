@@ -446,13 +446,15 @@ class MultiViewArea(QtWidgets.QWidget):
         self._layout_bar = bar
 
         # ── Content area ──────────────────────────────────────────────────────
+        # The vertical CameraViewRail used to live here.  As of the ParaView-
+        # style refactor those 10 preset buttons moved up to the top
+        # ``ViewPresetsToolBar``, so the rail is gone — every pixel of the
+        # body width now belongs to the 3-D content stack.
+        self._view_rail = None
         body = QtWidgets.QWidget()
         body_lay = QtWidgets.QHBoxLayout(body)
         body_lay.setContentsMargins(0, 0, 0, 0)
         body_lay.setSpacing(0)
-
-        self._view_rail = CameraViewRail(self._apply_camera_preset, self)
-        body_lay.addWidget(self._view_rail)
 
         # Stack holds two pages: the splitter grid and the maximised slot.
         self._content_stack = QtWidgets.QStackedWidget()
@@ -487,10 +489,8 @@ class MultiViewArea(QtWidgets.QWidget):
         self._refresh_layout_button_styles()
         for frame in list(self._frames.values()):
             frame.refresh_theme()
-        try:
-            self._view_rail.refresh_theme()
-        except Exception:
-            pass
+        # _view_rail is None now that the rail moved to the top toolbar — keep
+        # the attribute for backwards compatibility but skip the refresh.
 
     def _refresh_layout_button_styles(self) -> None:
         palette = active_palette()

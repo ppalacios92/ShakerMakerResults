@@ -46,24 +46,27 @@ class ViewerPalette:
 
 LIGHT_PALETTE = ViewerPalette()
 
+#: Warm-charcoal background + bone text + warm-gold accent.
+#: Hand-tuned to avoid the clinical pure-black + cold-blue palette common in
+#: IDE darks; reads well in long sessions on calibrated displays.
 DARK_PALETTE = ViewerPalette(
     name="dark",
-    accent="#5aa7ff",
-    accent_dark="#3f8de0",
-    navy="#cfd8e3",
-    surface="#262a33",
-    surface_2="#1d2027",
-    surface_3="#323845",
-    text="#e7ebf2",
-    text_2="#bfc7d1",
-    text_muted="#8e97a4",
-    border="#3a404c",
-    border_strong="#4c5363",
-    danger="#e07060",
-    plot_white="#1e1e1e",
-    render_background="#1e1e1e",
-    render_text="#bfc7d1",
-    active_border="#5aa7ff",
+    accent="#c9a76a",          # warm gold
+    accent_dark="#a88751",
+    navy="#e8dfca",            # titles → match bone body text
+    surface="#34302c",         # panel surface (slightly lighter than main)
+    surface_2="#2a2724",       # main window bg — warm charcoal, NOT pure black
+    surface_3="#3f3a35",       # hover / pressed
+    text="#e8dfca",            # bone — body text
+    text_2="#c4b9a4",          # softer bone for secondary labels
+    text_muted="#928876",      # warm muted gray
+    border="#3f3a35",
+    border_strong="#534c44",
+    danger="#d97560",
+    plot_white="#2a2724",
+    render_background="#2a2724",   # 3-D viewport background matches main bg
+    render_text="#aea495",
+    active_border="#c9a76a",       # active view-frame highlight
 )
 
 

@@ -230,6 +230,95 @@ class _AllWindowsState:
         self._subscribers.append(cb)
 
 
+# ── View presets toolbar (replaces the old vertical CameraViewRail) ──────────
+
+#: ``(group, key, label, icon_name, tooltip)`` — drives both the toolbar
+#: button layout and the camera-preset callback inside MultiViewArea.
+_VIEW_PRESET_ENTRIES: list[tuple[str, str, str, str, str]] = [
+    ("ISO",   "iso_ne", "NE", "view_iso_ne", "Isometric NE"),
+    ("ISO",   "iso_nw", "NW", "view_iso_nw", "Isometric NW"),
+    ("ISO",   "iso_sw", "SW", "view_iso_sw", "Isometric SW"),
+    ("ISO",   "iso_se", "SE", "view_iso_se", "Isometric SE"),
+    ("ORTHO", "top",    "Top",   "view_top",    "Top view (+Z)"),
+    ("ORTHO", "bottom", "Bot",   "view_bottom", "Bottom view (-Z)"),
+    ("ORTHO", "front",  "Front", "view_front",  "Front view (-Y)"),
+    ("ORTHO", "back",   "Back",  "view_back",   "Back view (+Y)"),
+    ("ORTHO", "left",   "Left",  "view_left",   "Left view (-X)"),
+    ("ORTHO", "right",  "Right", "view_right",  "Right view (+X)"),
+]
+
+
+class ViewPresetsToolBar(_ToolBarBase):
+    """The 10 camera-preset buttons that used to live on the left rail.
+
+    Each button calls :class:`~.multi_view.MultiViewArea` ``_apply_camera_preset``
+    on the current tab so the active pane (or every pane, when "All windows" is
+    on) snaps to the requested orientation.
+    """
+
+    def __init__(self, multi_view, session, all_state: "_AllWindowsState", parent=None):
+        super().__init__("View Presets", multi_view, session, parent)
+        self._all_state = all_state
+
+        previous_group: str | None = None
+        for group, key, label, icon_name, tooltip in _VIEW_PRESET_ENTRIES:
+            if previous_group is not None and group != previous_group:
+                self.addSeparator()
+            previous_group = group
+            btn = QtWidgets.QToolButton(self)
+            btn.setText(label)
+            btn.setIcon(viewer_icon(icon_name, active_palette().navy, 16))
+            btn.setIconSize(QtCore.QSize(16, 16))
+            btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+            btn.setToolTip(tooltip)
+            btn.setAutoRaise(True)
+            btn.setFixedHeight(26)
+            btn.clicked.connect(lambda _c=False, k=key: self._apply_preset(k))
+            self.addWidget(btn)
+
+    def _apply_preset(self, key: str) -> None:
+        # Prefer the per-tab MultiViewArea entry point so the "All windows"
+        # state and the GF-layout pin logic still flow through one path.
+        c = getattr(self._multi_view, "current", None)
+        target = c if c is not None else self._multi_view
+        apply = getattr(target, "_apply_camera_preset", None)
+        if callable(apply):
+            try:
+                # Sync the "apply to all" flag before firing so a single click
+                # mirrors the user-facing checkbox state.
+                set_all = getattr(target, "set_camera_apply_to_all", None)
+                if callable(set_all):
+                    set_all(self._all_state.enabled)
+                apply(key)
+                return
+            except Exception:
+                pass
+        # Fallback: drive every active plotter ourselves.
+        for p in self._target_plotters(self._all_state.enabled):
+            try:
+                if key.startswith("iso_"):
+                    p.view_isometric()
+                    az = {"iso_ne": 0, "iso_nw": 90, "iso_sw": 180, "iso_se": 270}.get(key, 0)
+                    if az:
+                        p.camera.Azimuth(az)
+                        p.reset_camera_clipping_range()
+                elif key == "top":
+                    p.view_xy()
+                elif key == "bottom":
+                    p.view_xy(negative=True)
+                elif key == "front":
+                    p.view_xz()
+                elif key == "back":
+                    p.view_xz(negative=True)
+                elif key == "left":
+                    p.view_yz(negative=True)
+                elif key == "right":
+                    p.view_yz()
+                p.render()
+            except Exception:
+                pass
+
+
 # ── Camera toolbar (presets + ortho/rotate + All windows toggle) ─────────────
 
 class CameraToolBar(_ToolBarBase):
@@ -663,10 +752,16 @@ class DisplayToolBar(_ToolBarBase):
 # ── Public factory ───────────────────────────────────────────────────────────
 
 def build_viewer_toolbars(multi_view, session, parent) -> list[_ToolBarBase]:
-    """Construct every themed toolbar in the order the window expects."""
+    """Construct every themed toolbar in the order the window expects.
+
+    Two rows by default — the window groups the first four in row 1 and the
+    last three in row 2 via ``addToolBarBreak``.  Order matters: the View
+    menu lists them top-to-bottom in this exact order.
+    """
     state = _AllWindowsState(multi_view)
     return [
         CameraToolBar(multi_view, session, state, parent),
+        ViewPresetsToolBar(multi_view, session, state, parent),
         OverlaysToolBar(multi_view, session, state, parent),
         SelectionToolBar(multi_view, session, state, parent),
         CaptureToolBar(multi_view, session, state, parent),
@@ -676,6 +771,7 @@ def build_viewer_toolbars(multi_view, session, parent) -> list[_ToolBarBase]:
 
 __all__ = [
     "CameraToolBar",
+    "ViewPresetsToolBar",
     "OverlaysToolBar",
     "SelectionToolBar",
     "CaptureToolBar",

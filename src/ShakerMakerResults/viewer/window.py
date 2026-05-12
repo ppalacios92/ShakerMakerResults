@@ -1,19 +1,28 @@
-"""Qt main window for the interactive viewer.
+"""Qt main window for the interactive viewer — ParaView-style layout.
 
-The window glues together:
+Layout shape (mirrors ParaView's Pipeline / Properties / Information / View):
 
-* a :class:`~.multi_view.TabbedMultiViewArea` central area (multiple layout
-  tabs, each with its own grid of :class:`~.view_frame.ViewFrame` instances);
-* a stack of :class:`QDockWidget` panels — one per :class:`~.side_panel`
-  section — that the user can float, dock or hide independently;
-* a set of small themed :class:`QToolBar` instances grouped by purpose
-  (camera, overlays, selection, capture, opacity);
-* a transport bar (time slider + play / step controls) docked at the bottom;
-* a global ``View`` menu with theme toggle, dock visibility, layout
-  save / restore actions.
+    ┌──────── menu / themed top toolbars ────────────────────────────────┐
+    │ Camera | View Presets | Overlays | Selection | Capture | Display   │
+    ├────────────┬─────────────────────────────────┬─────────────────────┤
+    │ Pipeline   │                                  │ Display             │
+    │ Properties │         3-D Render Views          │ Appearance          │
+    │ Information│         (tabbed multi-view)       │                     │
+    │ Responses  │                                  │                     │
+    │ Green Func.│                                  │                     │
+    ├────────────┴─────────────────────────────────┴─────────────────────┤
+    │ ◀◀ ◀ ▶ ▶▶  ━━●━━━━ time ── speed                                  │
+    │ status chips                                                       │
+    └────────────────────────────────────────────────────────────────────┘
 
-Layout (dock geometry + theme) is persisted to :class:`QtCore.QSettings` on
-close and restored on the next launch.
+All previously-loose side-panel sections live in dedicated
+:class:`QDockWidget` instances.  They can be floated, tabbed against each
+other, hidden through ``View → Panels`` or restored via
+``View → Reset window layout``.  Dock geometry and the active theme are
+persisted to :class:`QtCore.QSettings` between sessions.
+
+Data flow is left untouched — every interaction goes through the same
+:class:`ViewerSession` setters used by the legacy side panel.
 """
 
 from __future__ import annotations
@@ -21,21 +30,27 @@ from __future__ import annotations
 import time
 
 from ._imports import require_viewer_dependencies
+from .appearance_dock import AppearanceDock
 from .busy_dialog import BusyDialog
 from .controls import HeaderBar, StatusChipBar, TimeControls
+from .information_panel import InformationDock
 from .multi_view import TabbedMultiViewArea
+from .pipeline_browser import (
+    NODE_GEOGRAPHIC,
+    NODE_GF,
+    NODE_ROOT,
+    NODE_SELECTION,
+    NODE_STATIONS,
+    PipelineBrowserDock,
+)
+from .properties_dock import PropertiesDock
 from .side_panel import (
     DisplaySection,
-    GeographicSection,
-    NodeSearchSection,
-    VisualizationSection,
-    WarpSection,
     _LazyPage,
     _PageScrollArea,
     _ResponsesAnalysisTabs,
 )
 from .theme import (
-    active_palette,
     build_stylesheet,
     palette_by_name,
     save_theme_name,
@@ -58,17 +73,18 @@ def _settings() -> "QtCore.QSettings":
 
 
 # ── Dock configuration ───────────────────────────────────────────────────────
-#: ``(key, title, factory, default_area, default_visible)``
-#: Used by ``ViewerMainWindow`` to materialise the side-panel sections as
-#: ``QDockWidget`` instances and to build the ``View → Panels`` menu.
-_DOCK_SPECS: list[tuple[str, str, str, str, bool]] = [
-    ("node",        "Node",         "node",        "right",  True),
-    ("display",     "Display",      "display",     "right",  True),
-    ("visibility",  "Visibility",   "visibility",  "right",  False),
-    ("warp",        "Warp",         "warp",        "right",  False),
-    ("responses",   "Responses",    "responses",   "right",  False),
-    ("gf",          "Green Func.",  "gf",          "right",  False),
-    ("geographic",  "Geographic",   "geographic",  "right",  False),
+#: ``(key, title, area, default_visible)``
+#: ``key`` matches the dock factory in ``_init_dock_factories``.
+_DOCK_SPECS: list[tuple[str, str, str, bool]] = [
+    # Left column — pipeline, properties, info, analytics
+    ("pipeline",    "Pipeline Browser", "left",  True),
+    ("properties",  "Properties",       "left",  True),
+    ("information", "Information",      "left",  True),
+    ("responses",   "Responses",        "left",  True),
+    ("gf",          "Green Functions",  "left",  False),
+    # Right column — visual editors
+    ("display",     "Display",          "right", True),
+    ("appearance",  "Appearance",       "right", True),
 ]
 
 _DOCK_AREAS = {
@@ -80,7 +96,7 @@ _DOCK_AREAS = {
 
 
 class ViewerMainWindow(QtWidgets.QMainWindow):
-    """Qt main window with ParaView-style docks and themed toolbars."""
+    """Main window with ParaView-style docks, themed toolbars and a Pipeline."""
 
     def __init__(self, session):
         super().__init__()
@@ -94,10 +110,11 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
 
         summary = session.adapter.summary()
         self.setWindowTitle(f"ShakerMaker Results | {summary.name}")
-        self.resize(1600, 900)
+        self.resize(1700, 950)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
 
-        # Allow docks to share edges naturally, and let nested splits work.
+        # Allow nested + tabbed docks (so the user can pin Responses next to
+        # the 3-D view, or tab Display behind Appearance on the right).
         self.setDockOptions(
             QtWidgets.QMainWindow.AllowNestedDocks
             | QtWidgets.QMainWindow.AllowTabbedDocks
@@ -106,7 +123,8 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         )
         self.setTabPosition(QtCore.Qt.AllDockWidgetAreas, QtWidgets.QTabWidget.North)
 
-        # Apply the persisted theme.
+        # Apply the persisted theme to the entire window before any child
+        # widget is constructed so the first paint already reflects it.
         self._current_theme = saved_theme_name()
         self.setStyleSheet(build_stylesheet(palette_by_name(self._current_theme)))
 
@@ -128,43 +146,52 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self.time_controls = TimeControls(session)
         root.addWidget(self.time_controls)
 
-        # ── Themed toolbars ─────────────────────────────────────────────────
+        # ── Themed top toolbars ─────────────────────────────────────────────
+        # Camera + View Presets together on the first row; the rest break
+        # to a second row so a 1600 px window doesn't truncate the icons.
         self._toolbars = build_viewer_toolbars(self.multi_view, session, self)
-        for tb in self._toolbars:
+        for index, tb in enumerate(self._toolbars):
             tb.setMovable(True)
             tb.setFloatable(True)
             tb.setObjectName(f"ViewerToolBar_{tb.windowTitle().replace(' ', '_')}")
             self.addToolBar(QtCore.Qt.TopToolBarArea, tb)
+            # Break after the View Presets toolbar so it sits beside Camera
+            # and the rest wrap to the next line below.
+            if index == 1:
+                self.addToolBarBreak(QtCore.Qt.TopToolBarArea)
 
-        # Keep a reference to the master toolbar for write_frame_if_recording,
-        # dispose() and the All-windows checkbox.
         self.toolbar = self._toolbars[0] if self._toolbars else None
-        # Backwards compatibility: the playback timer used to call methods on
-        # ``self.toolbar``; route them to the recording toolbar instead.
+        # Recording state lives in CaptureToolBar; route playback frame writes.
         self._recording_toolbar = next(
             (tb for tb in self._toolbars if hasattr(tb, "write_frame_if_recording")),
             None,
         )
 
-        # ── Side-panel sections as dock widgets ─────────────────────────────
+        # ── Docks ───────────────────────────────────────────────────────────
         self._init_dock_factories()
-        for key, title, page_key, area, visible in _DOCK_SPECS:
+        for key, title, area, visible in _DOCK_SPECS:
             dock = self._build_dock(key, title)
             self.addDockWidget(_DOCK_AREAS[area], dock)
             dock.setVisible(visible)
+        self._apply_default_dock_grouping()
 
-        # Stack the heavy analytic docks behind Display so they share space.
-        self._tabify_default_docks()
+        # Pipeline browser drives the active properties tab — bridge wires it.
+        pipeline = self._docks.get("pipeline")
+        if pipeline is not None:
+            try:
+                pipeline.browser.activeNodeChanged.connect(self._on_pipeline_node_changed)
+            except Exception:
+                pass
 
-        # ── Status bar ───────────────────────────────────────────────────────
+        # ── Status bar ──────────────────────────────────────────────────────
         self.status_chip_bar = StatusChipBar()
         self.statusBar().addPermanentWidget(self.status_chip_bar, 1)
         self._update_status()
 
-        # ── Menu bar ─────────────────────────────────────────────────────────
+        # ── Menu bar ────────────────────────────────────────────────────────
         self._build_menu_bar()
 
-        # ── Playback timer ───────────────────────────────────────────────────
+        # ── Playback timer ──────────────────────────────────────────────────
         self._play_timer = QtCore.QTimer(self)
         self._play_timer.setInterval(16)
         self._play_timer.timeout.connect(self._advance_playback)
@@ -173,54 +200,78 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._advancing_playback: bool = False
         self._last_render_ms: float = 16.0
 
-        # ── Keyboard shortcut ────────────────────────────────────────────────
         self._space_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Space"), self)
         self._space_shortcut.activated.connect(self._toggle_play_shortcut)
 
-        # Guard flag: prevents re-entrant prewarm calls while one load is
-        # already running.
         self._prewarming: bool = False
 
-        # ── Restore persisted geometry & dock layout ─────────────────────────
+        # Restore persisted geometry + dock layout (silently no-op on first run).
         self._restore_window_state()
 
-        # ── Startup data pre-warm ────────────────────────────────────────────
+        # Fire the visual prewarm once the first paint is on screen.
         QtCore.QTimer.singleShot(0, self._prewarm_on_show)
 
-    # ── Dock setup ────────────────────────────────────────────────────────────
+    # ── Dock factories ──────────────────────────────────────────────────────
 
     def _init_dock_factories(self) -> None:
-        """Register a factory for every dock so heavy pages stay lazy."""
+        """Register a factory per dock so heavy panels stay lazy until shown."""
         session = self.session
 
-        # Lightweight pages — built immediately on first show.
-        self._lazy_dock_factories["node"] = lambda: NodeSearchSection(session)
-        self._lazy_dock_factories["display"] = lambda: DisplaySection(session)
-        self._lazy_dock_factories["visibility"] = lambda: VisualizationSection(session)
-        self._lazy_dock_factories["warp"] = lambda: WarpSection(session)
-        self._lazy_dock_factories["geographic"] = lambda: GeographicSection(session)
-        # Heavy analytic pages — wrapped in _LazyPage so they only construct
-        # their matplotlib canvases when the user actually shows them.
+        # Native dock classes — fully self-contained widgets that ALSO act as
+        # their own QDockWidget (Pipeline, Properties, Information,
+        # Appearance).  These are returned as full docks and bypass the
+        # generic ``_build_dock`` wrapping.
+        self._lazy_dock_factories["pipeline"]    = lambda parent=self: PipelineBrowserDock(session, parent)
+        self._lazy_dock_factories["properties"]  = lambda parent=self: PropertiesDock(session, parent)
+        self._lazy_dock_factories["information"] = lambda parent=self: InformationDock(session, parent)
+        self._lazy_dock_factories["appearance"]  = lambda parent=self: AppearanceDock(session, parent)
+
+        # Sections that live inside a generic dock wrapper.
+        self._lazy_dock_factories["display"]   = lambda: DisplaySection(session)
         self._lazy_dock_factories["responses"] = lambda: _LazyPage(
             lambda: _ResponsesAnalysisTabs(session)
         )
-        self._lazy_dock_factories["gf"] = lambda: _LazyPage(lambda: GFPanel(session))
+        self._lazy_dock_factories["gf"]        = lambda: _LazyPage(lambda: GFPanel(session))
+
+    # ── Dock building ───────────────────────────────────────────────────────
 
     def _build_dock(self, key: str, title: str) -> QtWidgets.QDockWidget:
-        dock = QtWidgets.QDockWidget(title, self)
-        dock.setObjectName(f"Dock_{key}")
-        dock.setAllowedAreas(
-            QtCore.Qt.LeftDockWidgetArea
-            | QtCore.Qt.RightDockWidgetArea
-            | QtCore.Qt.BottomDockWidgetArea
-        )
-        dock.setMinimumWidth(280)
-        page = self._lazy_dock_factories[key]()
-        self._side_pages[key] = page
-        scroll = _PageScrollArea(page)
-        dock.setWidget(scroll)
+        """Return the dock for *key*.
+
+        Some factories return a fully-formed ``QDockWidget`` (Pipeline,
+        Properties, Information, Appearance) — we use them directly so each
+        dock keeps its own internal refresh logic.  Generic content widgets
+        (DisplaySection, lazy panels) are wrapped in a thin ``QDockWidget``
+        with a scroll area.
+        """
+        factory = self._lazy_dock_factories[key]
+        page_or_dock = factory()
+
+        if isinstance(page_or_dock, QtWidgets.QDockWidget):
+            dock = page_or_dock
+            # Adopt the factory-built dock as a child of the main window so
+            # geometry / save-state work correctly on first show.
+            dock.setParent(self)
+            dock.setWindowTitle(title)
+            dock.setObjectName(f"Dock_{key}")
+            inner = dock.widget()
+            self._side_pages[key] = inner if inner is not None else dock
+        else:
+            dock = QtWidgets.QDockWidget(title, self)
+            dock.setObjectName(f"Dock_{key}")
+            dock.setAllowedAreas(
+                QtCore.Qt.LeftDockWidgetArea
+                | QtCore.Qt.RightDockWidgetArea
+                | QtCore.Qt.BottomDockWidgetArea
+            )
+            dock.setMinimumWidth(280)
+            page = page_or_dock
+            self._side_pages[key] = page
+            scroll = _PageScrollArea(page)
+            dock.setWidget(scroll)
+
         self._docks[key] = dock
-        # When the dock becomes visible, ensure lazy pages materialise.
+        # Lazy heavy pages materialise on first show.
         dock.visibilityChanged.connect(lambda v, k=key: self._on_dock_visibility(k, v))
         return dock
 
@@ -232,26 +283,66 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             page.ensure_created()
             page.refresh("full")
 
-    def _tabify_default_docks(self) -> None:
-        """Tab heavy analytic docks behind Display to save right-area space."""
-        anchor = self._docks.get("display")
-        if anchor is None:
-            return
-        for k in ("responses", "gf", "geographic"):
-            d = self._docks.get(k)
-            if d is not None and d is not anchor:
-                self.tabifyDockWidget(anchor, d)
-        # Make sure Display is the visible one in the tab stack.
-        anchor.raise_()
+    def _apply_default_dock_grouping(self) -> None:
+        """Stack secondary panels behind their primary on first launch.
 
-    # ── Menu bar ─────────────────────────────────────────────────────────────
+        Left column primary = Properties.  GF stacks behind Responses.
+        Right column primary = Display.
+        """
+        # Left side: keep Pipeline + Properties + Information + Responses
+        # individually visible by default.  GF tabs behind Responses.
+        responses = self._docks.get("responses")
+        gf = self._docks.get("gf")
+        if responses is not None and gf is not None:
+            self.tabifyDockWidget(responses, gf)
+        # Right side: Appearance tabs behind Display.
+        display = self._docks.get("display")
+        appearance = self._docks.get("appearance")
+        if display is not None and appearance is not None:
+            self.tabifyDockWidget(display, appearance)
+            display.raise_()
+
+        # Set reasonable initial widths so the central view stays dominant.
+        if "pipeline" in self._docks and "display" in self._docks:
+            self.resizeDocks(
+                [self._docks["pipeline"], self._docks["display"]],
+                [320, 320],
+                QtCore.Qt.Horizontal,
+            )
+
+    # ── Pipeline ↔ Properties bridge ────────────────────────────────────────
+
+    def _on_pipeline_node_changed(self, node_key: str) -> None:
+        """Focus the matching Properties tab when the pipeline selection changes."""
+        props = self._docks.get("properties")
+        if props is None or not hasattr(props, "focus_tab"):
+            return
+        # Map pipeline node keys → properties tab names.
+        tab_for_node = {
+            NODE_ROOT:       "Node",
+            NODE_STATIONS:   "Node",        # stations table lives inside the Node tab
+            NODE_SELECTION:  "Node",
+            NODE_GF:         "Warp",        # nothing GF-specific in Properties → keep Warp
+            NODE_GEOGRAPHIC: "Geographic",
+        }
+        target = tab_for_node.get(node_key)
+        if target is not None:
+            try:
+                props.focus_tab(target)
+                if not props.isVisible():
+                    props.setVisible(True)
+                    props.raise_()
+            except Exception:
+                pass
+
+    # ── Menu bar ────────────────────────────────────────────────────────────
 
     def _build_menu_bar(self) -> None:
         menubar = self.menuBar()
 
-        # View menu — panels (docks), toolbars, theme, layout reset.
         view_menu = menubar.addMenu("&View")
 
+        # Panels submenu — one entry per dock toggling visibility.
         panels_menu = view_menu.addMenu("&Panels")
         for key, title, *_ in _DOCK_SPECS:
             dock = self._docks.get(key)
@@ -262,6 +353,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             panels_menu.addAction(action)
             self._dock_actions[key] = action
 
+        # Toolbars submenu.
         toolbars_menu = view_menu.addMenu("&Toolbars")
         for tb in self._toolbars:
             action = tb.toggleViewAction()
@@ -299,18 +391,24 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._current_theme = name
         palette = palette_by_name(name)
         self.setStyleSheet(build_stylesheet(palette))
-        # Refresh widget-owned colours that cannot be expressed via stylesheet.
+        # Widget-owned colours that bypass the stylesheet.
         try:
             self.multi_view.refresh_theme()
         except Exception:
             pass
-        # Sync the menu action selection (set_theme may be called programmatically).
+        # Pipeline browser repaints its icons against the new palette.
+        try:
+            pipe = self._docks.get("pipeline")
+            if pipe is not None and hasattr(pipe, "refresh"):
+                pipe.refresh("full")
+        except Exception:
+            pass
         for n, act in getattr(self, "_theme_actions", {}).items():
             block = act.blockSignals(True)
             act.setChecked(n == name)
             act.blockSignals(block)
-        # 3-D viewports: re-broadcast appearance so scalar bar / text colours
-        # update against the new background.
+        # 3-D viewports — rebroadcast so scalar-bar / branding pick up the
+        # new luminance-aware foreground colour.
         try:
             self.multi_view.on_session_updated("appearance")
         except Exception:
@@ -345,20 +443,19 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         s = _settings()
         s.remove(_SETTINGS_GEOMETRY)
         s.remove(_SETTINGS_STATE)
-        # Re-show all default docks in their default positions.
-        for key, title, _, area, visible in _DOCK_SPECS:
+        for key, title, area, visible in _DOCK_SPECS:
             dock = self._docks.get(key)
             if dock is None:
                 continue
             dock.setFloating(False)
             self.addDockWidget(_DOCK_AREAS[area], dock)
             dock.setVisible(visible)
-        self._tabify_default_docks()
+        self._apply_default_dock_grouping()
 
-    # ── Session update routing ────────────────────────────────────────────────
+    # ── Session update routing ──────────────────────────────────────────────
 
     def on_session_updated(self, reason: str):
-        """Fan a state-change reason out to every affected sub-widget."""
+        """Broadcast *reason* to every affected sub-widget."""
         self.header.sync_from_state()
         self.time_controls.sync_from_state()
 
@@ -373,48 +470,47 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             self._sync_play_state()
             self._refresh_side_pages("playback")
             return
-        else:
-            if reason in ("panel_apply", "demand", "component"):
-                from .adapter import GF_DEMAND
-                demand = self.session.state.demand
-                if demand != GF_DEMAND:
-                    self._prewarm_display_field(
-                        demand, self.session.state.component, no_evict=False
-                    )
-            elif reason == "warp" and self.session.state.disp_warp_enabled:
-                disp_ready = all(
-                    ("disp", component) in self.session.adapter._series_cache
-                    for component in ("e", "n", "z")
-                )
-                if not disp_ready:
-                    self._prewarm_demands(["disp"], no_evict=True)
-            elif reason == "vector_field" and self.session.state.vector_field_enabled:
-                self._prewarm_demands(
-                    [self.session.state.vector_field_demand], no_evict=False
-                )
-            elif reason == "static_color" and self.session.current_wave_blend_enabled():
-                from .adapter import GF_DEMAND
-                demand = self.session.state.demand
-                if demand != GF_DEMAND:
-                    self._prewarm_display_field(
-                        demand, self.session.state.component, no_evict=False
-                    )
 
-            self.multi_view.on_session_updated(reason)
-            self._refresh_side_pages(reason)
-            if reason == "time" and self.session.state.is_playing:
-                self.status_chip_bar.update_time_chip(
-                    f"time {self.session.current_time():.3f}s"
+        if reason in ("panel_apply", "demand", "component"):
+            from .adapter import GF_DEMAND
+            demand = self.session.state.demand
+            if demand != GF_DEMAND:
+                self._prewarm_display_field(
+                    demand, self.session.state.component, no_evict=False
                 )
-            else:
-                self._update_status()
-            return
+        elif reason == "warp" and self.session.state.disp_warp_enabled:
+            disp_ready = all(
+                ("disp", component) in self.session.adapter._series_cache
+                for component in ("e", "n", "z")
+            )
+            if not disp_ready:
+                self._prewarm_demands(["disp"], no_evict=True)
+        elif reason == "vector_field" and self.session.state.vector_field_enabled:
+            self._prewarm_demands(
+                [self.session.state.vector_field_demand], no_evict=False
+            )
+        elif reason == "static_color" and self.session.current_wave_blend_enabled():
+            from .adapter import GF_DEMAND
+            demand = self.session.state.demand
+            if demand != GF_DEMAND:
+                self._prewarm_display_field(
+                    demand, self.session.state.component, no_evict=False
+                )
+
+        self.multi_view.on_session_updated(reason)
+        self._refresh_side_pages(reason)
+        if reason == "time" and self.session.state.is_playing:
+            self.status_chip_bar.update_time_chip(
+                f"time {self.session.current_time():.3f}s"
+            )
+        else:
+            self._update_status()
 
     def _refresh_side_pages(self, reason: str) -> None:
         """Refresh every visible side-panel page with *reason*.
 
-        Hidden / collapsed docks are skipped (no widget pressure) and heavy
-        pages re-materialise themselves only when the user shows them.
+        Hidden / collapsed docks are skipped, and lazy pages re-materialise
+        themselves only when the user actually shows them.
         """
         for key, page in self._side_pages.items():
             dock = self._docks.get(key)
@@ -424,16 +520,15 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                 if isinstance(page, _LazyPage):
                     if page.is_created:
                         page.refresh(reason)
-                else:
+                elif hasattr(page, "refresh"):
                     page.refresh(reason)
             except Exception:
                 pass
 
-    # ── Playback ──────────────────────────────────────────────────────────────
+    # ── Playback ────────────────────────────────────────────────────────────
 
     def _toggle_play_shortcut(self):
         self.session.toggle_playing()
-        return
 
     def _on_play_toggled(self, _is_playing: bool):
         self._sync_play_state()
@@ -501,7 +596,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    # ── Status bar ────────────────────────────────────────────────────────────
+    # ── Status bar ──────────────────────────────────────────────────────────
 
     def _update_status(self):
         selected = self.session.state.selected_node
@@ -554,7 +649,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     def _base_frame_duration_s() -> float:
         return 0.08
 
-    # ── Shared prewarm helper ─────────────────────────────────────────────────
+    # ── Shared prewarm helpers ──────────────────────────────────────────────
 
     def _prewarm_display_field(self, demand: str, component: str, *, no_evict: bool = False) -> None:
         if self._closing or self._prewarming:
@@ -754,7 +849,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             busy.close()
             self._update_status()
 
-    # ── Startup pre-warm ──────────────────────────────────────────────────────
+    # ── Startup pre-warm ────────────────────────────────────────────────────
 
     def _prewarm_on_show(self):
         if self._closing:
@@ -774,7 +869,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             pass
         self.multi_view.on_session_updated("panel_apply")
 
-    # ── Window close / cleanup ────────────────────────────────────────────────
+    # ── Window close / cleanup ──────────────────────────────────────────────
 
     def closeEvent(self, event):  # noqa: N802
         if self._closing:
@@ -783,7 +878,6 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
 
         self._closing = True
         try:
-            # Persist geometry and dock layout BEFORE tearing widgets down.
             self._save_window_state()
         except Exception:
             pass
