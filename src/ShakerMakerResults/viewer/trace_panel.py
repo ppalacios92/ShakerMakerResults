@@ -19,6 +19,22 @@ except ImportError:  # pragma: no cover - compatibility fallback
 from matplotlib.figure import Figure
 
 
+def _set_grid(ax, visible: bool, *, alpha: float = 0.25) -> None:
+    """Toggle a matplotlib grid without tripping the modern warning.
+
+    ``ax.grid(False, alpha=...)`` raises a ``UserWarning`` in current
+    matplotlib because passing line-property kwargs alongside a falsy
+    ``visible`` argument is deprecated — the warning then says the grid
+    will be drawn anyway, which is the opposite of what the user asked.
+    Splitting the call into the two valid forms (on with alpha, off
+    without kwargs) silences the warning and obeys the intent.
+    """
+    if visible:
+        ax.grid(True, alpha=alpha)
+    else:
+        ax.grid(False)
+
+
 class _BgWorker(QtCore.QThread):
     """Run a callable in a background thread; emit (key, result) on finish.
 
@@ -273,7 +289,7 @@ class SpectrumPanel(QtWidgets.QWidget):
             self._current_nodes = tuple()
             for ax in self.axes:
                 ax.clear()
-                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+                _set_grid(ax, self.chart_controls.show_grid())
             self.title_label.setText("No node selected")
             self._set_table_rows([])
             self.axes[-1].set_xlabel("Period [s]")
@@ -289,7 +305,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         # Show a placeholder immediately so the panel doesn't look frozen.
         for ax in self.axes:
             ax.clear()
-            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+            _set_grid(ax, self.chart_controls.show_grid())
         node_id = self._nodes_title(node_ids)
         self.axes[-1].set_xlabel("Period [s]")
         self.title_label.setText(f"{self._nodes_title(node_ids)} | Computing spectrum...")
@@ -336,7 +352,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         if isinstance(result, Exception):
             self.title_label.setText(f"Spectrum unavailable: {result}")
             for ax in self.axes:
-                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+                _set_grid(ax, self.chart_controls.show_grid())
             self._set_table_rows([])
             self.canvas.draw_idle()
             return
@@ -363,7 +379,7 @@ class SpectrumPanel(QtWidgets.QWidget):
                         label=f"Node {nid}",
                     )
                 ax.set_ylabel(label.upper())
-                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+                _set_grid(ax, self.chart_controls.show_grid())
                 if self.chart_controls.show_legend():
                     ax.legend(loc="upper right")
             for nid in node_ids:
@@ -397,7 +413,7 @@ class SpectrumPanel(QtWidgets.QWidget):
                 label=label.upper(),
             )
             ax.set_ylabel(label.upper())
-            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+            _set_grid(ax, self.chart_controls.show_grid())
             if self.chart_controls.show_legend():
                 ax.legend(loc="upper right")
         self.axes[-1].set_xlabel("Period [s]")
@@ -530,7 +546,7 @@ class AriasIntensityPanel(QtWidgets.QWidget):
         # Show a placeholder immediately so the panel doesn't look frozen.
         for ax in self.axes:
             ax.clear()
-            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+            _set_grid(ax, self.chart_controls.show_grid())
         node_id = self._nodes_title(node_ids)
         self.axes[-1].set_xlabel("Time [s]")
         self.title_label.setText(f"{self._nodes_title(node_ids)} | Computing Arias...")
@@ -604,7 +620,7 @@ class AriasIntensityPanel(QtWidgets.QWidget):
                 ax.axhline(95, color="gray", linestyle=":", linewidth=1, alpha=0.6)
                 ax.set_ylabel(label.upper())
                 ax.set_ylim(0, 100)
-                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+                _set_grid(ax, self.chart_controls.show_grid())
                 if self.chart_controls.show_legend():
                     ax.legend(loc="upper left")
             for nid in node_ids:
@@ -652,7 +668,7 @@ class AriasIntensityPanel(QtWidgets.QWidget):
             ax.axhline(95, color="gray", linestyle=":", linewidth=1, alpha=0.6)
             ax.set_ylabel(label.upper())
             ax.set_ylim(0, 100)
-            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+            _set_grid(ax, self.chart_controls.show_grid())
             if self.chart_controls.show_legend():
                 ax.legend(loc="upper left")
             t5 = float(item["t_start"])
@@ -1503,7 +1519,7 @@ class ResponsesPanel(QtWidgets.QWidget):
             for ax, (demand, component) in zip(axes, active_keys):
                 color, linestyle, label = self._CURVE_STYLES[(demand, component)]
                 ax.set_ylabel(label, fontsize=8)
-                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+                _set_grid(ax, self.chart_controls.show_grid())
                 ax.tick_params(labelsize=7)
                 row = _COMP_ROW[component]
                 for idx, node_id in enumerate(node_ids):
@@ -1532,7 +1548,7 @@ class ResponsesPanel(QtWidgets.QWidget):
             self.canvas.setMinimumHeight(220)
             ax = self.figure.subplots(1, 1)
             ax.set_xlabel("Time [s]", fontsize=8)
-            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+            _set_grid(ax, self.chart_controls.show_grid())
             ax.tick_params(labelsize=7)
 
             any_line = False

@@ -1303,7 +1303,8 @@ class DisplaySection(_SectionBase):
         if target == "all":
             # Global path — also drop every per-pane override for these
             # attributes so the global value is what every pane actually
-            # shows after this Apply.
+            # shows after this Apply.  ``demand`` is included so a pane
+            # that had a per-pane demand reverts to the new global.
             window = self.window()
             multi = getattr(window, "multi_view", None) if window is not None else None
             if multi is not None:
@@ -1311,8 +1312,8 @@ class DisplaySection(_SectionBase):
                     pane_state = getattr(pane, "pane_state", None)
                     if pane_state is not None:
                         pane_state.clear_overrides(
-                            ("colormap", "user_vmin", "user_vmax",
-                             "clamp_enabled", "component")
+                            ("demand", "component", "colormap",
+                             "user_vmin", "user_vmax", "clamp_enabled")
                         )
             self.session.apply_display_settings(
                 demand=demand,
@@ -1335,11 +1336,17 @@ class DisplaySection(_SectionBase):
             pane_state = getattr(pane, "pane_state", None)
             if pane_state is None:
                 continue
+            # IMPORTANT: ``demand`` MUST be written too — otherwise the
+            # pane keeps reading the session global demand and the user
+            # ends up with the wrong field rendered (e.g. accel data
+            # clamped to the velocity range they typed).  All other
+            # display attributes follow.
+            pane_state.demand = demand
+            pane_state.component = component
             pane_state.colormap = cmap_value
             pane_state.user_vmin = vmin
             pane_state.user_vmax = vmax
             pane_state.clamp_enabled = clamp
-            pane_state.component = component
             # Force this pane to re-render with the new overlay.
             scene = getattr(pane, "scene", None)
             if scene is not None:

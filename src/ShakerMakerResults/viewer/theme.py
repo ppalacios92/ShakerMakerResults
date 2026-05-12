@@ -21,20 +21,29 @@ _, _, _, QtCore, _, _ = require_viewer_dependencies()
 
 @dataclass(frozen=True)
 class ViewerPalette:
-    """Color tokens consumed by every Qt widget in the viewer."""
+    """Color tokens consumed by every Qt widget in the viewer.
+
+    The default values describe the **light "hueso"** palette: a cool
+    bone tone with slight neutrality (matches the user-supplied colour
+    sample).  The dark palette below is a cool slate that pairs well
+    with the same bone text — neither pure black nor strong blue.
+    """
 
     name: str = "light"
     accent: str = "#2a6bc2"
     accent_dark: str = "#1e5299"
     navy: str = "#1e3558"
-    surface: str = "#fbfaf7"
-    surface_2: str = "#f2f5f7"
-    surface_3: str = "#e6ebef"
-    text: str = "#172033"
-    text_2: str = "#4b5d74"
-    text_muted: str = "#7d8a9a"
-    border: str = "#d7dee6"
-    border_strong: str = "#aeb9c7"
+    # Surface tones (bone family, cool-neutral) sampled from the user's
+    # reference image.  The three steps follow the standard "container /
+    # panel / hover" triplet used elsewhere in the UI.
+    surface: str = "#f3f1ec"        # panel / form bg (slight cream)
+    surface_2: str = "#eceae6"      # main window bg (bone)
+    surface_3: str = "#e0ddd6"      # hover / pressed
+    text: str = "#1c2330"           # near-black with cool undertone
+    text_2: str = "#4d5664"
+    text_muted: str = "#7c8492"
+    border: str = "#cfcdc7"
+    border_strong: str = "#a9a7a0"
     danger: str = "#b24a3f"
     plot_white: str = "#ffffff"
     # Used by the 3-D plotter background and the in-scene branding text.
@@ -46,25 +55,27 @@ class ViewerPalette:
 
 LIGHT_PALETTE = ViewerPalette()
 
-#: Warm-charcoal background + bone text + warm-gold accent.
-#: Hand-tuned to avoid the clinical pure-black + cold-blue palette common in
-#: IDE darks; reads well in long sessions on calibrated displays.
+#: Cool dark slate background + bone text + warm-gold accent.
+#: Sampled from the user's reference image — a desaturated dark slate
+#: (not pure black, not strong primary blue), paired with the same
+#: bone text family as the light palette so the eye adapts smoothly
+#: between themes.
 DARK_PALETTE = ViewerPalette(
     name="dark",
     accent="#c9a76a",          # warm gold
     accent_dark="#a88751",
     navy="#e8dfca",            # titles → match bone body text
-    surface="#34302c",         # panel surface (slightly lighter than main)
-    surface_2="#2a2724",       # main window bg — warm charcoal, NOT pure black
-    surface_3="#3f3a35",       # hover / pressed
+    surface="#3f4853",         # panel surface (slightly lighter than main)
+    surface_2="#363f49",       # main window bg — cool dark slate
+    surface_3="#4a5460",       # hover / pressed
     text="#e8dfca",            # bone — body text
     text_2="#c4b9a4",          # softer bone for secondary labels
-    text_muted="#928876",      # warm muted gray
-    border="#3f3a35",
-    border_strong="#534c44",
+    text_muted="#929aa6",      # cool muted gray (matches slate)
+    border="#4a5460",
+    border_strong="#5c6776",
     danger="#d97560",
-    plot_white="#2a2724",
-    render_background="#2a2724",   # 3-D viewport background matches main bg
+    plot_white="#363f49",
+    render_background="#363f49",   # 3-D viewport background matches main bg
     render_text="#aea495",
     active_border="#c9a76a",       # active view-frame highlight
 )

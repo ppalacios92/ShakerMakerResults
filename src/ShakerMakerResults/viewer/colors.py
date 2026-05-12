@@ -9,9 +9,10 @@ import numpy as np
 BACKGROUND_PRESETS = {
     "White": "#ffffff",
     "Gray": "#d7d9dd",
-    # Warm charcoal — matches the "hueso" dark theme so the renderer
-    # background reads consistently with the rest of the UI in dark mode.
-    "Dark": "#2a2724",
+    # Cool dark slate — matches the dark UI palette so the renderer
+    # background reads consistently with the rest of the chrome when the
+    # user picks the dark theme.
+    "Dark": "#363f49",
 }
 
 COLORMAP_OPTIONS = (
