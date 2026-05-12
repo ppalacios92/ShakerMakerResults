@@ -34,14 +34,30 @@ import time
 
 from ._imports import require_viewer_dependencies
 from .busy_dialog import BusyDialog
+from .cmap_preview import ColormapPreview
 from .colors import COLORMAP_OPTIONS, colormap_for_component
 from .icons import icon
 from .session import VALID_STATIC_COLOR_BY
-from .theme import LIGHT_PALETTE
+from .theme import LIGHT_PALETTE, active_palette  # LIGHT_PALETTE kept for legacy callers
 from .trace_panel import AriasIntensityPanel, GFPanel, ResponsesPanel, SpectrumPanel
 from .visual_editors import LegendEditorDialog, TransferFunctionDialog
 
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
+
+
+def _stack(*widgets) -> QtWidgets.QWidget:
+    """Return a small QWidget that stacks *widgets* vertically with zero margin.
+
+    Used by the side-panel sections to pair a combo box with its colormap
+    preview inside one row of a form layout.
+    """
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(2)
+    for widget in widgets:
+        layout.addWidget(widget)
+    return container
 
 
 # ── Menu configuration ────────────────────────────────────────────────────────
@@ -580,6 +596,9 @@ class DisplaySection(_SectionBase):
         for cmap in COLORMAP_OPTIONS:
             self.cmap_combo.addItem(cmap, cmap)
         self.cmap_combo.currentTextChanged.connect(lambda *_: self._set_dirty())
+        self.cmap_preview = ColormapPreview(self.cmap_combo.currentText())
+        self.cmap_combo.currentTextChanged.connect(self.cmap_preview.setColormap)
+        cmap_row = _stack(self.cmap_combo, self.cmap_preview)
 
         self.auto_lbl  = QtWidgets.QLabel("-")
         self.vmin_spin = self._value_spin()
@@ -597,7 +616,7 @@ class DisplaySection(_SectionBase):
         self.legend_btn = QtWidgets.QPushButton("Legend settings")
         self.legend_btn.clicked.connect(self._open_legend_editor)
 
-        color_form.addRow("Preset",     self.cmap_combo)
+        color_form.addRow("Preset",     cmap_row)
         color_form.addRow("Auto range", self.auto_lbl)
         color_form.addRow("User min",   self.vmin_spin)
         color_form.addRow("User max",   self.vmax_spin)
@@ -630,7 +649,9 @@ class DisplaySection(_SectionBase):
         for cmap in COLORMAP_OPTIONS:
             self.vector_cmap_combo.addItem(cmap, cmap)
         self.vector_cmap_combo.currentTextChanged.connect(lambda *_: self._set_vector_dirty())
-        vector_form.addRow("Color ramp", self.vector_cmap_combo)
+        self.vector_cmap_preview = ColormapPreview(self.vector_cmap_combo.currentText())
+        self.vector_cmap_combo.currentTextChanged.connect(self.vector_cmap_preview.setColormap)
+        vector_form.addRow("Color ramp", _stack(self.vector_cmap_combo, self.vector_cmap_preview))
 
         self.vector_scale_spin = QtWidgets.QDoubleSpinBox()
         self.vector_scale_spin.setRange(0.01, 100.0)
@@ -666,6 +687,8 @@ class DisplaySection(_SectionBase):
         for cmap in COLORMAP_OPTIONS:
             self.static_cmap_combo.addItem(cmap, cmap)
         self.static_cmap_combo.currentTextChanged.connect(lambda *_: self._set_static_color_dirty())
+        self.static_cmap_preview = ColormapPreview(self.static_cmap_combo.currentText())
+        self.static_cmap_combo.currentTextChanged.connect(self.static_cmap_preview.setColormap)
 
         self.static_auto_lbl = QtWidgets.QLabel("-")
         self.static_vmin_spin = self._value_spin()
@@ -743,7 +766,10 @@ class DisplaySection(_SectionBase):
         self.static_apply_btn.clicked.connect(self._apply_static_color_with_busy)
 
         static_color_form.addRow("Source", self.static_color_combo)
-        static_color_form.addRow("Color ramp", self.static_cmap_combo)
+        static_color_form.addRow(
+            "Color ramp",
+            _stack(self.static_cmap_combo, self.static_cmap_preview),
+        )
         static_color_form.addRow("Auto range", self.static_auto_lbl)
         static_color_form.addRow("User min", self.static_vmin_spin)
         static_color_form.addRow("User max", self.static_vmax_spin)
@@ -792,6 +818,7 @@ class DisplaySection(_SectionBase):
             self.vector_enabled_cb.blockSignals(b)
             self._set_combo_data(self.vector_demand_combo, self.session.state.vector_field_demand)
             self._set_combo(self.vector_cmap_combo, self.session.state.vector_field_colormap)
+            self.vector_cmap_preview.setColormap(self.vector_cmap_combo.currentText())
             b = self.vector_scale_spin.blockSignals(True)
             self.vector_scale_spin.setValue(self.session.state.vector_field_scale)
             self.vector_scale_spin.blockSignals(b)
@@ -825,6 +852,7 @@ class DisplaySection(_SectionBase):
                     self.cmap_combo,
                     self.session.state.colormap or colormap_for_component(self.session.state.component),
                 )
+                self.cmap_preview.setColormap(self.cmap_combo.currentText())
                 lo, hi = self._field_auto_limits()
                 self.auto_lbl.setText(f"{lo:.4g}  /  {hi:.4g}")
                 if (self.session.state.user_vmin is None
@@ -841,6 +869,7 @@ class DisplaySection(_SectionBase):
                 current_static = self.session.current_static_color_by()
                 self._set_combo_data(self.static_color_combo, current_static)
                 self._set_combo(self.static_cmap_combo, self.session.current_static_colormap())
+                self.static_cmap_preview.setColormap(self.static_cmap_combo.currentText())
                 lo, hi = self.session.current_static_auto_limits()
                 self.static_auto_lbl.setText(f"{lo:.4g}  /  {hi:.4g}")
                 static_vmin, static_vmax = self.session.current_static_user_range()

@@ -1,82 +1,170 @@
-"""Qt main window for the interactive viewer."""
+"""Qt main window for the interactive viewer.
+
+The window glues together:
+
+* a :class:`~.multi_view.TabbedMultiViewArea` central area (multiple layout
+  tabs, each with its own grid of :class:`~.view_frame.ViewFrame` instances);
+* a stack of :class:`QDockWidget` panels — one per :class:`~.side_panel`
+  section — that the user can float, dock or hide independently;
+* a set of small themed :class:`QToolBar` instances grouped by purpose
+  (camera, overlays, selection, capture, opacity);
+* a transport bar (time slider + play / step controls) docked at the bottom;
+* a global ``View`` menu with theme toggle, dock visibility, layout
+  save / restore actions.
+
+Layout (dock geometry + theme) is persisted to :class:`QtCore.QSettings` on
+close and restored on the next launch.
+"""
 
 from __future__ import annotations
 
 import time
 
-from .busy_dialog import BusyDialog
 from ._imports import require_viewer_dependencies
+from .busy_dialog import BusyDialog
 from .controls import HeaderBar, StatusChipBar, TimeControls
-from .multi_view import MultiViewArea
-from .side_panel import ViewerSidePanel
-from .theme import LIGHT_PALETTE, build_stylesheet
-from .toolbar import ViewerToolBar
+from .multi_view import TabbedMultiViewArea
+from .side_panel import (
+    DisplaySection,
+    GeographicSection,
+    NodeSearchSection,
+    VisualizationSection,
+    WarpSection,
+    _LazyPage,
+    _PageScrollArea,
+    _ResponsesAnalysisTabs,
+)
+from .theme import (
+    active_palette,
+    build_stylesheet,
+    palette_by_name,
+    save_theme_name,
+    saved_theme_name,
+)
+from .toolbar import build_viewer_toolbars
+from .trace_panel import GFPanel
 
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
 
 
+_SETTINGS_ORG = "ShakerMakerResults"
+_SETTINGS_APP = "Viewer"
+_SETTINGS_GEOMETRY = "window/geometry"
+_SETTINGS_STATE = "window/state"
+
+
+def _settings() -> "QtCore.QSettings":
+    return QtCore.QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+
+
+# ── Dock configuration ───────────────────────────────────────────────────────
+#: ``(key, title, factory, default_area, default_visible)``
+#: Used by ``ViewerMainWindow`` to materialise the side-panel sections as
+#: ``QDockWidget`` instances and to build the ``View → Panels`` menu.
+_DOCK_SPECS: list[tuple[str, str, str, str, bool]] = [
+    ("node",        "Node",         "node",        "right",  True),
+    ("display",     "Display",      "display",     "right",  True),
+    ("visibility",  "Visibility",   "visibility",  "right",  False),
+    ("warp",        "Warp",         "warp",        "right",  False),
+    ("responses",   "Responses",    "responses",   "right",  False),
+    ("gf",          "Green Func.",  "gf",          "right",  False),
+    ("geographic",  "Geographic",   "geographic",  "right",  False),
+]
+
+_DOCK_AREAS = {
+    "right":  QtCore.Qt.RightDockWidgetArea,
+    "left":   QtCore.Qt.LeftDockWidgetArea,
+    "top":    QtCore.Qt.TopDockWidgetArea,
+    "bottom": QtCore.Qt.BottomDockWidgetArea,
+}
+
+
 class ViewerMainWindow(QtWidgets.QMainWindow):
-    """Thin Qt shell that wires together the multi-view area, side panel and
-    transport controls around a single shared :class:`~.session.ViewerSession`.
-
-    All session state (time, demand, component, warp, selection …) is global.
-    ``on_session_updated(reason)`` fans the update out to:
-
-    * ``multi_view``  — refreshes every visible 3-D viewport.
-    * ``side_panel``  — routes to the active nav page (lazy heavy pages are
-                        skipped when inactive).
-    """
+    """Qt main window with ParaView-style docks and themed toolbars."""
 
     def __init__(self, session):
         super().__init__()
         self.session = session
         self._closing = False
-        summary = session.adapter.summary()
+        self._docks: dict[str, QtWidgets.QDockWidget] = {}
+        self._lazy_dock_factories: dict[str, callable] = {}
+        self._side_pages: dict[str, QtWidgets.QWidget] = {}
+        self._dock_actions: dict[str, QtGui.QAction] = {}
+        self._toolbar_actions: dict[str, QtGui.QAction] = {}
 
+        summary = session.adapter.summary()
         self.setWindowTitle(f"ShakerMaker Results | {summary.name}")
         self.resize(1600, 900)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
-        self.setStyleSheet(build_stylesheet(LIGHT_PALETTE))
 
+        # Allow docks to share edges naturally, and let nested splits work.
+        self.setDockOptions(
+            QtWidgets.QMainWindow.AllowNestedDocks
+            | QtWidgets.QMainWindow.AllowTabbedDocks
+            | QtWidgets.QMainWindow.AnimatedDocks
+            | QtWidgets.QMainWindow.GroupedDragging
+        )
+        self.setTabPosition(QtCore.Qt.AllDockWidgetAreas, QtWidgets.QTabWidget.North)
+
+        # Apply the persisted theme.
+        self._current_theme = saved_theme_name()
+        self.setStyleSheet(build_stylesheet(palette_by_name(self._current_theme)))
+
+        # ── Central area: header + tabbed multi-view + transport ─────────────
         central = QtWidgets.QWidget()
         central.setObjectName("ViewerCentral")
         self.setCentralWidget(central)
 
         root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
 
-        # ── Header ────────────────────────────────────────────────────────────
         self.header = HeaderBar(session)
         root.addWidget(self.header)
 
-        # ── Toolbar ───────────────────────────────────────────────────────────
-        # Built before multi_view is added to the splitter so it sits above.
-        # Deferred addWidget call happens after multi_view is constructed.
+        self.multi_view = TabbedMultiViewArea(session)
+        root.addWidget(self.multi_view, 1)
 
-        # ── Main splitter: multi-view | side panel ────────────────────────────
-        splitter = QtWidgets.QSplitter()
-        splitter.setChildrenCollapsible(False)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 1)
-
-        self.multi_view = MultiViewArea(session)
-        splitter.addWidget(self.multi_view)
-
-        self.toolbar = ViewerToolBar(self.multi_view, session, self)
-        root.addWidget(self.toolbar)
-
-        self.side_panel = ViewerSidePanel(session)
-        splitter.addWidget(self.side_panel)
-        splitter.setSizes([1240, 360])
-
-        root.addWidget(splitter, 1)
-
-        # ── Transport controls ────────────────────────────────────────────────
         self.time_controls = TimeControls(session)
         root.addWidget(self.time_controls)
 
-        # ── Playback timer ────────────────────────────────────────────────────
+        # ── Themed toolbars ─────────────────────────────────────────────────
+        self._toolbars = build_viewer_toolbars(self.multi_view, session, self)
+        for tb in self._toolbars:
+            tb.setMovable(True)
+            tb.setFloatable(True)
+            tb.setObjectName(f"ViewerToolBar_{tb.windowTitle().replace(' ', '_')}")
+            self.addToolBar(QtCore.Qt.TopToolBarArea, tb)
+
+        # Keep a reference to the master toolbar for write_frame_if_recording,
+        # dispose() and the All-windows checkbox.
+        self.toolbar = self._toolbars[0] if self._toolbars else None
+        # Backwards compatibility: the playback timer used to call methods on
+        # ``self.toolbar``; route them to the recording toolbar instead.
+        self._recording_toolbar = next(
+            (tb for tb in self._toolbars if hasattr(tb, "write_frame_if_recording")),
+            None,
+        )
+
+        # ── Side-panel sections as dock widgets ─────────────────────────────
+        self._init_dock_factories()
+        for key, title, page_key, area, visible in _DOCK_SPECS:
+            dock = self._build_dock(key, title)
+            self.addDockWidget(_DOCK_AREAS[area], dock)
+            dock.setVisible(visible)
+
+        # Stack the heavy analytic docks behind Display so they share space.
+        self._tabify_default_docks()
+
+        # ── Status bar ───────────────────────────────────────────────────────
+        self.status_chip_bar = StatusChipBar()
+        self.statusBar().addPermanentWidget(self.status_chip_bar, 1)
+        self._update_status()
+
+        # ── Menu bar ─────────────────────────────────────────────────────────
+        self._build_menu_bar()
+
+        # ── Playback timer ───────────────────────────────────────────────────
         self._play_timer = QtCore.QTimer(self)
         self._play_timer.setInterval(16)
         self._play_timer.timeout.connect(self._advance_playback)
@@ -85,12 +173,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._advancing_playback: bool = False
         self._last_render_ms: float = 16.0
 
-        # ── Status bar ────────────────────────────────────────────────────────
-        self.status_chip_bar = StatusChipBar()
-        self.statusBar().addPermanentWidget(self.status_chip_bar, 1)
-        self._update_status()
-
-        # ── Keyboard shortcut ─────────────────────────────────────────────────
+        # ── Keyboard shortcut ────────────────────────────────────────────────
         self._space_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Space"), self)
         self._space_shortcut.activated.connect(self._toggle_play_shortcut)
 
@@ -98,22 +181,184 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         # already running.
         self._prewarming: bool = False
 
-        # ── Startup data pre-warm ─────────────────────────────────────────────
-        # Fire once after the window is fully painted.  Pre-warms the active
-        # scalar series into RAM so the first Play press is instant.
-        # Uses QTimer.singleShot(0) so the event loop paints the window first.
+        # ── Restore persisted geometry & dock layout ─────────────────────────
+        self._restore_window_state()
+
+        # ── Startup data pre-warm ────────────────────────────────────────────
         QtCore.QTimer.singleShot(0, self._prewarm_on_show)
+
+    # ── Dock setup ────────────────────────────────────────────────────────────
+
+    def _init_dock_factories(self) -> None:
+        """Register a factory for every dock so heavy pages stay lazy."""
+        session = self.session
+
+        # Lightweight pages — built immediately on first show.
+        self._lazy_dock_factories["node"] = lambda: NodeSearchSection(session)
+        self._lazy_dock_factories["display"] = lambda: DisplaySection(session)
+        self._lazy_dock_factories["visibility"] = lambda: VisualizationSection(session)
+        self._lazy_dock_factories["warp"] = lambda: WarpSection(session)
+        self._lazy_dock_factories["geographic"] = lambda: GeographicSection(session)
+        # Heavy analytic pages — wrapped in _LazyPage so they only construct
+        # their matplotlib canvases when the user actually shows them.
+        self._lazy_dock_factories["responses"] = lambda: _LazyPage(
+            lambda: _ResponsesAnalysisTabs(session)
+        )
+        self._lazy_dock_factories["gf"] = lambda: _LazyPage(lambda: GFPanel(session))
+
+    def _build_dock(self, key: str, title: str) -> QtWidgets.QDockWidget:
+        dock = QtWidgets.QDockWidget(title, self)
+        dock.setObjectName(f"Dock_{key}")
+        dock.setAllowedAreas(
+            QtCore.Qt.LeftDockWidgetArea
+            | QtCore.Qt.RightDockWidgetArea
+            | QtCore.Qt.BottomDockWidgetArea
+        )
+        dock.setMinimumWidth(280)
+        page = self._lazy_dock_factories[key]()
+        self._side_pages[key] = page
+        scroll = _PageScrollArea(page)
+        dock.setWidget(scroll)
+        self._docks[key] = dock
+        # When the dock becomes visible, ensure lazy pages materialise.
+        dock.visibilityChanged.connect(lambda v, k=key: self._on_dock_visibility(k, v))
+        return dock
+
+    def _on_dock_visibility(self, key: str, visible: bool) -> None:
+        if not visible:
+            return
+        page = self._side_pages.get(key)
+        if isinstance(page, _LazyPage):
+            page.ensure_created()
+            page.refresh("full")
+
+    def _tabify_default_docks(self) -> None:
+        """Tab heavy analytic docks behind Display to save right-area space."""
+        anchor = self._docks.get("display")
+        if anchor is None:
+            return
+        for k in ("responses", "gf", "geographic"):
+            d = self._docks.get(k)
+            if d is not None and d is not anchor:
+                self.tabifyDockWidget(anchor, d)
+        # Make sure Display is the visible one in the tab stack.
+        anchor.raise_()
+
+    # ── Menu bar ─────────────────────────────────────────────────────────────
+
+    def _build_menu_bar(self) -> None:
+        menubar = self.menuBar()
+
+        # View menu — panels (docks), toolbars, theme, layout reset.
+        view_menu = menubar.addMenu("&View")
+
+        panels_menu = view_menu.addMenu("&Panels")
+        for key, title, *_ in _DOCK_SPECS:
+            dock = self._docks.get(key)
+            if dock is None:
+                continue
+            action = dock.toggleViewAction()
+            action.setText(title)
+            panels_menu.addAction(action)
+            self._dock_actions[key] = action
+
+        toolbars_menu = view_menu.addMenu("&Toolbars")
+        for tb in self._toolbars:
+            action = tb.toggleViewAction()
+            action.setText(tb.windowTitle())
+            toolbars_menu.addAction(action)
+            self._toolbar_actions[tb.objectName()] = action
+
+        view_menu.addSeparator()
+
+        theme_menu = view_menu.addMenu("&Theme")
+        self._theme_actions: dict[str, QtGui.QAction] = {}
+        group = QtGui.QActionGroup(self)
+        group.setExclusive(True)
+        for name, label in (("light", "Light"), ("dark", "Dark")):
+            act = QtGui.QAction(label, self, checkable=True)
+            act.setData(name)
+            act.setChecked(self._current_theme == name)
+            act.triggered.connect(lambda _checked, n=name: self.set_theme(n))
+            group.addAction(act)
+            theme_menu.addAction(act)
+            self._theme_actions[name] = act
+
+        view_menu.addSeparator()
+
+        reset_act = QtGui.QAction("Reset window layout", self)
+        reset_act.triggered.connect(self._reset_window_layout)
+        view_menu.addAction(reset_act)
+
+    # ── Theme switching ─────────────────────────────────────────────────────
+
+    def set_theme(self, name: str) -> None:
+        """Apply *name* (``"light"`` or ``"dark"``) to the entire UI."""
+        name = str(name).lower()
+        save_theme_name(name)
+        self._current_theme = name
+        palette = palette_by_name(name)
+        self.setStyleSheet(build_stylesheet(palette))
+        # Refresh widget-owned colours that cannot be expressed via stylesheet.
+        try:
+            self.multi_view.refresh_theme()
+        except Exception:
+            pass
+        # Sync the menu action selection (set_theme may be called programmatically).
+        for n, act in getattr(self, "_theme_actions", {}).items():
+            block = act.blockSignals(True)
+            act.setChecked(n == name)
+            act.blockSignals(block)
+        # 3-D viewports: re-broadcast appearance so scalar bar / text colours
+        # update against the new background.
+        try:
+            self.multi_view.on_session_updated("appearance")
+        except Exception:
+            pass
+
+    # ── Save / restore window state ─────────────────────────────────────────
+
+    def _restore_window_state(self) -> None:
+        s = _settings()
+        geom = s.value(_SETTINGS_GEOMETRY)
+        state = s.value(_SETTINGS_STATE)
+        if geom is not None:
+            try:
+                self.restoreGeometry(geom)
+            except Exception:
+                pass
+        if state is not None:
+            try:
+                self.restoreState(state)
+            except Exception:
+                pass
+
+    def _save_window_state(self) -> None:
+        s = _settings()
+        try:
+            s.setValue(_SETTINGS_GEOMETRY, self.saveGeometry())
+            s.setValue(_SETTINGS_STATE, self.saveState())
+        except Exception:
+            pass
+
+    def _reset_window_layout(self) -> None:
+        s = _settings()
+        s.remove(_SETTINGS_GEOMETRY)
+        s.remove(_SETTINGS_STATE)
+        # Re-show all default docks in their default positions.
+        for key, title, _, area, visible in _DOCK_SPECS:
+            dock = self._docks.get(key)
+            if dock is None:
+                continue
+            dock.setFloating(False)
+            self.addDockWidget(_DOCK_AREAS[area], dock)
+            dock.setVisible(visible)
+        self._tabify_default_docks()
 
     # ── Session update routing ────────────────────────────────────────────────
 
     def on_session_updated(self, reason: str):
-        """Fan a state-change reason out to every affected sub-widget.
-
-        For reasons that change the active data field (``panel_apply``,
-        ``demand``, ``component``, ``warp``, ``vector_field``, ``playback``),
-        ``_prewarm_demands`` is called first so the 3-D render always hits the
-        cache rather than blocking on an HDF5 read.
-        """
+        """Fan a state-change reason out to every affected sub-widget."""
         self.header.sync_from_state()
         self.time_controls.sync_from_state()
 
@@ -126,32 +371,8 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             ):
                 self.multi_view.on_session_updated("static_color")
             self._sync_play_state()
-            self.side_panel.refresh("playback")
+            self._refresh_side_pages("playback")
             return
-            # Prewarm the display demand BEFORE starting the play timer so the
-            # first frame is served from cache and animation is smooth.
-            #
-            # NOTE: displacement (disp) for warp is intentionally NOT included
-            # here.  For large models a single E/N/Z triplet already fills the
-            # cache budget, so adding "disp" would evict the display demand via
-            # LRU on the next load — causing infinite thrashing.  Instead,
-            # apply_warp_settings opens a persistent HDF5 handle that makes
-            # per-frame displacement reads just as fast as a cache hit.
-            if self.session.state.is_playing:
-                from .adapter import GF_DEMAND
-                demand = self.session.state.demand
-                if demand != GF_DEMAND:
-                    needs = [demand]
-                    # Only include disp alongside the display demand when the
-                    # cache budget can hold both triplets simultaneously
-                    # (budget ≥ 6 × one_series_bytes).
-                    if self.session.state.disp_warp_enabled and demand != "disp":
-                        one = self.session.adapter._estimated_series_bytes()
-                        if 6 * one <= self.session.adapter.max_cache_bytes:
-                            needs.append("disp")
-                    self._prewarm_demands(needs)
-            self._sync_play_state()
-            self.side_panel.refresh("playback")
         else:
             if reason in ("panel_apply", "demand", "component"):
                 from .adapter import GF_DEMAND
@@ -180,7 +401,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                     )
 
             self.multi_view.on_session_updated(reason)
-            self.side_panel.refresh(reason)
+            self._refresh_side_pages(reason)
             if reason == "time" and self.session.state.is_playing:
                 self.status_chip_bar.update_time_chip(
                     f"time {self.session.current_time():.3f}s"
@@ -188,56 +409,25 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             else:
                 self._update_status()
             return
-            # Prewarm whenever the active field or warp state changes so the
-            # following 3-D rebuild reads from RAM, not from HDF5.
-            if reason in ("panel_apply", "demand", "component"):
-                from .adapter import GF_DEMAND
-                demand = self.session.state.demand
-                if demand != GF_DEMAND:
-                    needs = [demand]
-                    # Same "2-triplet coexistence" guard as above.
-                    if self.session.state.disp_warp_enabled and demand != "disp":
-                        one = self.session.adapter._estimated_series_bytes()
-                        if 6 * one <= self.session.adapter.max_cache_bytes:
-                            needs.append("disp")
-                    self._prewarm_demands(needs)
-            elif reason == "warp" and self.session.state.disp_warp_enabled:
-                # Only prewarm disp when it can coexist with the display
-                # demand in the cache (budget ≥ 6 × one_series_bytes).
-                # When it doesn't fit, the persistent HDF5 handle opened in
-                # apply_warp_settings is used for fast per-frame reads instead.
-                from .adapter import GF_DEMAND
-                demand = self.session.state.demand
-                if demand != GF_DEMAND:
-                    one = self.session.adapter._estimated_series_bytes()
-                    if 6 * one <= self.session.adapter.max_cache_bytes:
-                        self._prewarm_demands([demand, "disp"])
-            elif reason == "vector_field" and self.session.state.vector_field_enabled:
-                self._prewarm_demands([self.session.state.vector_field_demand])
-            elif reason == "static_color" and self.session.current_wave_blend_enabled():
-                # Wave blend just activated — prewarm the wave demand.
-                from .adapter import GF_DEMAND
-                demand = self.session.state.demand
-                if demand != GF_DEMAND:
-                    needs = [demand]
-                    if self.session.state.disp_warp_enabled and demand != "disp":
-                        one = self.session.adapter._estimated_series_bytes()
-                        if 6 * one <= self.session.adapter.max_cache_bytes:
-                            needs.append("disp")
-                    self._prewarm_demands(needs)
 
-            self.multi_view.on_session_updated(reason)
-            self.side_panel.refresh(reason)
+    def _refresh_side_pages(self, reason: str) -> None:
+        """Refresh every visible side-panel page with *reason*.
 
-        # During frame-by-frame playback only the time chip changes — skip the
-        # full status rebuild (color limits, cache MB, etc.) to reduce Qt
-        # widget pressure on every animation tick.
-        if reason == "time" and self.session.state.is_playing:
-            self.status_chip_bar.update_time_chip(
-                f"time {self.session.current_time():.3f}s"
-            )
-        else:
-            self._update_status()
+        Hidden / collapsed docks are skipped (no widget pressure) and heavy
+        pages re-materialise themselves only when the user shows them.
+        """
+        for key, page in self._side_pages.items():
+            dock = self._docks.get(key)
+            if dock is None or not dock.isVisible():
+                continue
+            try:
+                if isinstance(page, _LazyPage):
+                    if page.is_created:
+                        page.refresh(reason)
+                else:
+                    page.refresh(reason)
+            except Exception:
+                pass
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
@@ -274,7 +464,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         max_index = max(len(self.session.adapter.time) - 1, 0)
         if self.session.state.time_index >= max_index:
             self.session.set_playing(False)
-            self.toolbar.write_frame_if_recording()
+            self._write_recording_frame()
             return
 
         now = time.perf_counter()
@@ -295,14 +485,21 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._playback_frame_accumulator -= frames_to_advance
         remaining = max_index - self.session.state.time_index
         step = max(1, min(frames_to_advance, remaining))
-        # step_time fires on_session_updated("time") → multi_view renders each
-        # pane, side_panel throttles the active trace cursor update.
         _t0 = time.perf_counter()
         self.session.step_time(step)
         _render_ms = (time.perf_counter() - _t0) * 1000.0
         self._last_render_ms = 0.75 * self._last_render_ms + 0.25 * _render_ms
         self._play_timer.setInterval(self._play_interval_ms())
-        self.toolbar.write_frame_if_recording()
+        self._write_recording_frame()
+
+    def _write_recording_frame(self) -> None:
+        rec = self._recording_toolbar
+        if rec is None:
+            return
+        try:
+            rec.write_frame_if_recording()
+        except Exception:
+            pass
 
     # ── Status bar ────────────────────────────────────────────────────────────
 
@@ -374,12 +571,6 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             adapter.open_playback_handle()
 
     def _prewarm_demands(self, demands: list, *, no_evict: bool = False) -> None:
-        """Load *demands* E/N/Z triplets into RAM, showing a BusyDialog.
-
-        Skips demands that are already fully cached, don't fit the budget, or
-        are the special GF demand (which is warmed lazily on demand).
-        Re-entrant calls while a prewarm is running are silently ignored.
-        """
         if self._closing or self._prewarming:
             return
 
@@ -464,13 +655,6 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             self._update_status()
 
     def _prewarm_startup_visual_cache(self) -> None:
-        """Warm startup visual fields without forcing every demand to E/N/Z.
-
-        The visual cache should make Apply instant for the common scalar fields
-        while still preparing displacement components for warp when memory
-        allows it.  Resultant fields cost one cached matrix each; full triplets
-        cost three, so only ``disp`` gets the triplet treatment for warp.
-        """
         if self._closing or self._prewarming:
             return
 
@@ -573,11 +757,6 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Startup pre-warm ──────────────────────────────────────────────────────
 
     def _prewarm_on_show(self):
-        """Pre-warm visual fields and warp displacement once the window is painted.
-
-        Skipped when closing or when the active demand is GF (GF warms lazily
-        on the first Play press).
-        """
         if self._closing:
             return
 
@@ -598,37 +777,27 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Window close / cleanup ────────────────────────────────────────────────
 
     def closeEvent(self, event):  # noqa: N802
-        """Release every VTK / OpenGL / RAM resource when the viewer closes.
-
-        Cleanup order
-        -------------
-        1. Stop the playback timer — no callbacks fire during teardown.
-        2. ``toolbar.dispose()`` — stops any active recording cleanly.
-        3. ``multi_view.dispose()`` — calls ``scene.dispose()`` on every pane,
-           then ``plotter.close()``; releases all OpenGL contexts so subsequent
-           PyVista / matplotlib calls in the same process are not blocked.
-        4. Disable the Space shortcut so it cannot fire post-close.
-        5. ``session._on_window_closed()`` — sets ``is_playing=False``,
-           clears the series / spectrum / arias caches, and sets
-           ``session.window = None`` so ``show()`` can build a fresh window.
-
-        The ``_closing`` flag prevents re-entrancy when ``WA_DeleteOnClose``
-        causes Qt to call ``closeEvent`` a second time.
-        """
         if self._closing:
             event.accept()
             return
 
         self._closing = True
         try:
+            # Persist geometry and dock layout BEFORE tearing widgets down.
+            self._save_window_state()
+        except Exception:
+            pass
+        try:
             try:
                 self._play_timer.stop()
             except Exception:
                 pass
-            try:
-                self.toolbar.dispose()
-            except Exception:
-                pass
+            for tb in self._toolbars:
+                try:
+                    if hasattr(tb, "dispose"):
+                        tb.dispose()
+                except Exception:
+                    pass
             try:
                 self.multi_view.dispose()
             except Exception:

@@ -1,19 +1,22 @@
 """Multi-viewport central area for the interactive viewer.
 
-Provides :class:`ViewPane` (one VTK viewport) and :class:`MultiViewArea`
-(a layout-selector bar + a dynamic grid of panes).
+Each :class:`ViewPane` (one VTK viewport) is wrapped in a
+:class:`~.view_frame.ViewFrame` that paints a thin border, a title-bar with
+the pane name, and standard ParaView-style buttons (split horizontal /
+split vertical, maximize-toggle, pop-out toggle, close).
 
-Design contract
----------------
-* A single :class:`~.session.ViewerSession` is shared by every pane — all
-  state (time, demand, selection, warp …) is global.
-* Each pane owns an independent :class:`~pyvistaqt.QtInteractor` and a
-  :class:`~.scene.ViewerScene`, so cameras and orientations are per-pane.
-* On every ``on_session_updated(reason)`` call from the window, the
-  ``MultiViewArea`` broadcasts the reason to every visible pane; each pane
-  calls the matching scene method and then ``plotter.render()``.
-* Clicking anywhere in a pane marks it as *active* (thin blue top-bar).
-  The toolbar's view-preset and capture operations act on the active pane.
+:class:`MultiViewArea` owns the splitter tree, the camera rail and the
+layout-preset selector.  :class:`TabbedMultiViewArea` wraps several
+``MultiViewArea`` instances inside a ``QTabWidget`` so the user can keep
+multiple layouts side-by-side and switch between them with a click — the
+same model ParaView uses with ``pqTabbedMultiViewWidget``.
+
+The window and the global toolbar always talk to a single
+``TabbedMultiViewArea`` instance.  Attribute access (``active_pane``,
+``active_plotter``, ``_panes``, ``_current_layout``, ``_layout_n``,
+``on_active_pane_changed`` …) is proxied through to the currently visible
+tab so the legacy callers do not need to be aware that multiple layouts now
+coexist.
 """
 
 from __future__ import annotations
@@ -22,15 +25,16 @@ from ._imports import require_viewer_dependencies
 from .busy_dialog import BusyDialog
 from .icons import icon
 from .scene import ViewerScene
-from .theme import LIGHT_PALETTE
+from .theme import active_palette
+from .view_frame import ViewFrame
 
 _, QtInteractor, _, QtCore, _, QtWidgets = require_viewer_dependencies()
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-#: Default label assigned to new panes in creation order (used for initial
-#: camera orientation only — there is no visible combo in the pane UI).
+#: Default label assigned to new panes in creation order — used for initial
+#: camera orientation and as the title shown in the view-frame title-bar.
 _PANE_DEFAULTS: list[str] = [
     "3D NE", "Top", "Front", "Right", "3D NW", "3D SW", "3D SE",
 ]
@@ -46,9 +50,22 @@ LAYOUT_PRESETS: list[tuple[str, int]] = [
     ("GF",  9),   # 3×3 Green Function tensor viewer
 ]
 
+# Promotion targets used by the per-frame split buttons.  The button never
+# shrinks the layout — it only "grows" to the next sensible preset along the
+# requested axis, mirroring ParaView's pqViewFrame.SplitHorizontal /
+# SplitVertical behaviour without rewriting the splitter tree from scratch.
+_SPLIT_H_PROMOTIONS: dict[str, str] = {
+    "1×1": "1×2",
+    "2×1": "2×2",
+    "1+2": "2×2",
+}
+_SPLIT_V_PROMOTIONS: dict[str, str] = {
+    "1×1": "2×1",
+    "1×2": "2×2",
+    "2+1": "2×2",
+}
+
 # GF layout: (adapter component id, viewport label) in row-major order.
-# Row 0 → receiver component 1 (Z), Row 1 → 2 (N), Row 2 → 3 (E)
-# Col 0 → source component 1,      Col 1 → 2,       Col 2 → 3
 _GF_LAYOUT_COMPONENTS: list[tuple[str, str]] = [
     ("g11", "G_11"), ("g12", "G_12"), ("g13", "G_13"),
     ("g21", "G_21"), ("g22", "G_22"), ("g23", "G_23"),
@@ -123,7 +140,7 @@ class CameraViewRail(QtWidgets.QWidget):
             button = QtWidgets.QToolButton()
             button.setObjectName("ViewRailButton")
             button.setText(label)
-            button.setIcon(icon(icon_name, LIGHT_PALETTE.navy, 18))
+            button.setIcon(icon(icon_name, active_palette().navy, 18))
             button.setIconSize(QtCore.QSize(18, 18))
             button.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
             button.setCheckable(True)
@@ -135,6 +152,16 @@ class CameraViewRail(QtWidgets.QWidget):
 
         layout.addStretch(1)
         self._buttons["iso_ne"].setChecked(True)
+
+    def refresh_theme(self) -> None:
+        navy = active_palette().navy
+        for key, button in self._buttons.items():
+            icon_name = next(
+                (icon_name for _, k, _, icon_name in _CAMERA_VIEW_ENTRIES if k == key),
+                None,
+            )
+            if icon_name is not None:
+                button.setIcon(icon(icon_name, navy, 18))
 
     def _request_view(self, key: str):
         callback = self._on_view_requested
@@ -161,10 +188,7 @@ class CameraViewRail(QtWidgets.QWidget):
 # ── ViewPane ──────────────────────────────────────────────────────────────────
 
 class ViewPane(QtWidgets.QWidget):
-    """One viewport: 3 px active-indicator strip + full-height QtInteractor.
-
-    No per-pane menu or combo is shown — camera presets are controlled
-    exclusively from the toolbar above.
+    """One VTK viewport hosted inside a :class:`~.view_frame.ViewFrame`.
 
     Parameters
     ----------
@@ -172,11 +196,12 @@ class ViewPane(QtWidgets.QWidget):
         The shared viewer session (data + state).
     label:
         Initial camera orientation key (one of the ``_PANE_DEFAULTS``).
-        Applied once at construction; not displayed.
+        Applied once at construction; also used as the title shown in the
+        wrapping :class:`~.view_frame.ViewFrame` title-bar.
     on_activated:
         Callable ``(pane: ViewPane) -> None`` fired when the user clicks
         anywhere in this pane.  Used by :class:`MultiViewArea` to track the
-        active pane.
+        active pane and update the frame border / title-bar colour.
     """
 
     def __init__(
@@ -191,18 +216,13 @@ class ViewPane(QtWidgets.QWidget):
         self._on_activated = on_activated
         self._is_active = False
         self._show_station_tags = True
+        self._label = str(label)
 
         self.setMinimumSize(80, 80)
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-
-        # ── Active-pane indicator (thin colored strip at the top) ─────────────
-        self._indicator = QtWidgets.QWidget()
-        self._indicator.setFixedHeight(3)
-        self._indicator.setVisible(False)
-        outer.addWidget(self._indicator)
 
         # ── VTK interactor ───────────────────────────────────────────────────
         self.plotter = QtInteractor(self)
@@ -256,12 +276,17 @@ class ViewPane(QtWidgets.QWidget):
             self._on_activated(self)
 
     def set_active(self, active: bool):
-        if self._is_active == active:
-            return
-        self._is_active = active
-        self._indicator.setVisible(active)
-        if active:
-            self._indicator.setStyleSheet("background: #1565C0;")
+        """Track active state.
+
+        Visible highlighting is now driven by the wrapping
+        :class:`~.view_frame.ViewFrame`'s border / title-bar; this method
+        keeps the boolean state for legacy queries.
+        """
+        self._is_active = bool(active)
+
+    @property
+    def label(self) -> str:
+        return self._label
 
     def set_station_tags_visible(self, visible: bool, render: bool = True):
         self._show_station_tags = bool(visible)
@@ -301,7 +326,6 @@ class ViewPane(QtWidgets.QWidget):
             self.scene.refresh_selection(render=False)
             self.scene.refresh_ghost_reference(render=False)
         elif reason == "multi_selection":
-            # Node added/removed from selection set, or show/hide filter changed.
             self.scene.rebuild_scalar_actor(render=False)
             self.scene.refresh_multi_selection(render=False)
         elif reason == "node_opacity":
@@ -311,7 +335,6 @@ class ViewPane(QtWidgets.QWidget):
         elif reason == "vector_field":
             self.scene.refresh_vector_field(render=False)
         else:
-            # "full" or any unknown reason — full rebuild.
             self.scene.rebuild_scalar_actor(render=False)
             self.scene.refresh_selection(render=False)
         try:
@@ -365,20 +388,18 @@ class ViewPane(QtWidgets.QWidget):
 class MultiViewArea(QtWidgets.QWidget):
     """Central zone that manages 1–N synchronised :class:`ViewPane` instances.
 
-    The layout is controlled by a compact selector bar at the top.  Switching
-    layouts reparents existing panes into a new splitter tree without destroying
-    them, so cameras and rendering state are preserved across layout changes.
-
-    Parameters
-    ----------
-    session:
-        The shared viewer session passed to every new :class:`ViewPane`.
+    Each pane is wrapped in a :class:`~.view_frame.ViewFrame`.  Switching
+    layouts re-parents the *frames* (which in turn hold their panes) so the
+    underlying VTK contexts are preserved across layout changes.
     """
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
         self.session = session
         self._panes: list[ViewPane] = []
+        self._frames: dict[ViewPane, ViewFrame] = {}
+        self._popout_windows: dict[ViewPane, QtWidgets.QMainWindow] = {}
+        self._maximized_frame: ViewFrame | None = None
         self._active_pane: ViewPane | None = None
         self.on_active_pane_changed = None
         self._current_layout: str = "1×1"
@@ -396,46 +417,33 @@ class MultiViewArea(QtWidgets.QWidget):
         # ── Layout selector bar ───────────────────────────────────────────────
         bar = QtWidgets.QWidget()
         bar.setFixedHeight(30)
-        bar.setStyleSheet("background: #f0f0f0; border-bottom: 1px solid #d0d0d0;")
+        palette = active_palette()
+        bar.setStyleSheet(
+            f"background: {palette.surface_2}; "
+            f"border-bottom: 1px solid {palette.border};"
+        )
         blay = QtWidgets.QHBoxLayout(bar)
         blay.setContentsMargins(6, 3, 6, 3)
         blay.setSpacing(3)
 
         lbl = QtWidgets.QLabel("Layout:")
-        lbl.setStyleSheet("color: #404040; font-size: 11px;")
+        lbl.setStyleSheet(f"color: {palette.text_2}; font-size: 11px;")
         blay.addWidget(lbl)
 
         self._layout_buttons: dict[str, QtWidgets.QPushButton] = {}
         for name, _n in LAYOUT_PRESETS:
             btn = QtWidgets.QPushButton(name)
-            # GF button gets a slightly different style to distinguish it as
-            # a "specialised" preset rather than a generic grid selector.
             w = 36 if name == "GF" else 44
             btn.setFixedSize(w, 22)
             btn.setCheckable(True)
-            if name == "GF":
-                btn.setStyleSheet(
-                    "QPushButton { border: 1px solid #1565C0; border-radius: 3px;"
-                    "  background: #e8f0fe; color: #1565C0; font-size: 11px;"
-                    "  font-weight: bold; }"
-                    "QPushButton:checked { background: #e8f0fe; color: #1e3558;"
-                    "  border-color: #2a6bc2; }"
-                    "QPushButton:hover:!checked { background: #c5d8fa; }"
-                )
-            else:
-                btn.setStyleSheet(
-                    "QPushButton { border: 1px solid #bbb; border-radius: 3px;"
-                    "  background: #fff; font-size: 11px; }"
-                    "QPushButton:checked { background: #e8f0fe; color: #1e3558;"
-                    "  border-color: #2a6bc2; }"
-                    "QPushButton:hover:!checked { background: #e3eaf6; }"
-                )
             btn.clicked.connect(lambda _c, n=name: self._switch_layout(n))
             self._layout_buttons[name] = btn
             blay.addWidget(btn)
+        self._refresh_layout_button_styles()
 
         blay.addStretch(1)
         root.addWidget(bar)
+        self._layout_bar = bar
 
         # ── Content area ──────────────────────────────────────────────────────
         body = QtWidgets.QWidget()
@@ -446,15 +454,96 @@ class MultiViewArea(QtWidgets.QWidget):
         self._view_rail = CameraViewRail(self._apply_camera_preset, self)
         body_lay.addWidget(self._view_rail)
 
-        self._content = QtWidgets.QWidget()
-        self._content_lay = QtWidgets.QVBoxLayout(self._content)
-        self._content_lay.setContentsMargins(0, 0, 0, 0)
-        self._content_lay.setSpacing(0)
-        body_lay.addWidget(self._content, 1)
+        # Stack holds two pages: the splitter grid and the maximised slot.
+        self._content_stack = QtWidgets.QStackedWidget()
+        body_lay.addWidget(self._content_stack, 1)
+
+        self._grid_host = QtWidgets.QWidget()
+        self._grid_lay = QtWidgets.QVBoxLayout(self._grid_host)
+        self._grid_lay.setContentsMargins(0, 0, 0, 0)
+        self._grid_lay.setSpacing(0)
+        self._content_stack.addWidget(self._grid_host)             # index 0
+
+        self._max_host = QtWidgets.QWidget()
+        self._max_lay = QtWidgets.QVBoxLayout(self._max_host)
+        self._max_lay.setContentsMargins(0, 0, 0, 0)
+        self._max_lay.setSpacing(0)
+        self._content_stack.addWidget(self._max_host)               # index 1
+
         root.addWidget(body, 1)
 
         # Start with a single pane.
         self._switch_layout("1×1")
+
+    # ── Theme ─────────────────────────────────────────────────────────────────
+
+    def refresh_theme(self) -> None:
+        """Repaint chrome and frame icons after a palette swap."""
+        palette = active_palette()
+        self._layout_bar.setStyleSheet(
+            f"background: {palette.surface_2}; "
+            f"border-bottom: 1px solid {palette.border};"
+        )
+        self._refresh_layout_button_styles()
+        for frame in list(self._frames.values()):
+            frame.refresh_theme()
+        try:
+            self._view_rail.refresh_theme()
+        except Exception:
+            pass
+
+    def _refresh_layout_button_styles(self) -> None:
+        palette = active_palette()
+        for name, btn in self._layout_buttons.items():
+            if name == "GF":
+                btn.setStyleSheet(
+                    f"QPushButton {{ border: 1px solid {palette.accent_dark}; "
+                    f"border-radius: 3px; background: {palette.surface_3}; "
+                    f"color: {palette.accent_dark}; font-size: 11px; "
+                    f"font-weight: bold; }}"
+                    f"QPushButton:checked {{ background: {palette.surface_3}; "
+                    f"color: {palette.navy}; border-color: {palette.accent}; }}"
+                    f"QPushButton:hover:!checked {{ background: {palette.surface_3}; }}"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ border: 1px solid {palette.border}; "
+                    f"border-radius: 3px; background: {palette.surface}; "
+                    f"color: {palette.text}; font-size: 11px; }}"
+                    f"QPushButton:checked {{ background: {palette.surface_3}; "
+                    f"color: {palette.navy}; border-color: {palette.accent}; }}"
+                    f"QPushButton:hover:!checked {{ background: {palette.surface_3}; }}"
+                )
+
+    # ── Frame helpers ─────────────────────────────────────────────────────────
+
+    def _frame_for(self, pane: ViewPane) -> ViewFrame:
+        """Return the existing wrapper for *pane*, creating it on first use."""
+        frame = self._frames.get(pane)
+        if frame is None:
+            frame = ViewFrame(
+                pane,
+                pane.label,
+                on_split_h=self._on_frame_split_h,
+                on_split_v=self._on_frame_split_v,
+                on_maximize_toggle=self._on_frame_maximize_toggle,
+                on_popout_toggle=self._on_frame_popout_toggle,
+                on_close=self._on_frame_close,
+            )
+            self._frames[pane] = frame
+        return frame
+
+    def _frame_close_visibility(self, panes: list[ViewPane]) -> None:
+        """Show / hide each frame's close button depending on the current layout.
+
+        Closing the only frame in a 1×1 layout would leave an empty grid, so
+        we just hide the button instead of disabling it (matches ParaView).
+        """
+        allow_close = len(panes) > 1
+        for pane in panes:
+            frame = self._frames.get(pane)
+            if frame is not None:
+                frame.set_close_button_visible(allow_close)
 
     # ── Layout switching ──────────────────────────────────────────────────────
 
@@ -524,18 +613,28 @@ class MultiViewArea(QtWidgets.QWidget):
             pass
 
     def _switch_layout(self, name: str):
-        """Switch to layout *name*, creating panes as needed."""
+        """Switch to layout *name*, creating panes / frames as needed."""
+        if name not in self._layout_n:
+            return
+
+        # Exit any maximised view before re-laying-out the grid.
+        if self._maximized_frame is not None:
+            self._maximized_frame.set_maximized_state(False)
+            self._restore_maximised_frame()
+
         old_layout = self._current_layout
         needed = self._layout_n.get(name, 1)
 
-        # 1. Detach all panes from the current container (reparent, not delete).
+        # 1. Detach all panes / frames from the current container.
         for pane in self._panes:
-            pane.setParent(self)
-            pane.hide()
+            frame = self._frames.get(pane)
+            target = frame if frame is not None else pane
+            target.setParent(self)
+            target.hide()
 
         # 2. Remove and schedule the old container for deletion.
         if self._container is not None:
-            self._content_lay.removeWidget(self._container)
+            self._grid_lay.removeWidget(self._container)
             self._container.setParent(None)
             self._container.deleteLater()
             self._container = None
@@ -551,116 +650,245 @@ class MultiViewArea(QtWidgets.QWidget):
             )
             self._panes.append(pane)
 
-        # 4. Build the new splitter/container.
+        # Materialise frames for every pane we are about to show.
         panes_for_layout = self._panes[:needed]
+        for pane in panes_for_layout:
+            self._frame_for(pane)
+
+        # 4. Build the new splitter/container.
         self._container = self._build_container(name, panes_for_layout)
-        self._content_lay.addWidget(self._container)
+        self._grid_lay.addWidget(self._container)
         self._container.show()
 
-        # addWidget already reparented each pane into the container.
         for pane in panes_for_layout:
-            pane.show()
+            frame = self._frames[pane]
+            frame.show()
 
         # 5. Ensure a valid active pane.
         if self._active_pane not in panes_for_layout:
             self._set_active_pane(panes_for_layout[0] if panes_for_layout else None)
+        else:
+            # Refresh the active flag on the (still-active) pane's frame.
+            self._set_active_pane(self._active_pane)
 
         # 6. Sync button states.
         self._current_layout = name
         for n, btn in self._layout_buttons.items():
             btn.setChecked(n == name)
 
-        # 7. GF-specific configuration.
-        # Entering GF: auto-switch demand to GF + pin each pane to one component.
-        # Leaving GF: clear pins and restore the previous demand.
+        # 7. Frame close visibility — hidden on the only pane of 1×1.
+        self._frame_close_visibility(panes_for_layout)
+
+        # 8. GF-specific configuration.
         if name == "GF":
             self._apply_gf_layout(panes_for_layout)
         elif old_layout == "GF":
             self._clear_gf_layout(panes_for_layout)
 
+        # Show the grid page in the content stack.
+        self._content_stack.setCurrentIndex(0)
+
     def _build_container(
         self, name: str, panes: list[ViewPane]
     ) -> QtWidgets.QWidget:
-        """Assemble a splitter tree for *name* using the given pane list."""
+        """Assemble a splitter tree for *name* using the given pane list.
 
-        def _h(*ps) -> QtWidgets.QSplitter:
+        The splitter holds *frames* (so the title-bar / border are always
+        visible) rather than raw panes.
+        """
+
+        def _h(*frames) -> QtWidgets.QSplitter:
             s = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
             s.setChildrenCollapsible(False)
-            for p in ps:
-                s.addWidget(p)
+            for f in frames:
+                s.addWidget(f)
             return s
 
-        def _v(*ps) -> QtWidgets.QSplitter:
+        def _v(*frames) -> QtWidgets.QSplitter:
             s = QtWidgets.QSplitter(QtCore.Qt.Vertical)
             s.setChildrenCollapsible(False)
-            for p in ps:
-                s.addWidget(p)
+            for f in frames:
+                s.addWidget(f)
             return s
+
+        frames = [self._frame_for(p) for p in panes]
 
         if name == "1×1":
             w = QtWidgets.QWidget()
             lay = QtWidgets.QVBoxLayout(w)
             lay.setContentsMargins(0, 0, 0, 0)
-            lay.addWidget(panes[0])
+            lay.addWidget(frames[0])
             return w
 
         if name == "1×2":
-            return _h(panes[0], panes[1])
+            return _h(frames[0], frames[1])
 
         if name == "2×1":
-            return _v(panes[0], panes[1])
+            return _v(frames[0], frames[1])
 
         if name == "2×2":
-            return _v(_h(panes[0], panes[1]), _h(panes[2], panes[3]))
+            return _v(_h(frames[0], frames[1]), _h(frames[2], frames[3]))
 
         if name == "2+1":
-            # Two panes on the top row, one full-width on the bottom.
-            outer = _v(_h(panes[0], panes[1]), panes[2])
+            outer = _v(_h(frames[0], frames[1]), frames[2])
             outer.setSizes([600, 300])
             return outer
 
         if name == "1+2":
-            # One full-width pane on top, two panes on the bottom row.
-            outer = _v(panes[0], _h(panes[1], panes[2]))
+            outer = _v(frames[0], _h(frames[1], frames[2]))
             outer.setSizes([300, 600])
             return outer
 
         if name == "GF":
-            # 3 × 3 tensor grid — each pane shows one GF component.
-            # Row 0: G_11 G_12 G_13
-            # Row 1: G_21 G_22 G_23
-            # Row 2: G_31 G_32 G_33
-            row0 = _h(panes[0], panes[1], panes[2])
-            row1 = _h(panes[3], panes[4], panes[5])
-            row2 = _h(panes[6], panes[7], panes[8])
+            row0 = _h(frames[0], frames[1], frames[2])
+            row1 = _h(frames[3], frames[4], frames[5])
+            row2 = _h(frames[6], frames[7], frames[8])
             return _v(row0, row1, row2)
 
-        # Fallback — plain horizontal split.
-        return _h(*panes)
+        return _h(*frames)
+
+    # ── Frame-button handlers ────────────────────────────────────────────────
+
+    def _on_frame_split_h(self, frame: ViewFrame) -> None:
+        target = _SPLIT_H_PROMOTIONS.get(self._current_layout)
+        if target is not None:
+            self._switch_layout(target)
+
+    def _on_frame_split_v(self, frame: ViewFrame) -> None:
+        target = _SPLIT_V_PROMOTIONS.get(self._current_layout)
+        if target is not None:
+            self._switch_layout(target)
+
+    def _on_frame_maximize_toggle(self, frame: ViewFrame, wants_maximized: bool):
+        if wants_maximized:
+            # Restore any previous maximised frame first.
+            if self._maximized_frame is not None and self._maximized_frame is not frame:
+                self._maximized_frame.set_maximized_state(False)
+                self._restore_maximised_frame()
+            self._maximise_frame(frame)
+        else:
+            self._restore_maximised_frame()
+
+    def _on_frame_popout_toggle(self, frame: ViewFrame, wants_popout: bool):
+        pane = frame.pane
+        if not isinstance(pane, ViewPane):
+            return
+        if wants_popout:
+            self._popout_frame(frame)
+        else:
+            self._dock_frame(frame)
+
+    def _on_frame_close(self, frame: ViewFrame) -> None:
+        # "Closing" reduces the current layout by one preset slot.  For the
+        # grid presets we walk back through the LAYOUT_PRESETS to the closest
+        # smaller compatible one.  This mirrors ParaView's "close pane"
+        # behaviour without rewriting splitter trees by hand.
+        downgrades = {
+            "1×2": "1×1",
+            "2×1": "1×1",
+            "2×2": "1×2",
+            "2+1": "1×2",
+            "1+2": "1×2",
+            "GF":  "1×1",
+        }
+        target = downgrades.get(self._current_layout)
+        if target is not None:
+            self._switch_layout(target)
+
+    # ── Maximise / restore ───────────────────────────────────────────────────
+
+    def _maximise_frame(self, frame: ViewFrame) -> None:
+        # Remember its splitter slot so we can put it back later.
+        parent = frame.parentWidget()
+        index = None
+        if isinstance(parent, QtWidgets.QSplitter):
+            index = parent.indexOf(frame)
+        self._maximize_origin: tuple[QtWidgets.QSplitter | None, int | None] = (
+            parent if isinstance(parent, QtWidgets.QSplitter) else None,
+            index,
+        )
+        self._maximized_frame = frame
+        # Reparent into the maximise host and show stack[1].
+        frame.setParent(self._max_host)
+        self._max_lay.addWidget(frame)
+        frame.show()
+        self._content_stack.setCurrentIndex(1)
+
+    def _restore_maximised_frame(self) -> None:
+        frame = self._maximized_frame
+        if frame is None:
+            return
+        origin = getattr(self, "_maximize_origin", (None, None))
+        splitter, index = origin
+        self._max_lay.removeWidget(frame)
+        if isinstance(splitter, QtWidgets.QSplitter) and index is not None:
+            splitter.insertWidget(index, frame)
+        else:
+            # Fallback: rebuild the current layout from scratch.
+            self._switch_layout(self._current_layout)
+        frame.show()
+        self._maximized_frame = None
+        self._content_stack.setCurrentIndex(0)
+
+    # ── Pop-out / re-dock ────────────────────────────────────────────────────
+
+    def _popout_frame(self, frame: ViewFrame) -> None:
+        pane = frame.pane
+        if pane in self._popout_windows:
+            return
+        # Remember where to put the frame back when re-docked.
+        parent = frame.parentWidget()
+        origin_splitter = parent if isinstance(parent, QtWidgets.QSplitter) else None
+        origin_index = origin_splitter.indexOf(frame) if origin_splitter is not None else None
+        frame.setProperty("_origin_splitter", origin_splitter)
+        frame.setProperty("_origin_index", origin_index)
+
+        # Build a small top-level window for the frame.
+        win = QtWidgets.QMainWindow()
+        win.setWindowTitle(f"View — {frame.title()}")
+        win.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
+        win.resize(800, 600)
+        win.setCentralWidget(frame)
+
+        def _on_close(_event):
+            # User closed the floating window — re-dock instead of disposing.
+            frame.set_popout_state(False)
+            self._dock_frame(frame)
+            _event.accept()
+
+        win.closeEvent = _on_close  # type: ignore[assignment]
+        self._popout_windows[pane] = win
+        win.show()
+        # The slot in the grid is now empty — leave it; QSplitter handles
+        # missing children by giving them zero size.  Re-docking restores it.
+
+    def _dock_frame(self, frame: ViewFrame) -> None:
+        pane = frame.pane
+        win = self._popout_windows.pop(pane, None)
+        if win is None:
+            return
+        win.setCentralWidget(None)
+        origin_splitter = frame.property("_origin_splitter")
+        origin_index = frame.property("_origin_index")
+        if isinstance(origin_splitter, QtWidgets.QSplitter) and origin_index is not None:
+            origin_splitter.insertWidget(int(origin_index), frame)
+            frame.show()
+        else:
+            # Could not find an origin slot — rebuild the layout to recover.
+            self._switch_layout(self._current_layout)
+        try:
+            win.close()
+            win.deleteLater()
+        except Exception:
+            pass
 
     # ── GF layout helpers ─────────────────────────────────────────────────────
 
     def _apply_gf_layout(self, panes: list) -> None:
-        """Configure the 9 GF panes: Top view + per-pane component pin.
-
-        Steps
-        -----
-        1. Save the current demand so it can be restored when leaving GF layout.
-        2. Pre-warm all 9 GF component series in one pass (avoids per-frame I/O).
-        3. Set Top / orthographic camera on every pane.
-        4. Assign each pane its component pin and label overlay.
-        5. Switch session demand to "gf" — the normal demand-change broadcast
-           rebuilds every pane's scalar actor using its pin.  If demand is
-           already "gf" the panes are rebuilt directly.
-        """
         session = self.session
-
-        # Step 1 — remember old demand + component so both can be restored on exit.
         self._pre_gf_demand = session.state.demand
         self._pre_gf_component = session.state.component
 
-        # Step 2 — pre-warm all 9 GF series so playback is instant.
-        # Show the unified busy dialog while loading all components.
         if session.adapter.has_gf and session.adapter.has_map:
             sf = int(getattr(session, "_display_gf_subfault", 0))
             window = getattr(session, "window", None)
@@ -675,7 +903,7 @@ class MultiViewArea(QtWidgets.QWidget):
                 QtWidgets.QApplication.processEvents()
 
             for idx in range(9):
-                comp_label = _GF_LAYOUT_COMPONENTS[idx][1]   # e.g. "G_11"
+                comp_label = _GF_LAYOUT_COMPONENTS[idx][1]
                 if busy is not None:
                     busy.set_message(
                         f"Warming Green Function series...\n"
@@ -693,32 +921,27 @@ class MultiViewArea(QtWidgets.QWidget):
             if busy is not None:
                 busy.close()
 
-        # Steps 3 & 4 — camera + pins (before the demand switch so the first
-        # rebuild already uses the correct per-pane component).
         for pane, (comp, label) in zip(panes, _GF_LAYOUT_COMPONENTS):
             try:
                 scene = getattr(pane, "scene", None)
                 if scene is None:
                     continue
-                # Top (plan) view + orthographic for a clean 2-D heat map.
                 try:
                     pane.plotter.view_xy()
                     pane.plotter.enable_parallel_projection()
                 except Exception:
                     pass
                 scene.set_gf_component_pin(comp, label)
+                frame = self._frames.get(pane)
+                if frame is not None:
+                    frame.set_title(label)
             except Exception:
                 pass
 
-        # Step 5 — switch demand.
         if session.adapter.has_gf and session.adapter.has_map:
             if session.state.demand != "gf":
-                # set_demand triggers the normal window broadcast → rebuilds
-                # all 9 active panes via on_session_updated("demand").
                 session.set_demand("gf")
             else:
-                # Demand is already GF — rebuild panes manually (broadcast
-                # would be a no-op because the demand did not change).
                 for pane in panes:
                     try:
                         if pane.scene is not None:
@@ -727,8 +950,6 @@ class MultiViewArea(QtWidgets.QWidget):
                     except Exception:
                         pass
         else:
-            # No GF data — rebuild panes so they show whatever demand is active,
-            # ignoring the (inactive) pins.
             for pane in panes:
                 try:
                     if pane.scene is not None:
@@ -738,16 +959,8 @@ class MultiViewArea(QtWidgets.QWidget):
                     pass
 
     def _clear_gf_layout(self, panes_for_new_layout: list) -> None:
-        """Remove GF component pins from all panes and restore the old demand.
-
-        Called when the user switches *away* from the GF layout.  The pins are
-        cleared on every pane (not just the currently visible 9), so stale
-        overrides can never bleed into a later layout switch.
-        """
         session = self.session
 
-        # Clear pins on ALL panes (some may have been hidden, but they still
-        # carry their pin state and could become active again later).
         for pane in self._panes:
             try:
                 scene = getattr(pane, "scene", None)
@@ -755,26 +968,24 @@ class MultiViewArea(QtWidgets.QWidget):
                     scene.set_gf_component_pin(None, None)
             except Exception:
                 pass
+            # Restore the frame title to the pane's original label.
+            frame = self._frames.get(pane)
+            if frame is not None:
+                frame.set_title(pane.label)
 
-        # Restore the demand + component that were active before GF layout.
         pre_demand = self._pre_gf_demand
         pre_comp   = self._pre_gf_component
         self._pre_gf_demand    = None
         self._pre_gf_component = None
 
         if pre_demand is not None and pre_demand != session.state.demand:
-            # Restore the component first (set_demand auto-corrects it anyway,
-            # but setting it explicitly preserves the user's original choice).
             if pre_comp is not None:
                 try:
                     session.state.set_component(pre_comp)
                 except Exception:
                     pass
-            # set_demand fires the normal broadcast → rebuilds the new layout's
-            # panes with their cleared pins.
             session.set_demand(pre_demand)
         else:
-            # Demand unchanged — restore component manually and rebuild.
             if pre_comp is not None:
                 try:
                     session.state.set_component(pre_comp)
@@ -795,7 +1006,11 @@ class MultiViewArea(QtWidgets.QWidget):
 
     def _set_active_pane(self, pane: ViewPane | None):
         for p in self._panes:
-            p.set_active(p is pane)
+            frame = self._frames.get(p)
+            is_active = p is pane
+            p.set_active(is_active)
+            if frame is not None:
+                frame.set_active(is_active)
         self._active_pane = pane
         callback = self.on_active_pane_changed
         if callable(callback):
@@ -806,12 +1021,10 @@ class MultiViewArea(QtWidgets.QWidget):
 
     @property
     def active_pane(self) -> ViewPane | None:
-        """The pane the user last clicked, or the first pane."""
         return self._active_pane
 
     @property
     def active_plotter(self):
-        """Plotter of the active pane — used by the toolbar for capture/views."""
         if self._active_pane is not None:
             return self._active_pane.plotter
         return self._panes[0].plotter if self._panes else None
@@ -825,17 +1038,34 @@ class MultiViewArea(QtWidgets.QWidget):
             pane.on_session_updated(reason)
 
     def dispose(self) -> None:
-        """Dispose every pane and release layout containers."""
+        """Dispose every pane, frame, popout window and layout container."""
+        # Close any still-floating popout windows first.
+        for win in list(self._popout_windows.values()):
+            try:
+                win.setCentralWidget(None)
+            except Exception:
+                pass
+            try:
+                win.close()
+                win.deleteLater()
+            except Exception:
+                pass
+        self._popout_windows.clear()
+
         for pane in list(self._panes):
             try:
                 pane.dispose()
             except Exception:
                 pass
+            frame = self._frames.pop(pane, None)
+            if frame is not None:
+                try:
+                    frame.setParent(None)
+                    frame.deleteLater()
+                except Exception:
+                    pass
             try:
                 pane.setParent(None)
-            except Exception:
-                pass
-            try:
                 pane.deleteLater()
             except Exception:
                 pass
@@ -844,14 +1074,11 @@ class MultiViewArea(QtWidgets.QWidget):
 
         if self._container is not None:
             try:
-                self._content_lay.removeWidget(self._container)
+                self._grid_lay.removeWidget(self._container)
             except Exception:
                 pass
             try:
                 self._container.setParent(None)
-            except Exception:
-                pass
-            try:
                 self._container.deleteLater()
             except Exception:
                 pass
@@ -860,14 +1087,179 @@ class MultiViewArea(QtWidgets.QWidget):
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def close_all_panes(self):
-        """Close every pane's VTK interactor, releasing all OpenGL contexts.
-
-        Called by :class:`~.window.ViewerMainWindow` ``closeEvent`` so that
-        subsequent PyVista / matplotlib operations in the same process are
-        not blocked by orphaned VTK render windows.
-        """
         for pane in self._panes:
             try:
                 pane.plotter.close()
             except Exception:
                 pass
+
+
+# ── TabbedMultiViewArea ───────────────────────────────────────────────────────
+
+class TabbedMultiViewArea(QtWidgets.QWidget):
+    """ParaView-style tabbed wrapper around several :class:`MultiViewArea`.
+
+    Each tab is an independent :class:`MultiViewArea` with its own grid, its
+    own panes and its own active selection.  Attribute access is proxied to
+    the currently active tab so the existing toolbar and main window keep
+    working without modification.
+    """
+
+    def __init__(self, session, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self._on_active_pane_changed_external = None
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._tabs = QtWidgets.QTabWidget()
+        self._tabs.tabBar().setObjectName("MultiViewTabs")
+        self._tabs.setMovable(True)
+        self._tabs.setTabsClosable(False)
+        self._tabs.setDocumentMode(True)
+        self._tabs.tabCloseRequested.connect(self._on_tab_close_requested)
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+
+        # "+" corner button — adds a new layout tab on demand.
+        self._add_btn = QtWidgets.QToolButton()
+        self._add_btn.setText("+")
+        self._add_btn.setToolTip("Add a new viewport tab")
+        self._add_btn.setAutoRaise(True)
+        self._add_btn.setFixedSize(22, 22)
+        self._add_btn.clicked.connect(lambda: self.add_tab())
+        self._tabs.setCornerWidget(self._add_btn, QtCore.Qt.TopRightCorner)
+
+        root.addWidget(self._tabs)
+
+        # Bootstrap: one Main view tab.
+        self.add_tab(label="Main view")
+
+    # ── Tab management ───────────────────────────────────────────────────────
+
+    def add_tab(self, label: str | None = None) -> MultiViewArea:
+        area = MultiViewArea(self.session)
+        area.on_active_pane_changed = self._proxy_active_pane_changed
+        text = label or f"View {self._tabs.count() + 1}"
+        idx = self._tabs.addTab(area, text)
+        self._tabs.setCurrentIndex(idx)
+        self._tabs.setTabsClosable(self._tabs.count() > 1)
+        return area
+
+    def _on_tab_close_requested(self, index: int) -> None:
+        if self._tabs.count() <= 1:
+            return
+        area = self._tabs.widget(index)
+        self._tabs.removeTab(index)
+        if isinstance(area, MultiViewArea):
+            try:
+                area.dispose()
+            except Exception:
+                pass
+            try:
+                area.deleteLater()
+            except Exception:
+                pass
+        self._tabs.setTabsClosable(self._tabs.count() > 1)
+
+    def _on_tab_changed(self, _index: int) -> None:
+        self._proxy_active_pane_changed(self.active_pane)
+
+    def _proxy_active_pane_changed(self, pane) -> None:
+        cb = self._on_active_pane_changed_external
+        if callable(cb):
+            try:
+                cb(pane)
+            except Exception:
+                pass
+
+    # ── Proxy attributes (read by the toolbar / window) ──────────────────────
+
+    @property
+    def current(self) -> MultiViewArea | None:
+        widget = self._tabs.currentWidget()
+        return widget if isinstance(widget, MultiViewArea) else None
+
+    @property
+    def on_active_pane_changed(self):
+        return self._on_active_pane_changed_external
+
+    @on_active_pane_changed.setter
+    def on_active_pane_changed(self, callback):
+        self._on_active_pane_changed_external = callback
+
+    @property
+    def active_pane(self):
+        c = self.current
+        return c.active_pane if c is not None else None
+
+    @property
+    def active_plotter(self):
+        c = self.current
+        return c.active_plotter if c is not None else None
+
+    @property
+    def _panes(self):
+        c = self.current
+        return c._panes if c is not None else []
+
+    @property
+    def _current_layout(self):
+        c = self.current
+        return c._current_layout if c is not None else "1×1"
+
+    @property
+    def _layout_n(self):
+        c = self.current
+        return c._layout_n if c is not None else dict(LAYOUT_PRESETS)
+
+    def visible_panes(self):
+        c = self.current
+        return c.visible_panes() if c is not None else []
+
+    def apply_selection_filter(self, mode: str, *, apply_to_all: bool = False):
+        c = self.current
+        if c is not None:
+            c.apply_selection_filter(mode, apply_to_all=apply_to_all)
+
+    def set_camera_apply_to_all(self, enabled: bool):
+        c = self.current
+        if c is not None:
+            c.set_camera_apply_to_all(enabled)
+
+    def on_session_updated(self, reason: str) -> None:
+        """Broadcast *reason* to every tab so background tabs stay in sync."""
+        for i in range(self._tabs.count()):
+            area = self._tabs.widget(i)
+            if isinstance(area, MultiViewArea):
+                try:
+                    area.on_session_updated(reason)
+                except Exception:
+                    pass
+
+    def dispose(self) -> None:
+        while self._tabs.count() > 0:
+            area = self._tabs.widget(0)
+            self._tabs.removeTab(0)
+            if isinstance(area, MultiViewArea):
+                try:
+                    area.dispose()
+                except Exception:
+                    pass
+                try:
+                    area.deleteLater()
+                except Exception:
+                    pass
+
+    def refresh_theme(self) -> None:
+        for i in range(self._tabs.count()):
+            area = self._tabs.widget(i)
+            if hasattr(area, "refresh_theme"):
+                try:
+                    area.refresh_theme()
+                except Exception:
+                    pass
+
+
+__all__ = ["MultiViewArea", "TabbedMultiViewArea", "ViewPane", "LAYOUT_PRESETS"]

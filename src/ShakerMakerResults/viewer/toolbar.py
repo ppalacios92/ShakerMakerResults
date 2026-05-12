@@ -1,4 +1,20 @@
-"""Top toolbar for the interactive viewer — view presets, capture and overlays."""
+"""Themed Qt toolbars for the interactive viewer.
+
+ParaView splits its top toolbar into a handful of small purpose-specific
+toolbars (camera, axes, animation time, color, representation, custom
+viewpoints …).  Each one is independently floatable, hideable from the
+``View → Toolbars`` menu, and reorderable by dragging.
+
+We follow the same pattern: :func:`build_viewer_toolbars` returns a list of
+:class:`QToolBar` instances that the :class:`ViewerMainWindow` adds via
+``addToolBar``.  Each toolbar carries a class attribute ``windowTitle`` that
+shows up in the toggle action of the View menu.
+
+The recording / screenshot toolbar additionally exposes
+``write_frame_if_recording()`` so the playback timer in
+:class:`ViewerMainWindow` can request one frame per simulation tick during
+an active recording.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +23,9 @@ import os
 
 from ._imports import require_viewer_dependencies
 from .icons import icon as viewer_icon
-from .theme import LIGHT_PALETTE
+from .theme import active_palette
+
+import numpy as np
 
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
 
@@ -16,6 +34,7 @@ try:
     _HAS_QTA = True
 except ImportError:
     _HAS_QTA = False
+
 
 # ── ffmpeg path ───────────────────────────────────────────────────────────────
 # Set this to your local ffmpeg.exe if ffmpeg is not on the system PATH.
@@ -30,7 +49,6 @@ def _icon(name: str, color: str = "#404040"):
     return None
 
 
-# (label, tooltip, azimuth_offset)
 _ISO_PRESETS = [
     ("NE", "Isometric — North-East",  0),
     ("NW", "Isometric — North-West", 90),
@@ -38,7 +56,6 @@ _ISO_PRESETS = [
     ("SE", "Isometric — South-East", 270),
 ]
 
-# (label, tooltip, icon_name, plotter_method, extra_kwargs)
 _VIEW_PRESETS = [
     ("Top",   "Top view (+Z)",    "mdi.arrow-collapse-up",   "view_xy",  {}),
     ("Bot",   "Bottom view (−Z)", "mdi.arrow-collapse-down", "view_xy",  {"negative": True}),
@@ -49,166 +66,38 @@ _VIEW_PRESETS = [
 ]
 
 
-class ViewerToolBar(QtWidgets.QWidget):
-    """Horizontal icon toolbar placed below the header bar.
+# ── Shared helpers (mixed-in by each themed toolbar) ─────────────────────────
 
-    Parameters
-    ----------
-    multi_view:
-        The :class:`~.multi_view.MultiViewArea` that owns all view panes.
-        View-preset and capture operations always target its *active* pane,
-        so the toolbar naturally follows whichever pane the user last clicked.
+_LOCAL_ICON_NAMES = {
+    "fit", "ortho", "rotate_left_90", "rotate_right_90",
+    "capture_screen", "record_screen", "stop_screen",
+}
+
+
+class _ToolBarBase(QtWidgets.QToolBar):
+    """Shared plumbing for every themed viewer toolbar.
+
+    Subclasses inherit:
+
+    * the access pattern to the active plotter / active pane;
+    * the "All windows" toggle wired into the multi-view area;
+    * helper factories for icon and text buttons.
     """
 
-    def __init__(self, multi_view, session, parent=None):
-        super().__init__(parent)
+    def __init__(self, title: str, multi_view, session, parent=None):
+        super().__init__(title, parent)
         self._multi_view = multi_view
         self._session = session
-        self._recording = False
-        self._recording_writer = None
-        self._show_bbox = False
-        self._show_axes = True
+        self.setIconSize(QtCore.QSize(18, 18))
+        self.setMovable(True)
+        self.setFloatable(True)
+        # Re-export setWindowTitle as the toolbar's user-visible name.
+        self.setWindowTitle(title)
 
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(2, 1, 2, 1)
-        layout.setSpacing(1)
-
-        self._all_windows_chk = QtWidgets.QCheckBox("All windows")
-        self._all_windows_chk.setToolTip("Apply toolbar actions to all visible panes")
-        self._all_windows_chk.setChecked(False)
-        self._all_windows_chk.toggled.connect(self._sync_apply_to_all)
-        layout.addWidget(self._all_windows_chk)
-
-        # ── Camera ───────────────────────────────────────────────────────────
-        self._add_sep(layout)
-
-        fit_btn = self._btn(
-            "Fit", "fit", "Fit all — reset camera to show full model"
-        )
-        fit_btn.clicked.connect(self._fit_all)
-        layout.addWidget(fit_btn)
-        self._ortho_btn = self._btn(
-            "Ortho", "ortho",
-            "Toggle orthographic / perspective projection",
-            checkable=True,
-        )
-        self._ortho_btn.toggled.connect(self._toggle_ortho)
-        layout.addWidget(self._ortho_btn)
-        self._add_sep(layout)
-        rot_minus_btn = self._btn("-90", "rotate_left_90", "Rotate active view -90 around Z")
-        rot_minus_btn.clicked.connect(lambda: self._rotate_active_camera(-90))
-        layout.addWidget(rot_minus_btn)
-        rot_plus_btn = self._btn("+90", "rotate_right_90", "Rotate active view +90 around Z")
-        rot_plus_btn.clicked.connect(lambda: self._rotate_active_camera(90))
-        layout.addWidget(rot_plus_btn)
-        self._add_sep(layout)
-        self._stations_btn = self._btn(
-            "Stations",
-            "mdi.map-marker-multiple-outline",
-            "Toggle station tags visibility",
-            checkable=True,
-        )
-        self._stations_btn.setChecked(True)
-        self._stations_btn.toggled.connect(self._toggle_stations)
-        layout.addWidget(self._stations_btn)
-        self._multi_view.on_active_pane_changed = self._sync_from_active_pane
-
-        # ── Capture ───────────────────────────────────────────────────────────
-        self._add_sep(layout)
-
-        shot_btn = self._btn("", "capture_screen", "Save full viewer window as PNG")
-        shot_btn.clicked.connect(self._screenshot)
-        layout.addWidget(shot_btn)
-
-        self._record_btn = self._btn(
-            "Rec", "record_screen",
-            "Record full viewer window to MP4 / GIF",
-            checkable=True,
-        )
-        self._record_btn.toggled.connect(self._toggle_record)
-        layout.addWidget(self._record_btn)
-
-        # ── Overlays ─────────────────────────────────────────────────────────
-        self._add_sep(layout)
-
-        self._axes_btn = self._btn(
-            "Axes", "mdi.axis-arrow",
-            "Toggle orientation axes widget",
-            checkable=True,
-        )
-        self._axes_btn.setChecked(True)
-        self._axes_btn.toggled.connect(self._toggle_axes)
-        layout.addWidget(self._axes_btn)
-
-        self._bbox_btn = self._btn(
-            "BBox", "mdi.crop-square",
-            "Toggle bounding box",
-            checkable=True,
-        )
-        self._bbox_btn.toggled.connect(self._toggle_bbox)
-        layout.addWidget(self._bbox_btn)
-
-        # ── Selection filters ─────────────────────────────────────────────────
-        self._add_sep(layout)
-
-        self._sel_all_btn = self._sel_btn(
-            "Show All", "sel_all", "Show all visible nodes (reset filter)"
-        )
-        self._sel_all_btn.clicked.connect(
-            lambda: self._apply_selection_filter("all")
-        )
-        layout.addWidget(self._sel_all_btn)
-
-        self._sel_only_btn = self._sel_btn(
-            "Show Sel.", "sel_show", "Show only selected nodes"
-        )
-        self._sel_only_btn.clicked.connect(
-            lambda: self._apply_selection_filter("only")
-        )
-        layout.addWidget(self._sel_only_btn)
-
-        self._sel_hide_btn = self._sel_btn(
-            "Hide Sel.", "sel_hide", "Hide selected nodes"
-        )
-        self._sel_hide_btn.clicked.connect(
-            lambda: self._apply_selection_filter("hide")
-        )
-        layout.addWidget(self._sel_hide_btn)
-
-        self._sel_prev_btn = self._sel_btn(
-            "Reset", "sel_cursor", "Reset selection filter"
-        )
-        self._sel_prev_btn.clicked.connect(
-            lambda: self._apply_selection_filter("all")
-        )
-        layout.addWidget(self._sel_prev_btn)
-
-        # ── Node opacity ──────────────────────────────────────────────────────
-        self._add_sep(layout)
-
-        opacity_lbl = QtWidgets.QLabel("Opacity")
-        opacity_lbl.setToolTip("Uniform opacity for all rendered nodes (0 = transparent, 1 = opaque)")
-        layout.addWidget(opacity_lbl)
-
-        self._opacity_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self._opacity_slider.setRange(0, 100)
-        self._opacity_slider.setValue(100)
-        self._opacity_slider.setFixedWidth(80)
-        self._opacity_slider.setToolTip("Node opacity")
-        self._opacity_slider.valueChanged.connect(self._on_opacity_changed)
-        layout.addWidget(self._opacity_slider)
-
-        layout.addStretch(1)
-
-        self.setStyleSheet("ViewerToolBar { border-bottom: 1px solid #d0d0d0; }")
-        self._sync_from_active_pane(self._multi_view.active_pane)
-        self._sync_apply_to_all(self._all_windows_chk.isChecked())
-
-    # ── Active-plotter access ─────────────────────────────────────────────────
+    # ── Pane / plotter access ───────────────────────────────────────────────
 
     @property
     def _plotter(self):
-        """Active pane's plotter — re-evaluated on every access."""
         return self._multi_view.active_plotter
 
     def _visible_panes(self):
@@ -218,88 +107,190 @@ class ViewerToolBar(QtWidgets.QWidget):
         needed = int(layout_n.get(current_layout, len(panes) or 1))
         return panes[: max(0, min(needed, len(panes)))]
 
-    def _target_plotters(self):
-        if self._all_windows_chk.isChecked():
+    def _target_plotters(self, all_windows: bool):
+        if all_windows:
             plotters = [getattr(pane, "plotter", None) for pane in self._visible_panes()]
         else:
             plotters = [self._plotter]
         unique = []
         seen = set()
         for p in plotters:
-            if p is None:
+            if p is None or id(p) in seen:
                 continue
-            key = id(p)
-            if key in seen:
-                continue
-            seen.add(key)
+            seen.add(id(p))
             unique.append(p)
         return unique
 
-    def _target_panes(self):
-        if self._all_windows_chk.isChecked():
+    def _target_panes(self, all_windows: bool):
+        if all_windows:
             return self._visible_panes()
         pane = getattr(self._multi_view, "active_pane", None)
         return [pane] if pane is not None else []
 
-    def _sync_apply_to_all(self, checked: bool) -> None:
+    # ── Button factories ────────────────────────────────────────────────────
+
+    def _btn(
+        self,
+        text: str,
+        icon_name: str,
+        tooltip: str,
+        *,
+        checkable: bool = False,
+    ) -> QtWidgets.QToolButton:
+        btn = QtWidgets.QToolButton(self)
+        ic = (
+            viewer_icon(icon_name, active_palette().navy, 18)
+            if icon_name in _LOCAL_ICON_NAMES
+            else _icon(icon_name, active_palette().navy)
+        )
+        if ic is not None:
+            btn.setIcon(ic)
+            btn.setIconSize(QtCore.QSize(18, 18))
+            if text:
+                btn.setText(text)
+                btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+            else:
+                btn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        else:
+            _FALLBACK = {
+                "mdi.rotate-3d-variant":       "⬡",
+                "mdi.arrow-collapse-up":        "⬆",
+                "mdi.arrow-collapse-down":      "⬇",
+                "mdi.arrow-expand-up":          "↑",
+                "mdi.arrow-expand-down":        "↓",
+                "mdi.arrow-expand-left":        "←",
+                "mdi.arrow-expand-right":       "→",
+                "mdi.fit-to-page-outline":      "⌖",
+                "mdi.grid":                     "⊞",
+                "mdi.camera-outline":           "📷",
+                "mdi.record-circle-outline":    "⏺",
+                "mdi.axis-arrow":               "✛",
+                "mdi.crop-square":              "▭",
+            }
+            btn.setText(text or _FALLBACK.get(icon_name, icon_name.split(".")[-1]))
+        btn.setToolTip(tooltip)
+        btn.setAutoRaise(True)
+        btn.setCheckable(checkable)
+        btn.setFixedHeight(26)
+        return btn
+
+    def _sel_btn(self, label: str, icon_name: str, tooltip: str) -> QtWidgets.QToolButton:
+        btn = QtWidgets.QToolButton(self)
+        btn.setText(label)
+        btn.setIcon(viewer_icon(icon_name, active_palette().navy, 16))
+        btn.setIconSize(QtCore.QSize(16, 16))
+        btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        btn.setToolTip(tooltip)
+        btn.setAutoRaise(True)
+        btn.setFixedHeight(26)
+        return btn
+
+    # Optional disposer; specific toolbars override if they hold resources.
+    def dispose(self) -> None:
+        return None
+
+
+# ── Shared "All windows" coordination ────────────────────────────────────────
+
+class _AllWindowsState:
+    """Shared toggle propagated to every themed toolbar.
+
+    The state lives in one object so the user-facing checkbox in the camera
+    toolbar and the broadcast logic in the other toolbars all agree on
+    whether actions target every pane or just the active one.
+    """
+
+    def __init__(self, multi_view):
+        self._multi_view = multi_view
+        self._enabled = False
+        self._subscribers: list = []
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def set(self, value: bool) -> None:
+        value = bool(value)
+        if value == self._enabled:
+            return
+        self._enabled = value
         setter = getattr(self._multi_view, "set_camera_apply_to_all", None)
         if callable(setter):
-            setter(bool(checked))
+            try:
+                setter(value)
+            except Exception:
+                pass
+        for cb in self._subscribers:
+            try:
+                cb(value)
+            except Exception:
+                pass
 
-    # ── View presets ──────────────────────────────────────────────────────────
+    def subscribe(self, cb) -> None:
+        self._subscribers.append(cb)
 
-    def _view_cb(self, method_name: str, kwargs: dict):
-        """Return a callback that calls *method_name* on the active plotter."""
-        def _cb():
-            plotters = self._target_plotters()
-            if not plotters:
-                return
-            for p in plotters:
-                fn = getattr(p, method_name, None)
-                if fn is None:
-                    continue
-                try:
-                    fn(**kwargs)
-                    p.render()
-                except Exception:
-                    pass
-        return _cb
 
-    def _iso_view_cb(self, azimuth_extra: float):
-        """Return a callback for an isometric view rotated by *azimuth_extra*°."""
-        def _cb():
-            plotters = self._target_plotters()
-            if not plotters:
-                return
-            for p in plotters:
-                try:
-                    p.view_isometric()
-                    if azimuth_extra:
-                        p.camera.Azimuth(azimuth_extra)
-                        p.reset_camera_clipping_range()
-                    p.render()
-                except Exception:
-                    pass
-        return _cb
+# ── Camera toolbar (presets + ortho/rotate + All windows toggle) ─────────────
+
+class CameraToolBar(_ToolBarBase):
+    """Camera fit / projection / rotate buttons + ``All windows`` checkbox."""
+
+    def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        super().__init__("Camera", multi_view, session, parent)
+        self._all_state = all_state
+
+        # All windows toggle — first item, communicates scope of every action.
+        self._all_chk = QtWidgets.QCheckBox("All windows")
+        self._all_chk.setToolTip("Apply camera / view actions to every visible pane")
+        self._all_chk.setChecked(all_state.enabled)
+        self._all_chk.toggled.connect(all_state.set)
+        all_state.subscribe(lambda v: self._all_chk.setChecked(v))
+        self.addWidget(self._all_chk)
+        self.addSeparator()
+
+        fit_btn = self._btn("Fit", "fit", "Fit all — reset camera to show full model")
+        fit_btn.clicked.connect(self._fit_all)
+        self.addWidget(fit_btn)
+
+        self._ortho_btn = self._btn(
+            "Ortho", "ortho",
+            "Toggle orthographic / perspective projection",
+            checkable=True,
+        )
+        self._ortho_btn.toggled.connect(self._toggle_ortho)
+        self.addWidget(self._ortho_btn)
+
+        self.addSeparator()
+        rot_minus_btn = self._btn("-90", "rotate_left_90", "Rotate active view -90 around Z")
+        rot_minus_btn.clicked.connect(lambda: self._rotate_camera(-90))
+        self.addWidget(rot_minus_btn)
+        rot_plus_btn = self._btn("+90", "rotate_right_90", "Rotate active view +90 around Z")
+        rot_plus_btn.clicked.connect(lambda: self._rotate_camera(90))
+        self.addWidget(rot_plus_btn)
+
+    # ── Internals ───────────────────────────────────────────────────────────
 
     def _fit_all(self):
-        plotters = self._target_plotters()
-        if not plotters:
-            return
-        for p in plotters:
+        for p in self._target_plotters(self._all_state.enabled):
             try:
                 p.reset_camera()
                 p.render()
             except Exception:
                 pass
 
-    # ── Camera ────────────────────────────────────────────────────────────────
+    def _toggle_ortho(self, checked: bool):
+        for p in self._target_plotters(self._all_state.enabled):
+            try:
+                if checked:
+                    p.enable_parallel_projection()
+                else:
+                    p.disable_parallel_projection()
+                p.render()
+            except Exception:
+                pass
 
-    def _rotate_active_camera(self, degrees: float):
-        plotters = self._target_plotters()
-        if not plotters:
-            return
-        for p in plotters:
+    def _rotate_camera(self, degrees: float):
+        for p in self._target_plotters(self._all_state.enabled):
             camera = getattr(p, "camera", None)
             if camera is None:
                 continue
@@ -336,21 +327,164 @@ class ViewerToolBar(QtWidgets.QWidget):
             except Exception:
                 pass
 
-    def _toggle_ortho(self, checked: bool):
-        plotters = self._target_plotters()
-        if not plotters:
-            return
-        for p in plotters:
+
+# ── Overlays toolbar (axes, bbox, stations) ──────────────────────────────────
+
+class OverlaysToolBar(_ToolBarBase):
+    """Toggle visibility of helper overlays (orientation axes, bbox, stations)."""
+
+    def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        super().__init__("Overlays", multi_view, session, parent)
+        self._all_state = all_state
+        self._show_bbox = False
+        self._show_axes = True
+
+        self._stations_btn = self._btn(
+            "Stations",
+            "mdi.map-marker-multiple-outline",
+            "Toggle station tags visibility",
+            checkable=True,
+        )
+        self._stations_btn.setChecked(True)
+        self._stations_btn.toggled.connect(self._toggle_stations)
+        self.addWidget(self._stations_btn)
+        self._multi_view.on_active_pane_changed = self._sync_from_active_pane
+
+        self._axes_btn = self._btn(
+            "Axes", "mdi.axis-arrow",
+            "Toggle orientation axes widget",
+            checkable=True,
+        )
+        self._axes_btn.setChecked(True)
+        self._axes_btn.toggled.connect(self._toggle_axes)
+        self.addWidget(self._axes_btn)
+
+        self._bbox_btn = self._btn(
+            "BBox", "mdi.crop-square",
+            "Toggle bounding box",
+            checkable=True,
+        )
+        self._bbox_btn.toggled.connect(self._toggle_bbox)
+        self.addWidget(self._bbox_btn)
+
+        self._sync_from_active_pane(self._multi_view.active_pane)
+
+    def _toggle_axes(self, checked: bool):
+        self._show_axes = checked
+        for p in self._target_plotters(self._all_state.enabled):
             try:
                 if checked:
-                    p.enable_parallel_projection()
+                    p.show_axes()
                 else:
-                    p.disable_parallel_projection()
+                    p.hide_axes()
                 p.render()
             except Exception:
                 pass
 
-    # ── Capture ───────────────────────────────────────────────────────────────
+    def _toggle_bbox(self, checked: bool):
+        self._show_bbox = checked
+        for p in self._target_plotters(self._all_state.enabled):
+            try:
+                if checked:
+                    p.add_bounding_box()
+                else:
+                    p.remove_bounding_box()
+                p.render()
+            except Exception:
+                pass
+
+    def _toggle_stations(self, checked: bool):
+        panes = self._target_panes(self._all_state.enabled)
+        if not panes:
+            return
+        for pane in panes:
+            if pane is None:
+                continue
+            try:
+                pane.set_station_tags_visible(bool(checked))
+            except Exception:
+                pass
+
+    def _sync_from_active_pane(self, pane=None):
+        if pane is None:
+            pane = getattr(self._multi_view, "active_pane", None)
+        checked = True if pane is None else pane.station_tags_visible()
+        self._stations_btn.blockSignals(True)
+        self._stations_btn.setChecked(bool(checked))
+        self._stations_btn.blockSignals(False)
+
+
+# ── Selection toolbar (show all / show selected / hide selected) ─────────────
+
+class SelectionToolBar(_ToolBarBase):
+    """Selection-filter buttons (delegates to MultiViewArea.apply_selection_filter)."""
+
+    def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        super().__init__("Selection", multi_view, session, parent)
+        self._all_state = all_state
+
+        all_btn = self._sel_btn(
+            "Show All", "sel_all", "Show all visible nodes (reset filter)"
+        )
+        all_btn.clicked.connect(lambda: self._apply("all"))
+        self.addWidget(all_btn)
+
+        only_btn = self._sel_btn(
+            "Show Sel.", "sel_show", "Show only selected nodes"
+        )
+        only_btn.clicked.connect(lambda: self._apply("only"))
+        self.addWidget(only_btn)
+
+        hide_btn = self._sel_btn(
+            "Hide Sel.", "sel_hide", "Hide selected nodes"
+        )
+        hide_btn.clicked.connect(lambda: self._apply("hide"))
+        self.addWidget(hide_btn)
+
+        reset_btn = self._sel_btn(
+            "Reset", "sel_cursor", "Reset selection filter"
+        )
+        reset_btn.clicked.connect(lambda: self._apply("all"))
+        self.addWidget(reset_btn)
+
+    def _apply(self, mode: str):
+        fn = getattr(self._multi_view, "apply_selection_filter", None)
+        if callable(fn):
+            try:
+                fn(mode, apply_to_all=self._all_state.enabled)
+            except Exception:
+                pass
+
+
+# ── Capture toolbar (screenshot + record) ────────────────────────────────────
+
+class CaptureToolBar(_ToolBarBase):
+    """Capture buttons + recording state.
+
+    The :class:`ViewerMainWindow` calls :meth:`write_frame_if_recording` after
+    every playback step so the recorded MP4 / GIF stays in sync with the
+    animation.
+    """
+
+    def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        super().__init__("Capture", multi_view, session, parent)
+        self._all_state = all_state
+        self._recording = False
+        self._recording_writer = None
+
+        shot_btn = self._btn("", "capture_screen", "Save full viewer window as PNG")
+        shot_btn.clicked.connect(self._screenshot)
+        self.addWidget(shot_btn)
+
+        self._record_btn = self._btn(
+            "Rec", "record_screen",
+            "Record full viewer window to MP4 / GIF",
+            checkable=True,
+        )
+        self._record_btn.toggled.connect(self._toggle_record)
+        self.addWidget(self._record_btn)
+
+    # ── Recording lifecycle ─────────────────────────────────────────────────
 
     def _screenshot(self):
         widget = self._capture_widget()
@@ -407,7 +541,7 @@ class ViewerToolBar(QtWidgets.QWidget):
         except Exception as exc:
             self._close_recording_writer()
             self._recording = False
-            self._record_btn.setIcon(viewer_icon("record_screen", LIGHT_PALETTE.navy, 18))
+            self._record_btn.setIcon(viewer_icon("record_screen", active_palette().navy, 18))
             self._uncheck_record()
             QtWidgets.QMessageBox.warning(
                 self, "Recording failed",
@@ -419,27 +553,22 @@ class ViewerToolBar(QtWidgets.QWidget):
         if self._recording:
             self._close_recording_writer()
         self._recording = False
-        self._record_btn.setIcon(viewer_icon("record_screen", LIGHT_PALETTE.navy, 18))
+        self._record_btn.setIcon(viewer_icon("record_screen", active_palette().navy, 18))
         self._record_btn.setToolTip("Record full viewer window to MP4 / GIF")
 
     def _uncheck_record(self):
-        """Silently uncheck the record button (user cancelled or error)."""
         self._record_btn.blockSignals(True)
         self._record_btn.setChecked(False)
         self._record_btn.blockSignals(False)
 
     def write_frame_if_recording(self):
-        """Write the current viewer window as one video frame after each playback step."""
         if not self._recording or self._recording_writer is None:
             return
         try:
             self._write_widget_frame()
         except Exception:
-            # Writer failed mid-recording — stop gracefully.
             self._stop_recording()
             self._uncheck_record()
-
-    # ── Overlays ──────────────────────────────────────────────────────────────
 
     def _capture_widget(self):
         return self.window()
@@ -500,143 +629,56 @@ class ViewerToolBar(QtWidgets.QWidget):
                 pass
 
     def dispose(self) -> None:
-        """Release toolbar runtime state before the viewer closes."""
         try:
             self._stop_recording()
         except Exception:
             pass
-        self._multi_view = None
 
-    def _toggle_axes(self, checked: bool):
-        plotters = self._target_plotters()
-        if not plotters:
-            return
-        self._show_axes = checked
-        for p in plotters:
-            try:
-                if checked:
-                    p.show_axes()
-                else:
-                    p.hide_axes()
-                p.render()
-            except Exception:
-                pass
 
-    def _toggle_bbox(self, checked: bool):
-        plotters = self._target_plotters()
-        if not plotters:
-            return
-        self._show_bbox = checked
-        for p in plotters:
-            try:
-                if checked:
-                    p.add_bounding_box()
-                else:
-                    p.remove_bounding_box()
-                p.render()
-            except Exception:
-                pass
+# ── Display toolbar (opacity slider) ─────────────────────────────────────────
 
-    def _toggle_stations(self, checked: bool):
-        panes = self._target_panes()
-        if not panes:
-            return
-        for pane in panes:
-            if pane is None:
-                continue
-            try:
-                pane.set_station_tags_visible(bool(checked))
-            except Exception:
-                pass
+class DisplayToolBar(_ToolBarBase):
+    """Node opacity slider."""
 
-    def _sync_from_active_pane(self, pane=None):
-        if pane is None:
-            pane = getattr(self._multi_view, "active_pane", None)
-        checked = True if pane is None else pane.station_tags_visible()
-        self._stations_btn.blockSignals(True)
-        self._stations_btn.setChecked(bool(checked))
-        self._stations_btn.blockSignals(False)
+    def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        super().__init__("Display", multi_view, session, parent)
+        self._all_state = all_state
 
-    # ── Selection helpers ─────────────────────────────────────────────────────
+        label = QtWidgets.QLabel("Opacity")
+        label.setToolTip("Uniform opacity for all rendered nodes (0 = transparent, 1 = opaque)")
+        self.addWidget(label)
+
+        self._opacity_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._opacity_slider.setRange(0, 100)
+        self._opacity_slider.setValue(100)
+        self._opacity_slider.setFixedWidth(120)
+        self._opacity_slider.setToolTip("Node opacity")
+        self._opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        self.addWidget(self._opacity_slider)
 
     def _on_opacity_changed(self, value: int):
         self._session.set_node_opacity(value / 100.0)
 
-    def _apply_selection_filter(self, mode: str):
-        apply_fn = getattr(self._multi_view, "apply_selection_filter", None)
-        if callable(apply_fn):
-            apply_fn(mode, apply_to_all=self._all_windows_chk.isChecked())
 
-    def _sel_btn(self, label: str, icon_name: str, tooltip: str) -> QtWidgets.QToolButton:
-        """Create a small toolbar button using a viewer SVG icon."""
-        btn = QtWidgets.QToolButton()
-        btn.setText(label)
-        btn.setIcon(viewer_icon(icon_name, LIGHT_PALETTE.navy, 16))
-        btn.setIconSize(QtCore.QSize(16, 16))
-        btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        btn.setToolTip(tooltip)
-        btn.setAutoRaise(True)
-        btn.setFixedHeight(26)
-        return btn
+# ── Public factory ───────────────────────────────────────────────────────────
 
-    def _btn(
-        self,
-        text: str,
-        icon_name: str,
-        tooltip: str,
-        *,
-        checkable: bool = False,
-    ) -> QtWidgets.QToolButton:
-        btn = QtWidgets.QToolButton()
-        local_icon_names = {
-            "fit",
-            "ortho",
-            "rotate_left_90",
-            "rotate_right_90",
-            "capture_screen",
-            "record_screen",
-            "stop_screen",
-        }
-        ic = (
-            viewer_icon(icon_name, LIGHT_PALETTE.navy, 18)
-            if icon_name in local_icon_names
-            else _icon(icon_name)
-        )
-        if ic is not None:
-            btn.setIcon(ic)
-            btn.setIconSize(QtCore.QSize(18, 18))
-            if text:
-                btn.setText(text)
-                btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-            else:
-                btn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
-        else:
-            _FALLBACK = {
-                "mdi.rotate-3d-variant":       "⬡",
-                "mdi.arrow-collapse-up":        "⬆",
-                "mdi.arrow-collapse-down":      "⬇",
-                "mdi.arrow-expand-up":          "↑",
-                "mdi.arrow-expand-down":        "↓",
-                "mdi.arrow-expand-left":        "←",
-                "mdi.arrow-expand-right":       "→",
-                "mdi.fit-to-page-outline":      "⌖",
-                "mdi.grid":                     "⊞",
-                "mdi.camera-outline":           "📷",
-                "mdi.record-circle-outline":    "⏺",
-                "mdi.axis-arrow":               "✛",
-                "mdi.crop-square":              "▭",
-            }
-            btn.setText(text or _FALLBACK.get(icon_name, icon_name.split(".")[-1]))
-        btn.setToolTip(tooltip)
-        btn.setAutoRaise(True)
-        btn.setCheckable(checkable)
-        btn.setFixedHeight(26)
-        return btn
+def build_viewer_toolbars(multi_view, session, parent) -> list[_ToolBarBase]:
+    """Construct every themed toolbar in the order the window expects."""
+    state = _AllWindowsState(multi_view)
+    return [
+        CameraToolBar(multi_view, session, state, parent),
+        OverlaysToolBar(multi_view, session, state, parent),
+        SelectionToolBar(multi_view, session, state, parent),
+        CaptureToolBar(multi_view, session, state, parent),
+        DisplayToolBar(multi_view, session, state, parent),
+    ]
 
-    @staticmethod
-    def _add_sep(layout: QtWidgets.QHBoxLayout):
-        sep = QtWidgets.QFrame()
-        sep.setFrameShape(QtWidgets.QFrame.VLine)
-        sep.setFrameShadow(QtWidgets.QFrame.Sunken)
-        sep.setFixedWidth(8)
-        layout.addWidget(sep)
+
+__all__ = [
+    "CameraToolBar",
+    "OverlaysToolBar",
+    "SelectionToolBar",
+    "CaptureToolBar",
+    "DisplayToolBar",
+    "build_viewer_toolbars",
+]
