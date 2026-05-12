@@ -1180,6 +1180,10 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
         super().__init__(parent)
         self.session = session
         self._on_active_pane_changed_external = None
+        # Optional callback fired when the tab/pane structure changes
+        # (add tab, close tab).  The window connects it to the Scene
+        # Browser refresh so the tree stays current without polling.
+        self.on_structure_changed = None
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1216,7 +1220,16 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
         idx = self._tabs.addTab(area, text)
         self._tabs.setCurrentIndex(idx)
         self._tabs.setTabsClosable(self._tabs.count() > 1)
+        self._fire_structure_changed()
         return area
+
+    def _fire_structure_changed(self) -> None:
+        cb = self.on_structure_changed
+        if callable(cb):
+            try:
+                cb()
+            except Exception:
+                pass
 
     def _on_tab_close_requested(self, index: int) -> None:
         if self._tabs.count() <= 1:
@@ -1233,23 +1246,23 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
             except Exception:
                 pass
         self._tabs.setTabsClosable(self._tabs.count() > 1)
+        self._fire_structure_changed()
 
     def _on_tab_changed(self, _index: int) -> None:
-        # Flush any reasons this tab missed while it was in the background.
-        # Combining them into a single broadcast keeps the wake-up cheap:
-        # ``rebuild_scalar_actor`` already handles every reason that touches
-        # the field / color map / warp; we send each accumulated reason in
-        # sequence and let the scene de-duplicate redundant work.
+        # Wake up the new tab: rather than replaying every accumulated
+        # reason (each of which can trigger a full ``rebuild_scalar_actor``
+        # on 100k-point clouds) we coalesce the lot into a single ``full``
+        # broadcast.  ``full`` already covers the union of every other
+        # reason's effects in ``ViewPane.on_session_updated``.
         new_area = self.current
         if isinstance(new_area, MultiViewArea):
             pending = getattr(new_area, "_pending_reasons", None)
             if pending:
-                for reason in list(pending):
-                    try:
-                        new_area.on_session_updated(reason)
-                    except Exception:
-                        pass
                 pending.clear()
+                try:
+                    new_area.on_session_updated("full")
+                except Exception:
+                    pass
         self._proxy_active_pane_changed(self.active_pane)
 
     def _proxy_active_pane_changed(self, pane) -> None:

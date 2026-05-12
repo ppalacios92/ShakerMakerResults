@@ -219,12 +219,22 @@ class _SectionBase(QtWidgets.QWidget):
             dlg.close()
 
     def _make_apply_button(self, callback, message: str = "Updating scene…") -> QtWidgets.QPushButton:
-        """Create a disabled Apply button that shows the busy overlay on click."""
+        """Create an always-clickable Apply button that shows the busy overlay.
+
+        Earlier the button was gated by an internal "dirty" flag — it
+        stayed disabled until the user touched a control.  In practice
+        background refreshes (playback ticks, pane state syncs) cleared
+        the flag faster than the user could click, so the button looked
+        permanently locked.  The user explicitly asked for it to be
+        always pressable; we keep ``_dirty`` to remember whether the
+        section has unsaved edits (for refresh-skipping logic) but no
+        longer use it to disable the button.
+        """
         def _wrapped():
             self._run_heavy(callback, message)
 
         btn = QtWidgets.QPushButton("Apply")
-        btn.setEnabled(False)
+        btn.setEnabled(True)
         btn.clicked.connect(_wrapped)
         self.apply_button = btn
         return btn
@@ -233,13 +243,11 @@ class _SectionBase(QtWidgets.QWidget):
         if self._syncing:
             return
         self._dirty = bool(dirty)
-        if self.apply_button is not None:
-            self.apply_button.setEnabled(self._dirty)
+        # Button stays clickable; flag only drives refresh-skipping.
 
     def _clear_dirty(self):
         self._dirty = False
-        if self.apply_button is not None:
-            self.apply_button.setEnabled(False)
+        # Button stays clickable.
 
     @staticmethod
     def _set_combo(combo, value):
@@ -763,7 +771,9 @@ class StaticColorSection(_SectionBase):
         )
 
         self.apply_button = QtWidgets.QPushButton("Apply")
-        self.apply_button.setEnabled(False)
+        # Always clickable — matches the rest of the side panel, where the
+        # dirty flag only drives refresh-skipping logic now.
+        self.apply_button.setEnabled(True)
         self.apply_button.clicked.connect(self._apply_with_busy)
 
         form.addRow("Source", self.source_combo)
@@ -847,7 +857,10 @@ class StaticColorSection(_SectionBase):
             self.wave_blend_strength_spin.setEnabled(
                 allow and self.session.current_wave_blend_enabled()
             )
-            self.apply_button.setEnabled(allow and self._dirty)
+            # Apply stays clickable regardless of dirty flag — user
+            # explicitly asked for this.  We still respect the playback
+            # lock-out (no static-color recompute while animating).
+            self.apply_button.setEnabled(allow)
         finally:
             self._syncing = False
 
@@ -857,12 +870,11 @@ class StaticColorSection(_SectionBase):
         if self._syncing:
             return
         self._dirty = bool(dirty)
-        if not self.session.state.is_playing:
-            self.apply_button.setEnabled(self._dirty)
+        # Button stays clickable; flag only drives refresh-skipping.
 
     def _clear_dirty(self) -> None:
         self._dirty = False
-        self.apply_button.setEnabled(False)
+        # Button stays clickable.
 
     def _on_source_changed(self, *_):
         if self._syncing:

@@ -167,20 +167,29 @@ class PipelineBrowser(QtWidgets.QTreeWidget):
 
             panes = list(getattr(area, "_panes", []) or [])
             for pane_index, pane in enumerate(panes):
-                pane_label = self._pane_label(pane, pane_index)
-                pane_item = QtWidgets.QTreeWidgetItem([pane_label])
+                pane_label = getattr(pane, "label", None) or f"Pane {pane_index + 1}"
+                pane_item = QtWidgets.QTreeWidgetItem([str(pane_label)])
                 pane_item.setData(
                     0, QtCore.Qt.UserRole,
                     f"{NODE_PANE}:{tab_index}/{pane_index}",
                 )
                 pane_item.setIcon(0, _icon_for(NODE_PANE, palette))
-                # Tint pane rows that carry one or more per-pane overrides so
-                # the user can scan the tree to spot "weird" panes at a
-                # glance.
+                # Bold the pane label so it stands out from the property
+                # rows that hang below it.
+                font = pane_item.font(0)
+                font.setBold(True)
+                pane_item.setFont(0, font)
+                # Tint pane rows that carry one or more per-pane overrides
+                # so the user can scan the tree to spot "non-default" panes.
                 pane_state = getattr(pane, "pane_state", None)
                 if pane_state is not None and pane_state.overridden_names():
                     pane_item.setForeground(0, QtGui.QBrush(QtGui.QColor(palette.accent_dark)))
                 tab_item.addChild(pane_item)
+
+                # Add a property row per displayable attribute so the user
+                # can read the pane's current visual state at a glance
+                # (vertical list instead of a cramped horizontal sentence).
+                self._append_pane_property_rows(pane_item, pane, palette)
 
     def _build_auxiliary(self, palette) -> None:
         # Auxiliary nodes live at the same top level as Active Views.
@@ -211,20 +220,87 @@ class PipelineBrowser(QtWidgets.QTreeWidget):
 
     # ── Labels ──────────────────────────────────────────────────────────────
 
-    def _pane_label(self, pane, index: int) -> str:
-        """One-line summary used as the visible tree label for a pane."""
-        label = getattr(pane, "label", None) or f"Pane {index + 1}"
+    def _append_pane_property_rows(self, pane_item, pane, palette) -> None:
+        """Add child rows under *pane_item* — one row per visual property.
+
+        The rows are read-only "leaf" nodes the user can scan to know
+        exactly what the pane is rendering.  Each row uses a muted
+        colour so the tree's primary structure (Active Views → tabs →
+        panes) keeps the visual hierarchy.
+        """
         state = getattr(pane, "pane_state", None)
         if state is None:
-            return str(label)
+            return
         try:
-            demand = state.demand
-            component = state.component
-            cmap = state.colormap or "—"
-            warp = "warp on" if state.disp_warp_enabled else "warp off"
-            return f"{label}    {demand}/{component} · {cmap} · {warp}"
+            # Format displayable values.  Anything that fails defaults
+            # to "—" so a missing attribute never breaks the tree.
+            def _safe(name, default="—"):
+                try:
+                    value = getattr(state, name)
+                    if value is None or value == "":
+                        return default
+                    return value
+                except Exception:
+                    return default
+
+            try:
+                vmin = float(_safe("user_vmin", float("nan")))
+                vmax = float(_safe("user_vmax", float("nan")))
+                range_text = f"[{vmin:.3g}, {vmax:.3g}]"
+            except Exception:
+                range_text = "—"
+
+            warp = "on" if _safe("disp_warp_enabled", False) else "off"
+            warp_scale = _safe("warp_scale")
+            if warp == "on" and warp_scale not in ("—", None):
+                try:
+                    warp = f"on ×{float(warp_scale):g}"
+                except Exception:
+                    pass
+
+            rows = [
+                ("demand",     str(_safe("demand"))),
+                ("component",  str(_safe("component"))),
+                ("colormap",   str(_safe("colormap"))),
+                ("range",      range_text),
+                ("clamp",      "on" if _safe("clamp_enabled", False) else "off"),
+                ("warp",       warp),
+            ]
+
+            muted = QtGui.QBrush(QtGui.QColor(palette.text_2))
+            accent_muted = QtGui.QBrush(QtGui.QColor(palette.accent_dark))
+            override_names = set(getattr(state, "overridden_names", lambda: ())())
+
+            for key, value in rows:
+                row = QtWidgets.QTreeWidgetItem([f"{key}:  {value}"])
+                # Property rows share the pane's identifier so clicking
+                # one still targets the pane.  Using the same identifier
+                # also means the cached selection restore picks up the
+                # parent (which is what we actually want to highlight).
+                row.setData(
+                    0, QtCore.Qt.UserRole,
+                    pane_item.data(0, QtCore.Qt.UserRole),
+                )
+                # Tint rows that correspond to a per-pane override so the
+                # user can spot non-default attributes at a glance.
+                override_attr = {
+                    "demand":    "demand",
+                    "component": "component",
+                    "colormap":  "colormap",
+                    "range":     "user_vmin",     # user_vmax follows
+                    "clamp":     "clamp_enabled",
+                    "warp":      "disp_warp_enabled",
+                }.get(key)
+                if override_attr in override_names:
+                    row.setForeground(0, accent_muted)
+                else:
+                    row.setForeground(0, muted)
+                pane_item.addChild(row)
         except Exception:
-            return str(label)
+            # Property rows are a UX nicety; if anything fails we just
+            # leave the pane node as a leaf — the user still gets a
+            # working tree.
+            pass
 
     # ── Accessors ───────────────────────────────────────────────────────────
 

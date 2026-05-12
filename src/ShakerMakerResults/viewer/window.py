@@ -211,11 +211,13 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                 pipeline.browser.activeNodeChanged.connect(self._on_pipeline_node_changed)
             except Exception:
                 pass
-            # Rebuild the tree whenever the tab / pane structure changes.
+            # Rebuild the tree only when the tab / pane structure changes
+            # (add tab, close tab).  We deliberately do NOT hook into
+            # ``tabs.currentChanged`` — that creates a signal loop with the
+            # browser's selection bridge.  State-summary refreshes still
+            # come through the regular ``_refresh_side_pages`` broadcast.
             try:
-                tabs = getattr(self.multi_view, "_tabs", None)
-                if tabs is not None:
-                    tabs.currentChanged.connect(lambda *_: pipeline.refresh("full"))
+                self.multi_view.on_structure_changed = lambda: pipeline.refresh("full")
             except Exception:
                 pass
 
