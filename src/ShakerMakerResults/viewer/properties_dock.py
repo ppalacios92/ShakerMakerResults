@@ -21,7 +21,6 @@ from .side_panel import (
     GeographicSection,
     NodeSearchSection,
     VisualizationSection,
-    WarpSection,
     _PageScrollArea,
 )
 
@@ -35,8 +34,11 @@ class PropertiesPanel(QtWidgets.QTabWidget):
 
     1. **Node**       — pick / search a node, edit station tags
     2. **Visibility** — toggle internal / external / QA point classes
-    3. **Warp**       — enable displacement warp + scale presets
-    4. **Geographic** — UTM reference + display transform matrix
+    3. **Geographic** — UTM reference + display transform matrix
+
+    Warp used to live here too; it now has its own dock on the right
+    side next to Display so the user does not have to dig into the data
+    inspector to deform the scene.
 
     The active tab is preserved across :meth:`refresh` calls.
     """
@@ -54,13 +56,11 @@ class PropertiesPanel(QtWidgets.QTabWidget):
         # blow the dock's preferred size out of proportion.
         self.node_section       = NodeSearchSection(session)
         self.visibility_section = VisualizationSection(session)
-        self.warp_section       = WarpSection(session)
         self.geographic_section = GeographicSection(session)
 
         self._tabs: list[tuple[str, QtWidgets.QWidget]] = [
             ("Node",       self.node_section),
             ("Visibility", self.visibility_section),
-            ("Warp",       self.warp_section),
             ("Geographic", self.geographic_section),
         ]
         for title, widget in self._tabs:

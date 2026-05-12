@@ -866,14 +866,29 @@ class ViewerScene:
             clim = self.session.current_color_limits(scalars)
             bar_title = self._scalar_bar_title()
         # PyVista keeps every scalar bar it has ever added in a per-plotter
-        # registry keyed by title.  Without this clean-up step every call to
-        # ``add_points(show_scalar_bar=True, ...)`` stacks a new bar on top
-        # of the old one — labels, ticks and the title pile up.  Clearing
-        # the registry first guarantees exactly one scalar bar per render.
+        # registry keyed by title.  Calling ``.clear()`` only empties the
+        # *registry* dict — the underlying VTK 2-D actors stay parented to
+        # the renderer, so a demand switch (accel → vel etc.) ends up
+        # overlaying two titles + two sets of labels on top of each other.
+        # The fix is to ``remove_scalar_bar(title)`` per known title so the
+        # actors actually leave the renderer, then drop the registry.
         try:
-            scalar_bars = getattr(self.plotter, "scalar_bars", None)
-            if scalar_bars is not None and hasattr(scalar_bars, "clear"):
-                scalar_bars.clear()
+            bars = getattr(self.plotter, "scalar_bars", None)
+            if bars is not None:
+                try:
+                    titles = list(bars.keys()) if hasattr(bars, "keys") else []
+                except Exception:
+                    titles = []
+                for title in titles:
+                    try:
+                        self.plotter.remove_scalar_bar(title)
+                    except Exception:
+                        pass
+                if hasattr(bars, "clear"):
+                    try:
+                        bars.clear()
+                    except Exception:
+                        pass
         except Exception:
             pass
         kwargs = {

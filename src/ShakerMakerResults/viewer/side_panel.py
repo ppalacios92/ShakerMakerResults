@@ -558,6 +558,11 @@ class VectorFieldSection(_SectionBase):
         self.cmap_combo.currentTextChanged.connect(lambda *_: self._set_dirty())
         self.cmap_preview = ColormapPreview(self.cmap_combo.currentText())
         self.cmap_combo.currentTextChanged.connect(self.cmap_preview.setColormap)
+        # Click on the ramp opens the advanced color editor — same dialog
+        # the explicit "Advanced color editor" button uses in the other
+        # sections, so users get a single canonical place to redesign the
+        # transfer function regardless of which preview they clicked.
+        self.cmap_preview.clicked.connect(self._open_transfer_editor)
         form.addRow("Color ramp", _stack(self.cmap_combo, self.cmap_preview))
 
         self.scale_spin = QtWidgets.QDoubleSpinBox()
@@ -611,6 +616,33 @@ class VectorFieldSection(_SectionBase):
         )
         self._clear_dirty()
 
+    # ── Ramp click → open advanced colour editor ───────────────────────────
+
+    def _open_transfer_editor(self):
+        """Open the same advanced colour editor the other sections use.
+
+        The TransferFunctionDialog edits global colour preferences applied
+        to the active scalar field; the vector overlay then re-renders
+        with the new ramp on its next Apply.
+        """
+        dlg = TransferFunctionDialog(self.session, self.window())
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        values = dlg.values()
+        self.session.apply_transfer_function_preferences(
+            colormap=values.colormap,
+            inverted=values.invert,
+            discrete=values.discrete,
+            bins=values.bins,
+            nan_color=values.nan_color,
+            below_color=values.below_color,
+            above_color=values.above_color,
+            use_below=values.use_below,
+            use_above=values.use_above,
+            symmetric_range=values.symmetric_range,
+            percentile_clip=values.percentile_clip,
+        )
+
 
 # ── Static Color (Color By) section ──────────────────────────────────────────
 
@@ -657,6 +689,7 @@ class StaticColorSection(_SectionBase):
         self.cmap_combo.currentTextChanged.connect(lambda *_: self._set_dirty())
         self.cmap_preview = ColormapPreview(self.cmap_combo.currentText())
         self.cmap_combo.currentTextChanged.connect(self.cmap_preview.setColormap)
+        self.cmap_preview.clicked.connect(self._open_transfer_editor)
 
         self.auto_lbl = QtWidgets.QLabel("-")
         self.vmin_spin = self._value_spin()
@@ -1008,6 +1041,7 @@ class DisplaySection(_SectionBase):
         self.cmap_combo.currentTextChanged.connect(lambda *_: self._set_dirty())
         self.cmap_preview = ColormapPreview(self.cmap_combo.currentText())
         self.cmap_combo.currentTextChanged.connect(self.cmap_preview.setColormap)
+        self.cmap_preview.clicked.connect(self._open_transfer_editor)
         cmap_row = _stack(self.cmap_combo, self.cmap_preview)
 
         self.auto_lbl  = QtWidgets.QLabel("-")

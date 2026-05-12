@@ -48,6 +48,7 @@ from .side_panel import (
     DisplaySection,
     StaticColorSection,
     VectorFieldSection,
+    WarpSection,
     _LazyPage,
     _PageScrollArea,
     _ResponsesAnalysisTabs,
@@ -78,17 +79,18 @@ def _settings() -> "QtCore.QSettings":
 #: ``(key, title, area, default_visible)``
 #: ``key`` matches the dock factory in ``_init_dock_factories``.
 _DOCK_SPECS: list[tuple[str, str, str, bool]] = [
-    # Left column — pipeline, properties, info, analytics
+    # Left column — inspection / data context + global appearance
     ("pipeline",    "Pipeline Browser", "left",  True),
     ("properties",  "Properties",       "left",  True),
     ("information", "Information",      "left",  True),
+    ("appearance",  "Appearance",       "left",  True),
     ("responses",   "Responses",        "left",  True),
     ("gf",          "Green Functions",  "left",  False),
-    # Right column — visual editors
+    # Right column — visual editors that map scene data → pixels
     ("display",      "Display",      "right", True),
     ("vector_field", "Vector Field", "right", False),
     ("color_by",     "Color By",     "right", False),
-    ("appearance",   "Appearance",   "right", True),
+    ("warp",         "Warp",         "right", True),
 ]
 
 _DOCK_AREAS = {
@@ -247,6 +249,9 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._lazy_dock_factories["display"]      = lambda: DisplaySection(session)
         self._lazy_dock_factories["vector_field"] = lambda: VectorFieldSection(session)
         self._lazy_dock_factories["color_by"]     = lambda: StaticColorSection(session)
+        # Warp used to be a tab inside Properties; promote to its own dock
+        # so it lives next to the other visual editors on the right.
+        self._lazy_dock_factories["warp"]         = lambda: WarpSection(session)
         self._lazy_dock_factories["responses"]    = lambda: _LazyPage(
             lambda: _ResponsesAnalysisTabs(session)
         )
@@ -314,17 +319,26 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         gf = self._docks.get("gf")
         if responses is not None and gf is not None:
             self.tabifyDockWidget(responses, gf)
-        # Right side: stack Vector Field, Color By and Appearance behind
-        # Display so they share the right-area real-estate as tabs.  The
-        # user clicks the tab they need without losing context of the
-        # main Display panel.
+        # Right side: stack Vector Field, Color By and Warp behind
+        # Display so they share the right-area real-estate as tabs.
         display = self._docks.get("display")
-        for key in ("vector_field", "color_by", "appearance"):
+        for key in ("vector_field", "color_by", "warp"):
             sibling = self._docks.get(key)
             if display is not None and sibling is not None:
                 self.tabifyDockWidget(display, sibling)
         if display is not None:
             display.raise_()
+
+        # Left side: tab the secondary panels (Appearance, Responses) under
+        # Information so the visible-by-default column doesn't grow taller
+        # than the screen.  Pipeline + Properties stay un-tabbed at top.
+        information = self._docks.get("information")
+        for key in ("appearance", "responses"):
+            sibling = self._docks.get(key)
+            if information is not None and sibling is not None:
+                self.tabifyDockWidget(information, sibling)
+        if information is not None:
+            information.raise_()
 
         # Set reasonable initial widths so the central view stays dominant.
         if "pipeline" in self._docks and "display" in self._docks:
@@ -341,12 +355,14 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         props = self._docks.get("properties")
         if props is None or not hasattr(props, "focus_tab"):
             return
-        # Map pipeline node keys → properties tab names.
+        # Map pipeline node keys → properties tab names.  Warp is no
+        # longer a tab here (moved to its own dock on the right), so
+        # GF → Visibility as the closest meaningful target.
         tab_for_node = {
             NODE_ROOT:       "Node",
             NODE_STATIONS:   "Node",        # stations table lives inside the Node tab
             NODE_SELECTION:  "Node",
-            NODE_GF:         "Warp",        # nothing GF-specific in Properties → keep Warp
+            NODE_GF:         "Visibility",
             NODE_GEOGRAPHIC: "Geographic",
         }
         target = tab_for_node.get(node_key)
