@@ -21,6 +21,7 @@ class ViewerScene:
         self._point_actor_rgb = False
         self.selection_actor = None
         self.multi_selection_actor = None   # red spheres for selection-mode set
+        self.multi_selection_label_actor = None
         self.vector_actor = None            # line overlay for vector field
         self._vec_pv = None                 # pv.PolyData live source (lines)
         self._vec_factor = None             # cached scale factor (float)
@@ -29,6 +30,7 @@ class ViewerScene:
         self._vec_pts_buf = None            # pre-allocated (4*N, 3) points buffer
         self.station_actor = None
         self.station_label_actor = None
+        self.ghost_actor = None
         self.show_station_tags = True
         self._picker = vtk.vtkPointPicker()
         self._picker.SetTolerance(0.02)
@@ -132,6 +134,7 @@ class ViewerScene:
         self.plotter.set_background(self.session.current_background_color())
         self.point_actor = self._add_point_actor()
         self.plotter.add_axes()
+        self._sync_axes_grid()
         self.plotter.reset_camera()
         self._install_picking()
         self.refresh_selection(render=False)
@@ -195,6 +198,45 @@ class ViewerScene:
         if render:
             self.plotter.render()
 
+    def refresh_ghost_reference(self, render: bool = True):
+        if self.ghost_actor is not None:
+            try:
+                self.plotter.remove_actor(self.ghost_actor, render=False)
+            except Exception:
+                pass
+            self.ghost_actor = None
+        if not (
+            self.session.state.ghost_warp_reference
+            and self.session.state.disp_warp_enabled
+        ):
+            if render:
+                self.plotter.render()
+            return
+        try:
+            import numpy as np
+
+            base_points = self.session.current_visible_points()
+            domain_idx = self._domain_index_array()
+            if domain_idx is not None:
+                base_points = base_points[domain_idx]
+            cloud = pv.PolyData(np.asarray(base_points, dtype=float))
+            self.ghost_actor = self.plotter.add_points(
+                cloud,
+                color="#6b7280",
+                opacity=0.22,
+                point_size=max(self._point_size() - 1, 2),
+                render_points_as_spheres=True,
+                render=False,
+            )
+            try:
+                self.ghost_actor.SetPickable(0)
+            except Exception:
+                pass
+        except Exception:
+            self.ghost_actor = None
+        if render:
+            self.plotter.render()
+
     def rebuild_for_visibility(self, render: bool = True):
         if self.point_actor is not None:
             self.plotter.remove_actor(self.point_actor, render=False)
@@ -250,6 +292,12 @@ class ViewerScene:
         if self.multi_selection_actor is not None:
             self.plotter.remove_actor(self.multi_selection_actor, render=False)
             self.multi_selection_actor = None
+        if self.multi_selection_label_actor is not None:
+            try:
+                self.plotter.remove_actor(self.multi_selection_label_actor, render=False)
+            except Exception:
+                pass
+            self.multi_selection_label_actor = None
 
         state = self.session.state
         if not state.multi_selection:
@@ -283,6 +331,26 @@ class ViewerScene:
             self.multi_selection_actor.SetPickable(0)
         except Exception:
             pass
+        if state.selection_labels_enabled:
+            try:
+                labels = [
+                    str(node_id)
+                    for node_id in state.multi_selection
+                    if self._domain_contains(node_id)
+                ]
+                if labels:
+                    self.multi_selection_label_actor = self.plotter.add_point_labels(
+                        sel_cloud,
+                        labels,
+                        point_size=0,
+                        font_size=9,
+                        text_color="#b71c1c",
+                        fill_shape=False,
+                        always_visible=True,
+                        render=False,
+                    )
+            except Exception:
+                self.multi_selection_label_actor = None
         if render:
             self.plotter.render()
 
@@ -697,6 +765,9 @@ class ViewerScene:
         self.plotter.set_background(self.session.current_background_color())
         self.rebuild_scalar_actor(render=render)
         self.refresh_selection(render=False)
+        self.refresh_multi_selection(render=False)
+        self.refresh_ghost_reference(render=False)
+        self._sync_axes_grid()
 
     def apply_color_range(self, render: bool = True):
         if self.point_cloud is not None and "active_scalars" in self.point_cloud.point_data:
@@ -779,12 +850,40 @@ class ViewerScene:
         else:
             kwargs["cmap"] = self.session.current_colormap()
             kwargs["clim"] = clim
+            kwargs["n_colors"] = (
+                self.session.state.colormap_bins
+                if self.session.state.colormap_discrete
+                else 256
+            )
+            kwargs["nan_color"] = self.session.state.nan_color
+            if self.session.state.use_below_range_color:
+                kwargs["below_color"] = self.session.state.below_range_color
+            if self.session.state.use_above_range_color:
+                kwargs["above_color"] = self.session.state.above_range_color
             kwargs["show_scalar_bar"] = self.session.state.show_scalar_bar
-            kwargs["scalar_bar_args"] = {
+            scalar_bar_args = {
                 "title": bar_title,
-                "title_font_size": 12,
-                "label_font_size": 11,
+                "title_font_size": self.session.state.legend_title_font_size,
+                "label_font_size": self.session.state.legend_label_font_size,
+                "n_labels": self.session.state.legend_label_count,
+                "vertical": self.session.state.legend_orientation == "vertical",
+                "outline": self.session.state.legend_show_outline,
             }
+            if self.session.state.legend_position == "left":
+                scalar_bar_args.update({"position_x": 0.03, "position_y": 0.18})
+            elif self.session.state.legend_position == "top":
+                scalar_bar_args.update({"position_x": 0.28, "position_y": 0.88})
+            elif self.session.state.legend_position == "bottom":
+                scalar_bar_args.update({"position_x": 0.28, "position_y": 0.04})
+            else:
+                scalar_bar_args.update({"position_x": 0.86, "position_y": 0.18})
+            if self.session.state.legend_orientation == "horizontal":
+                scalar_bar_args.update({"width": 0.42, "height": 0.08})
+            else:
+                scalar_bar_args.update({"width": 0.08, "height": 0.56})
+            if self.session.state.legend_show_background:
+                scalar_bar_args["background_color"] = "#ffffff"
+            kwargs["scalar_bar_args"] = scalar_bar_args
         actor = self.plotter.add_points(self.point_cloud, **kwargs)
         self._point_actor_rgb = rgb_scalars
         try:
@@ -792,6 +891,18 @@ class ViewerScene:
         except Exception:
             pass
         return actor
+
+    def _sync_axes_grid(self):
+        try:
+            if self.session.state.show_axes_grid:
+                self.plotter.show_grid(
+                    color=self.session.state.axes_grid_color,
+                    render=False,
+                )
+            else:
+                self.plotter.remove_bounds_axes()
+        except Exception:
+            pass
 
     @staticmethod
     def _scalars_are_rgb(scalars) -> bool:
@@ -875,6 +986,16 @@ class ViewerScene:
         except Exception:
             pass
         try:
+            if self.multi_selection_label_actor is not None:
+                self.plotter.remove_actor(self.multi_selection_label_actor, render=False)
+        except Exception:
+            pass
+        try:
+            if self.ghost_actor is not None:
+                self.plotter.remove_actor(self.ghost_actor, render=False)
+        except Exception:
+            pass
+        try:
             if self.selection_actor is not None:
                 self.plotter.remove_actor(self.selection_actor, render=False)
         except Exception:
@@ -903,6 +1024,8 @@ class ViewerScene:
         self.selection_actor = None
         self.station_actor = None
         self.station_label_actor = None
+        self.multi_selection_label_actor = None
+        self.ghost_actor = None
         self._gf_label_actor = None
         self._interactor_style = None
         self._picker = None

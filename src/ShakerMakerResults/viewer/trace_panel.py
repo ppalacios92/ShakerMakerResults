@@ -52,6 +52,50 @@ COMPONENT_COLORS = {
 }
 
 
+class _ChartControlStrip(QtWidgets.QWidget):
+    """Compact chart toolbar shared by analytical plot panels."""
+
+    def __init__(self, *, on_refresh, on_export, parent=None):
+        super().__init__(parent)
+        self._on_refresh = on_refresh
+        self._on_export = on_export
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+
+        self.legend_cb = QtWidgets.QCheckBox("Legend")
+        self.legend_cb.setChecked(True)
+        self.legend_cb.toggled.connect(lambda *_: self._on_refresh())
+        self.grid_cb = QtWidgets.QCheckBox("Grid")
+        self.grid_cb.setChecked(True)
+        self.grid_cb.toggled.connect(lambda *_: self._on_refresh())
+        self.export_btn = QtWidgets.QPushButton("Export PNG")
+        self.export_btn.clicked.connect(self._on_export)
+
+        layout.addWidget(self.legend_cb)
+        layout.addWidget(self.grid_cb)
+        layout.addStretch(1)
+        layout.addWidget(self.export_btn)
+
+    def show_legend(self) -> bool:
+        return bool(self.legend_cb.isChecked())
+
+    def show_grid(self) -> bool:
+        return bool(self.grid_cb.isChecked())
+
+
+def _export_figure_png(parent, figure: Figure, suggested_name: str):
+    path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        parent,
+        "Export plot",
+        suggested_name,
+        "PNG image (*.png)",
+    )
+    if not path:
+        return
+    figure.savefig(path, dpi=180)
+
+
 class TracePanel(QtWidgets.QWidget):
     """Embedded matplotlib panel showing node traces."""
 
@@ -163,6 +207,10 @@ class SpectrumPanel(QtWidgets.QWidget):
         self.title_label = QtWidgets.QLabel("No node selected")
         self.title_label.setStyleSheet("font-size: 11px; color: #1e3558; font-weight: 600;")
         self.title_label.setContentsMargins(2, 2, 2, 0)
+        self.chart_controls = _ChartControlStrip(
+            on_refresh=lambda: self.refresh("full"),
+            on_export=lambda: _export_figure_png(self, self.figure, "spectrum.png"),
+        )
         self.figure = Figure(figsize=(5, 4), constrained_layout=True)
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setMinimumHeight(330)
@@ -209,6 +257,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         table_layout.addWidget(self.table)
 
         layout.addWidget(self.title_label)
+        layout.addWidget(self.chart_controls)
         layout.addWidget(plot_box, 0)
         layout.addWidget(table_box, 1)
 
@@ -224,7 +273,7 @@ class SpectrumPanel(QtWidgets.QWidget):
             self._current_nodes = tuple()
             for ax in self.axes:
                 ax.clear()
-                ax.grid(True, alpha=0.25)
+                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
             self.title_label.setText("No node selected")
             self._set_table_rows([])
             self.axes[-1].set_xlabel("Period [s]")
@@ -240,7 +289,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         # Show a placeholder immediately so the panel doesn't look frozen.
         for ax in self.axes:
             ax.clear()
-            ax.grid(True, alpha=0.25)
+            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
         node_id = self._nodes_title(node_ids)
         self.axes[-1].set_xlabel("Period [s]")
         self.title_label.setText(f"{self._nodes_title(node_ids)} | Computing spectrum...")
@@ -287,7 +336,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         if isinstance(result, Exception):
             self.title_label.setText(f"Spectrum unavailable: {result}")
             for ax in self.axes:
-                ax.grid(True, alpha=0.25)
+                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
             self._set_table_rows([])
             self.canvas.draw_idle()
             return
@@ -314,8 +363,9 @@ class SpectrumPanel(QtWidgets.QWidget):
                         label=f"Node {nid}",
                     )
                 ax.set_ylabel(label.upper())
-                ax.grid(True, alpha=0.25)
-                ax.legend(loc="upper right")
+                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+                if self.chart_controls.show_legend():
+                    ax.legend(loc="upper right")
             for nid in node_ids:
                 spectrum = spectra.get(nid)
                 if spectrum is None:
@@ -347,8 +397,9 @@ class SpectrumPanel(QtWidgets.QWidget):
                 label=label.upper(),
             )
             ax.set_ylabel(label.upper())
-            ax.grid(True, alpha=0.25)
-            ax.legend(loc="upper right")
+            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+            if self.chart_controls.show_legend():
+                ax.legend(loc="upper right")
         self.axes[-1].set_xlabel("Period [s]")
         self._set_table_rows(
             zip(
@@ -410,6 +461,10 @@ class AriasIntensityPanel(QtWidgets.QWidget):
         self.title_label = QtWidgets.QLabel("No node selected")
         self.title_label.setStyleSheet("font-size: 11px; color: #1e3558; font-weight: 600;")
         self.title_label.setContentsMargins(2, 2, 2, 0)
+        self.chart_controls = _ChartControlStrip(
+            on_refresh=lambda: self.refresh("full"),
+            on_export=lambda: _export_figure_png(self, self.figure, "arias.png"),
+        )
         self.figure = Figure(figsize=(5, 4), constrained_layout=True)
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setMinimumHeight(330)
@@ -443,6 +498,7 @@ class AriasIntensityPanel(QtWidgets.QWidget):
         metrics_layout.addWidget(self.metrics_table)
 
         layout.addWidget(self.title_label)
+        layout.addWidget(self.chart_controls)
         layout.addWidget(plot_box, 0)
         layout.addWidget(metrics_box, 0)
         layout.addStretch(1)
@@ -474,7 +530,7 @@ class AriasIntensityPanel(QtWidgets.QWidget):
         # Show a placeholder immediately so the panel doesn't look frozen.
         for ax in self.axes:
             ax.clear()
-            ax.grid(True, alpha=0.25)
+            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
         node_id = self._nodes_title(node_ids)
         self.axes[-1].set_xlabel("Time [s]")
         self.title_label.setText(f"{self._nodes_title(node_ids)} | Computing Arias...")
@@ -548,8 +604,9 @@ class AriasIntensityPanel(QtWidgets.QWidget):
                 ax.axhline(95, color="gray", linestyle=":", linewidth=1, alpha=0.6)
                 ax.set_ylabel(label.upper())
                 ax.set_ylim(0, 100)
-                ax.grid(True, alpha=0.25)
-                ax.legend(loc="upper left")
+                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+                if self.chart_controls.show_legend():
+                    ax.legend(loc="upper left")
             for nid in node_ids:
                 arias = arias_by_node.get(nid)
                 if arias is None:
@@ -595,12 +652,14 @@ class AriasIntensityPanel(QtWidgets.QWidget):
             ax.axhline(95, color="gray", linestyle=":", linewidth=1, alpha=0.6)
             ax.set_ylabel(label.upper())
             ax.set_ylim(0, 100)
-            ax.grid(True, alpha=0.25)
-            ax.legend(loc="upper left")
+            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
+            if self.chart_controls.show_legend():
+                ax.legend(loc="upper left")
             t5 = float(item["t_start"])
             t95 = float(item["t_end"])
             metric_rows.append(
                 (
+                    node_id,
                     label.upper(),
                     float(item["ia_total"]),
                     t5,
@@ -1287,6 +1346,11 @@ class ResponsesPanel(QtWidgets.QWidget):
         self.title_label.setStyleSheet("font-size: 11px; color: #1e3558; font-weight: 600;")
         self.title_label.setContentsMargins(2, 2, 2, 0)
         root.addWidget(self.title_label)
+        self.chart_controls = _ChartControlStrip(
+            on_refresh=self._rebuild_figure,
+            on_export=lambda: _export_figure_png(self, self.figure, "responses.png"),
+        )
+        root.addWidget(self.chart_controls)
 
         layout_box = QtWidgets.QGroupBox("Layout")
         layout_box_lay = QtWidgets.QVBoxLayout(layout_box)
@@ -1439,7 +1503,7 @@ class ResponsesPanel(QtWidgets.QWidget):
             for ax, (demand, component) in zip(axes, active_keys):
                 color, linestyle, label = self._CURVE_STYLES[(demand, component)]
                 ax.set_ylabel(label, fontsize=8)
-                ax.grid(True, alpha=0.25)
+                ax.grid(self.chart_controls.show_grid(), alpha=0.25)
                 ax.tick_params(labelsize=7)
                 row = _COMP_ROW[component]
                 for idx, node_id in enumerate(node_ids):
@@ -1462,13 +1526,13 @@ class ResponsesPanel(QtWidgets.QWidget):
 
             if axes:
                 axes[-1].set_xlabel("Time [s]", fontsize=8)
-                if len(node_ids) > 1:
+                if len(node_ids) > 1 and self.chart_controls.show_legend():
                     axes[0].legend(loc="upper right", fontsize=8)
         else:
             self.canvas.setMinimumHeight(220)
             ax = self.figure.subplots(1, 1)
             ax.set_xlabel("Time [s]", fontsize=8)
-            ax.grid(True, alpha=0.25)
+            ax.grid(self.chart_controls.show_grid(), alpha=0.25)
             ax.tick_params(labelsize=7)
 
             any_line = False
@@ -1490,7 +1554,7 @@ class ResponsesPanel(QtWidgets.QWidget):
                     )
                     any_line = True
 
-            if any_line:
+            if any_line and self.chart_controls.show_legend():
                 ax.legend(loc="upper right", fontsize=8)
 
             cursor = ax.axvline(

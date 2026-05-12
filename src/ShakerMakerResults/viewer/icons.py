@@ -79,6 +79,25 @@ _PATHS = {
         "M4 5h16c1.1 0 2 .9 2 2v10c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V7"
         "c0-1.1.9-2 2-2zm0 2v10h16V7H4zm6 3h4v4h-4v-4z"
     ),
+    "colormap_editor": (
+        "M4 18h16v2H4v-2zm1-4h3v2H5v-2zm4-4h3v6H9v-6zm4-4h3v10h-3V6zm4-2h3v12h-3V4z"
+    ),
+    "legend_edit": (
+        "M5 4h10a2 2 0 0 1 2 2v12H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm1 3v2h8V7H6zm0 4v2h8v-2H6z"
+        "M19.7 11.3 22 13.6 17.6 18H15v-2.6l4.7-4.1z"
+    ),
+    "axes_grid": (
+        "M4 4h16v16H4V4zm2 2v4h4V6H6zm6 0v4h6V6h-6zM6 12v6h4v-6H6zm6 0v6h6v-6h-6z"
+    ),
+    "selection_label": (
+        "M4 4h9v6H8l-4 4V4zm11 2h5v12h-5V6zm2 2v2h1V8h-1zm0 4v2h1v-2h-1z"
+    ),
+    "ghost_warp": (
+        "M5 6c0-1.1.9-2 2-2h5c1.1 0 2 .9 2 2v2h3c1.1 0 2 .9 2 2v8H8c-1.1 0-2-.9-2-2v-2H5V6zm3 0v8h6V6H8zm6 4v6h3v-6h-3z"
+    ),
+    "chart_settings": (
+        "M4 18h16v2H4v-2zm2-3h3v2H6v-2zm5-5h3v7h-3v-7zm5-4h3v11h-3V6z"
+    ),
     # ── Side-panel nav icons ───────────────────────────────────────────────────
     "nav_node": (
         "M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z"

@@ -39,6 +39,7 @@ from .icons import icon
 from .session import VALID_STATIC_COLOR_BY
 from .theme import LIGHT_PALETTE
 from .trace_panel import AriasIntensityPanel, GFPanel, ResponsesPanel, SpectrumPanel
+from .visual_editors import LegendEditorDialog, TransferFunctionDialog
 
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
 
@@ -591,6 +592,10 @@ class DisplaySection(_SectionBase):
 
         self.reset_btn = QtWidgets.QPushButton("Reset to auto")
         self.reset_btn.clicked.connect(self._reset_range)
+        self.transfer_btn = QtWidgets.QPushButton("Advanced color editor")
+        self.transfer_btn.clicked.connect(self._open_transfer_editor)
+        self.legend_btn = QtWidgets.QPushButton("Legend settings")
+        self.legend_btn.clicked.connect(self._open_legend_editor)
 
         color_form.addRow("Preset",     self.cmap_combo)
         color_form.addRow("Auto range", self.auto_lbl)
@@ -598,6 +603,8 @@ class DisplaySection(_SectionBase):
         color_form.addRow("User max",   self.vmax_spin)
         color_form.addRow("",           self.clamp_cb)
         color_form.addRow("",           self.reset_btn)
+        color_form.addRow("",           self.transfer_btn)
+        color_form.addRow("",           self.legend_btn)
         outer.addWidget(color_box)
 
         outer.addWidget(
@@ -671,6 +678,10 @@ class DisplaySection(_SectionBase):
 
         self.static_reset_btn = QtWidgets.QPushButton("Reset to auto")
         self.static_reset_btn.clicked.connect(self._reset_static_range)
+        self.static_transfer_btn = QtWidgets.QPushButton("Advanced color editor")
+        self.static_transfer_btn.clicked.connect(self._open_transfer_editor)
+        self.static_legend_btn = QtWidgets.QPushButton("Legend settings")
+        self.static_legend_btn.clicked.connect(self._open_legend_editor)
 
         self.newmark_T_spin = QtWidgets.QDoubleSpinBox()
         self.newmark_T_spin.setDecimals(3)
@@ -738,6 +749,8 @@ class DisplaySection(_SectionBase):
         static_color_form.addRow("User max", self.static_vmax_spin)
         static_color_form.addRow("", self.static_clamp_cb)
         static_color_form.addRow("", self.static_reset_btn)
+        static_color_form.addRow("", self.static_transfer_btn)
+        static_color_form.addRow("", self.static_legend_btn)
         static_color_form.addRow("T target", self.newmark_T_spin)
         static_color_form.addRow("Component", self.newmark_component_combo)
         static_color_form.addRow("Data", self.newmark_data_combo)
@@ -935,6 +948,42 @@ class DisplaySection(_SectionBase):
         self.clamp_cb.blockSignals(b)
         self._set_dirty(True)
 
+    def _open_transfer_editor(self):
+        dlg = TransferFunctionDialog(self.session, self.window())
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        values = dlg.values()
+        self.session.apply_transfer_function_preferences(
+            colormap=values.colormap,
+            inverted=values.invert,
+            discrete=values.discrete,
+            bins=values.bins,
+            nan_color=values.nan_color,
+            below_color=values.below_color,
+            above_color=values.above_color,
+            use_below=values.use_below,
+            use_above=values.use_above,
+            symmetric_range=values.symmetric_range,
+            percentile_clip=values.percentile_clip,
+        )
+
+    def _open_legend_editor(self):
+        dlg = LegendEditorDialog(self.session, self.window())
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        values = dlg.values()
+        self.session.apply_legend_preferences(
+            visible=values.visible,
+            title=values.title,
+            orientation=values.orientation,
+            position=values.position,
+            label_count=values.label_count,
+            label_font_size=values.label_font_size,
+            title_font_size=values.title_font_size,
+            show_outline=values.show_outline,
+            show_background=values.show_background,
+        )
+
     # ── Single atomic apply ───────────────────────────────────────────────
 
     def _apply(self):
@@ -1027,9 +1076,12 @@ class VisualizationSection(_SectionBase):
         self.internal_cb = QtWidgets.QCheckBox("Show internal nodes")
         self.external_cb = QtWidgets.QCheckBox("Show external nodes")
         self.qa_cb       = QtWidgets.QCheckBox("Show QA")
+        self.selection_labels_cb = QtWidgets.QCheckBox("Label selected nodes")
         for cb in (self.internal_cb, self.external_cb, self.qa_cb):
             cb.toggled.connect(lambda *_: self._set_dirty())
             lay.addWidget(cb)
+        self.selection_labels_cb.toggled.connect(self.session.set_selection_labels_enabled)
+        lay.addWidget(self.selection_labels_cb)
 
         lay.addWidget(self._make_apply_button(self._apply, "Updating node visibility…"))
         lay.addStretch(1)
@@ -1043,6 +1095,9 @@ class VisualizationSection(_SectionBase):
             self.internal_cb.setChecked(self.session.state.show_internal)
             self.external_cb.setChecked(self.session.state.show_external)
             self.qa_cb.setChecked(self.session.state.show_qa)
+            b = self.selection_labels_cb.blockSignals(True)
+            self.selection_labels_cb.setChecked(self.session.state.selection_labels_enabled)
+            self.selection_labels_cb.blockSignals(b)
             self._clear_dirty()
         finally:
             self._syncing = False
@@ -1068,6 +1123,9 @@ class WarpSection(_SectionBase):
         self.warp_cb = QtWidgets.QCheckBox("Enable displacement warp")
         self.warp_cb.toggled.connect(lambda *_: self._set_dirty())
         outer.addWidget(self.warp_cb)
+        self.ghost_cb = QtWidgets.QCheckBox("Show undeformed reference cloud")
+        self.ghost_cb.toggled.connect(lambda *_: self._set_dirty())
+        outer.addWidget(self.ghost_cb)
 
         axes_row = QtWidgets.QWidget()
         arl = QtWidgets.QHBoxLayout(axes_row)
@@ -1118,6 +1176,7 @@ class WarpSection(_SectionBase):
         self._syncing = True
         try:
             self.warp_cb.setChecked(self.session.state.disp_warp_enabled)
+            self.ghost_cb.setChecked(self.session.state.ghost_warp_reference)
             ax = self.session.state.warp_axes
             self.x_cb.setChecked(ax[0])
             self.y_cb.setChecked(ax[1])
@@ -1154,6 +1213,7 @@ class WarpSection(_SectionBase):
             warp_axes=(self.x_cb.isChecked(), self.y_cb.isChecked(), self.z_cb.isChecked()),
             warp_scale=self.scale_spin.value(),
         )
+        self.session.set_ghost_warp_reference(self.ghost_cb.isChecked())
         self._clear_dirty()
 
 

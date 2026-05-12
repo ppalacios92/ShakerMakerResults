@@ -20,6 +20,28 @@ class ViewerState:
     colormap: str | None = None
     point_size: float | None = None
     show_scalar_bar: bool = True
+    colormap_inverted: bool = False
+    colormap_discrete: bool = False
+    colormap_bins: int = 12
+    nan_color: str = "#8c8c8c"
+    below_range_color: str = "#15304b"
+    above_range_color: str = "#f3b23f"
+    use_below_range_color: bool = False
+    use_above_range_color: bool = False
+    symmetric_color_range: bool = False
+    percentile_clip: float = 0.0
+    legend_title_override: str = ""
+    legend_orientation: str = "vertical"
+    legend_position: str = "right"
+    legend_label_count: int = 5
+    legend_label_font_size: int = 11
+    legend_title_font_size: int = 12
+    legend_show_outline: bool = True
+    legend_show_background: bool = False
+    show_axes_grid: bool = False
+    axes_grid_color: str = "#8c97a8"
+    selection_labels_enabled: bool = False
+    ghost_warp_reference: bool = False
     is_playing: bool = False
     playback_speed: float = 1.0
 
@@ -72,6 +94,36 @@ class ViewerState:
             self.colormap = colormap_for_component(self.component)
         self.point_size = None if self.point_size is None else float(self.point_size)
         self.show_scalar_bar = bool(self.show_scalar_bar)
+        self.colormap_inverted = bool(self.colormap_inverted)
+        self.colormap_discrete = bool(self.colormap_discrete)
+        self.colormap_bins = max(3, min(64, int(self.colormap_bins)))
+        self.nan_color = str(self.nan_color or "#8c8c8c")
+        self.below_range_color = str(self.below_range_color or "#15304b")
+        self.above_range_color = str(self.above_range_color or "#f3b23f")
+        self.use_below_range_color = bool(self.use_below_range_color)
+        self.use_above_range_color = bool(self.use_above_range_color)
+        self.symmetric_color_range = bool(self.symmetric_color_range)
+        self.percentile_clip = max(0.0, min(20.0, float(self.percentile_clip)))
+        self.legend_title_override = str(self.legend_title_override or "")
+        self.legend_orientation = (
+            str(self.legend_orientation)
+            if str(self.legend_orientation) in ("vertical", "horizontal")
+            else "vertical"
+        )
+        self.legend_position = (
+            str(self.legend_position)
+            if str(self.legend_position) in ("right", "left", "top", "bottom")
+            else "right"
+        )
+        self.legend_label_count = max(2, min(12, int(self.legend_label_count)))
+        self.legend_label_font_size = max(7, min(24, int(self.legend_label_font_size)))
+        self.legend_title_font_size = max(8, min(28, int(self.legend_title_font_size)))
+        self.legend_show_outline = bool(self.legend_show_outline)
+        self.legend_show_background = bool(self.legend_show_background)
+        self.show_axes_grid = bool(self.show_axes_grid)
+        self.axes_grid_color = str(self.axes_grid_color or "#8c97a8")
+        self.selection_labels_enabled = bool(self.selection_labels_enabled)
+        self.ghost_warp_reference = bool(self.ghost_warp_reference)
         self.is_playing = bool(self.is_playing)
         self.playback_speed = self._validate_playback_speed(self.playback_speed)
         self.clamp_enabled = bool(self.clamp_enabled)
@@ -128,6 +180,68 @@ class ViewerState:
     def set_show_scalar_bar(self, show_scalar_bar: bool) -> bool:
         self.show_scalar_bar = bool(show_scalar_bar)
         return self.show_scalar_bar
+
+    def set_transfer_function_preferences(
+        self,
+        *,
+        inverted: bool,
+        discrete: bool,
+        bins: int,
+        nan_color: str,
+        below_color: str,
+        above_color: str,
+        use_below: bool,
+        use_above: bool,
+        symmetric_range: bool,
+        percentile_clip: float,
+    ) -> None:
+        self.colormap_inverted = bool(inverted)
+        self.colormap_discrete = bool(discrete)
+        self.colormap_bins = max(3, min(64, int(bins)))
+        self.nan_color = str(nan_color or self.nan_color)
+        self.below_range_color = str(below_color or self.below_range_color)
+        self.above_range_color = str(above_color or self.above_range_color)
+        self.use_below_range_color = bool(use_below)
+        self.use_above_range_color = bool(use_above)
+        self.symmetric_color_range = bool(symmetric_range)
+        self.percentile_clip = max(0.0, min(20.0, float(percentile_clip)))
+
+    def set_legend_preferences(
+        self,
+        *,
+        title: str,
+        orientation: str,
+        position: str,
+        label_count: int,
+        label_font_size: int,
+        title_font_size: int,
+        show_outline: bool,
+        show_background: bool,
+    ) -> None:
+        self.legend_title_override = str(title or "")
+        self.legend_orientation = (
+            str(orientation) if str(orientation) in ("vertical", "horizontal") else "vertical"
+        )
+        self.legend_position = (
+            str(position) if str(position) in ("right", "left", "top", "bottom") else "right"
+        )
+        self.legend_label_count = max(2, min(12, int(label_count)))
+        self.legend_label_font_size = max(7, min(24, int(label_font_size)))
+        self.legend_title_font_size = max(8, min(28, int(title_font_size)))
+        self.legend_show_outline = bool(show_outline)
+        self.legend_show_background = bool(show_background)
+
+    def set_axes_grid_visible(self, visible: bool) -> bool:
+        self.show_axes_grid = bool(visible)
+        return self.show_axes_grid
+
+    def set_selection_labels_enabled(self, enabled: bool) -> bool:
+        self.selection_labels_enabled = bool(enabled)
+        return self.selection_labels_enabled
+
+    def set_ghost_warp_reference(self, enabled: bool) -> bool:
+        self.ghost_warp_reference = bool(enabled)
+        return self.ghost_warp_reference
 
     def set_playing(self, is_playing: bool) -> bool:
         self.is_playing = bool(is_playing)

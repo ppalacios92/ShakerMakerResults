@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from .adapter import GF_DEMAND, REGULAR_DEMANDS, ViewerDataAdapter
-from .colors import BACKGROUND_PRESETS, colormap_for_component, scalar_limits, scalars_to_rgb
+from .colors import (
+    BACKGROUND_PRESETS,
+    colormap_for_component,
+    effective_colormap_name,
+    scalar_limits,
+    scalars_to_rgb,
+)
 from .state import ViewerState
 
 VALID_STATIC_COLOR_BY = ("elevation_z", "newmark_sa", "arias")
@@ -357,6 +363,79 @@ class ViewerSession:
         self.state.set_show_scalar_bar(show_scalar_bar)
         self._notify_window("appearance")
         return self.state.show_scalar_bar
+
+    def apply_transfer_function_preferences(
+        self,
+        *,
+        colormap: str,
+        inverted: bool,
+        discrete: bool,
+        bins: int,
+        nan_color: str,
+        below_color: str,
+        above_color: str,
+        use_below: bool,
+        use_above: bool,
+        symmetric_range: bool,
+        percentile_clip: float,
+    ):
+        self.state.set_colormap(colormap)
+        self.state.set_transfer_function_preferences(
+            inverted=inverted,
+            discrete=discrete,
+            bins=bins,
+            nan_color=nan_color,
+            below_color=below_color,
+            above_color=above_color,
+            use_below=use_below,
+            use_above=use_above,
+            symmetric_range=symmetric_range,
+            percentile_clip=percentile_clip,
+        )
+        self._notify_window("appearance")
+        return self.current_colormap()
+
+    def apply_legend_preferences(
+        self,
+        *,
+        visible: bool,
+        title: str,
+        orientation: str,
+        position: str,
+        label_count: int,
+        label_font_size: int,
+        title_font_size: int,
+        show_outline: bool,
+        show_background: bool,
+    ):
+        self.state.set_show_scalar_bar(visible)
+        self.state.set_legend_preferences(
+            title=title,
+            orientation=orientation,
+            position=position,
+            label_count=label_count,
+            label_font_size=label_font_size,
+            title_font_size=title_font_size,
+            show_outline=show_outline,
+            show_background=show_background,
+        )
+        self._notify_window("appearance")
+        return self.state.show_scalar_bar
+
+    def set_axes_grid_visible(self, visible: bool):
+        self.state.set_axes_grid_visible(visible)
+        self._notify_window("appearance")
+        return self.state.show_axes_grid
+
+    def set_selection_labels_enabled(self, enabled: bool):
+        self.state.set_selection_labels_enabled(enabled)
+        self._notify_window("multi_selection")
+        return self.state.selection_labels_enabled
+
+    def set_ghost_warp_reference(self, enabled: bool):
+        self.state.set_ghost_warp_reference(enabled)
+        self._notify_window("warp")
+        return self.state.ghost_warp_reference
 
     def set_color_range(self, vmin: float | None, vmax: float | None, *, clamp: bool | None = None):
         self.state.set_user_color_range(vmin, vmax)
@@ -866,7 +945,15 @@ class ViewerSession:
             len(elev),
         )
         if self._blend_base_rgb_key != key or self._blend_base_rgb is None:
-            self._blend_base_rgb = scalars_to_rgb(elev, self._static_color_map, vmin, vmax)
+            self._blend_base_rgb = scalars_to_rgb(
+                elev,
+                effective_colormap_name(
+                    self._static_color_map,
+                    inverted=self.state.colormap_inverted,
+                ),
+                vmin,
+                vmax,
+            )
             self._blend_base_rgb_key = key
         return self._blend_base_rgb
 
@@ -1004,7 +1091,10 @@ class ViewerSession:
             return scalar_limits(scalars, self.state.component)
 
     def _current_wave_colormap(self) -> str:
-        return self.state.colormap or colormap_for_component(self.state.component)
+        return effective_colormap_name(
+            self.state.colormap or colormap_for_component(self.state.component),
+            inverted=self.state.colormap_inverted,
+        )
 
     def current_color_limits(self, scalars=None) -> tuple[float, float]:
         if self.current_wave_blend_active():
@@ -1019,10 +1109,29 @@ class ViewerSession:
             return vmin, vmax
         if scalars is None:
             try:
-                return self.default_color_limits()
+                lo, hi = self.default_color_limits()
+                if self.state.symmetric_color_range:
+                    vmax = max(abs(float(lo)), abs(float(hi)))
+                    return -vmax, vmax
+                return lo, hi
             except Exception:
                 scalars = self.current_visible_scalars()
-        return scalar_limits(scalars, self.state.component)
+        try:
+            import numpy as np
+
+            arr = np.asarray(scalars, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size and self.state.percentile_clip > 0.0:
+                lo = float(np.percentile(arr, self.state.percentile_clip))
+                hi = float(np.percentile(arr, 100.0 - self.state.percentile_clip))
+            else:
+                lo, hi = scalar_limits(arr, self.state.component)
+        except Exception:
+            lo, hi = scalar_limits(scalars, self.state.component)
+        if self.state.symmetric_color_range:
+            vmax = max(abs(float(lo)), abs(float(hi)))
+            return -vmax, vmax
+        return lo, hi
 
     def current_trace(self):
         node_id = self.state.selected_node
@@ -1148,8 +1257,14 @@ class ViewerSession:
         if self.current_wave_blend_active():
             return self._current_wave_colormap()
         if self._static_color_by is not None:
-            return self._static_color_map
-        return self.state.colormap or colormap_for_component(self.state.component)
+            return effective_colormap_name(
+                self._static_color_map,
+                inverted=self.state.colormap_inverted,
+            )
+        return effective_colormap_name(
+            self.state.colormap or colormap_for_component(self.state.component),
+            inverted=self.state.colormap_inverted,
+        )
 
     def current_static_color_by(self) -> str | None:
         return self._static_color_by
@@ -1174,6 +1289,8 @@ class ViewerSession:
         }
 
     def current_scalar_bar_title(self) -> str:
+        if self.state.legend_title_override:
+            return self.state.legend_title_override
         if self.current_wave_blend_active():
             return f"{self.state.demand}/{self.state.component}"
         if self._static_color_by == "elevation_z":

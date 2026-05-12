@@ -6,6 +6,7 @@ from ._imports import require_viewer_dependencies
 from .colors import BACKGROUND_PRESETS, COLORMAP_OPTIONS
 from .icons import icon
 from .theme import LIGHT_PALETTE
+from .visual_editors import LegendEditorDialog, TransferFunctionDialog
 
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
 
@@ -86,10 +87,26 @@ class AppearanceButton(QtWidgets.QToolButton):
         self.scalar_bar_checkbox = QtWidgets.QCheckBox("Visible")
         self.scalar_bar_checkbox.toggled.connect(session.set_show_scalar_bar)
 
+        self.axes_grid_checkbox = QtWidgets.QCheckBox("Visible")
+        self.axes_grid_checkbox.toggled.connect(session.set_axes_grid_visible)
+
+        advanced_row = QtWidgets.QWidget()
+        advanced_layout = QtWidgets.QHBoxLayout(advanced_row)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(5)
+        self.color_editor_btn = QtWidgets.QPushButton("Color editor")
+        self.color_editor_btn.clicked.connect(self._open_transfer_editor)
+        self.legend_editor_btn = QtWidgets.QPushButton("Legend editor")
+        self.legend_editor_btn.clicked.connect(self._open_legend_editor)
+        advanced_layout.addWidget(self.color_editor_btn)
+        advanced_layout.addWidget(self.legend_editor_btn)
+
         form.addRow("Background", self.background_combo)
         form.addRow("Colormap", self.colormap_combo)
         form.addRow("Point size", point_size_row)
         form.addRow("Scalar bar", self.scalar_bar_checkbox)
+        form.addRow("Axes grid", self.axes_grid_checkbox)
+        form.addRow("", advanced_row)
 
         menu = QtWidgets.QMenu(self)
         action = QtWidgets.QWidgetAction(menu)
@@ -110,12 +127,51 @@ class AppearanceButton(QtWidgets.QToolButton):
         block = self.scalar_bar_checkbox.blockSignals(True)
         self.scalar_bar_checkbox.setChecked(self.session.state.show_scalar_bar)
         self.scalar_bar_checkbox.blockSignals(block)
+        block = self.axes_grid_checkbox.blockSignals(True)
+        self.axes_grid_checkbox.setChecked(self.session.state.show_axes_grid)
+        self.axes_grid_checkbox.blockSignals(block)
 
     @staticmethod
     def _set_combo_value(combo, value):
         block = combo.blockSignals(True)
         combo.setCurrentText(str(value))
         combo.blockSignals(block)
+
+    def _open_transfer_editor(self):
+        dlg = TransferFunctionDialog(self.session, self.window())
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        values = dlg.values()
+        self.session.apply_transfer_function_preferences(
+            colormap=values.colormap,
+            inverted=values.invert,
+            discrete=values.discrete,
+            bins=values.bins,
+            nan_color=values.nan_color,
+            below_color=values.below_color,
+            above_color=values.above_color,
+            use_below=values.use_below,
+            use_above=values.use_above,
+            symmetric_range=values.symmetric_range,
+            percentile_clip=values.percentile_clip,
+        )
+
+    def _open_legend_editor(self):
+        dlg = LegendEditorDialog(self.session, self.window())
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        values = dlg.values()
+        self.session.apply_legend_preferences(
+            visible=values.visible,
+            title=values.title,
+            orientation=values.orientation,
+            position=values.position,
+            label_count=values.label_count,
+            label_font_size=values.label_font_size,
+            title_font_size=values.title_font_size,
+            show_outline=values.show_outline,
+            show_background=values.show_background,
+        )
 
 
 class TimeControls(QtWidgets.QWidget):

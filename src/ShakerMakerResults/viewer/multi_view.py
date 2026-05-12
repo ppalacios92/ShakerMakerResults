@@ -299,6 +299,7 @@ class ViewPane(QtWidgets.QWidget):
         elif reason == "warp":
             self.scene.rebuild_scalar_actor(render=False)
             self.scene.refresh_selection(render=False)
+            self.scene.refresh_ghost_reference(render=False)
         elif reason == "multi_selection":
             # Node added/removed from selection set, or show/hide filter changed.
             self.scene.rebuild_scalar_actor(render=False)

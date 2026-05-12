@@ -12,7 +12,27 @@ BACKGROUND_PRESETS = {
     "Dark": "#1f2430",
 }
 
-COLORMAP_OPTIONS = ("RdBu_r", "viridis", "hot_r", "seismic")
+COLORMAP_OPTIONS = (
+    "RdBu_r",
+    "viridis",
+    "hot_r",
+    "seismic",
+    "terrain",
+    "plasma",
+    "magma",
+    "cividis",
+    "coolwarm",
+)
+
+
+def effective_colormap_name(name: str, *, inverted: bool = False) -> str:
+    """Return a Matplotlib colormap name honoring the viewer inversion flag."""
+    cmap = str(name or "viridis")
+    if inverted and not cmap.endswith("_r"):
+        return f"{cmap}_r"
+    if not inverted and cmap.endswith("_r"):
+        return cmap[:-2]
+    return cmap
 
 
 def colormap_for_component(component: str) -> str:
