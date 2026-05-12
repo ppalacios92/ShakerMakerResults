@@ -33,17 +33,18 @@ class ViewerPalette:
     accent: str = "#2a6bc2"
     accent_dark: str = "#1e5299"
     navy: str = "#1e3558"
-    # Surface tones (bone family, cool-neutral) sampled from the user's
-    # reference image.  The three steps follow the standard "container /
-    # panel / hover" triplet used elsewhere in the UI.
-    surface: str = "#f3f1ec"        # panel / form bg (slight cream)
-    surface_2: str = "#eceae6"      # main window bg (bone)
-    surface_3: str = "#e0ddd6"      # hover / pressed
+    # Surface tones — the user's reference value is ``#ebedef`` for the
+    # main bone-white background.  Panel surface is one tick lighter and
+    # the hover state one tick darker so the three steps still read
+    # against each other on calibrated displays.
+    surface: str = "#f4f5f7"        # panel / form bg
+    surface_2: str = "#ebedef"      # main window bg (bone white)
+    surface_3: str = "#dfe2e5"      # hover / pressed
     text: str = "#1c2330"           # near-black with cool undertone
     text_2: str = "#4d5664"
     text_muted: str = "#7c8492"
-    border: str = "#cfcdc7"
-    border_strong: str = "#a9a7a0"
+    border: str = "#cfd3d8"
+    border_strong: str = "#a9aeb5"
     danger: str = "#b24a3f"
     plot_white: str = "#ffffff"
     # Used by the 3-D plotter background and the in-scene branding text.
@@ -56,27 +57,28 @@ class ViewerPalette:
 LIGHT_PALETTE = ViewerPalette()
 
 #: Cool dark slate background + bone text + warm-gold accent.
-#: Sampled from the user's reference image — a desaturated dark slate
-#: (not pure black, not strong primary blue), paired with the same
-#: bone text family as the light palette so the eye adapts smoothly
-#: between themes.
+#: Main window background is ``#303841`` (user-supplied).  Panel
+#: surface is one tick lighter, hover one tick lighter again, so the
+#: three steps read against each other.  Bone-coloured body text
+#: (``#ebedef`` — same hex as the light palette's main bg) closes the
+#: visual loop between themes.
 DARK_PALETTE = ViewerPalette(
     name="dark",
     accent="#c9a76a",          # warm gold
     accent_dark="#a88751",
-    navy="#e8dfca",            # titles → match bone body text
-    surface="#3f4853",         # panel surface (slightly lighter than main)
-    surface_2="#363f49",       # main window bg — cool dark slate
-    surface_3="#4a5460",       # hover / pressed
-    text="#e8dfca",            # bone — body text
-    text_2="#c4b9a4",          # softer bone for secondary labels
-    text_muted="#929aa6",      # cool muted gray (matches slate)
-    border="#4a5460",
-    border_strong="#5c6776",
+    navy="#ebedef",            # titles → match bone body text
+    surface="#3a424d",         # panel surface
+    surface_2="#303841",       # main window bg (user reference)
+    surface_3="#454e5a",       # hover / pressed
+    text="#ebedef",            # bone — body text
+    text_2="#c5cad1",
+    text_muted="#929aa6",
+    border="#454e5a",
+    border_strong="#5a6473",
     danger="#d97560",
-    plot_white="#363f49",
-    render_background="#363f49",   # 3-D viewport background matches main bg
-    render_text="#aea495",
+    plot_white="#303841",
+    render_background="#303841",   # 3-D viewport background matches main bg
+    render_text="#aeb5be",
     active_border="#c9a76a",       # active view-frame highlight
 )
 

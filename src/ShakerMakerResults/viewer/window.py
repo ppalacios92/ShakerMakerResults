@@ -171,17 +171,23 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         root.addWidget(self.time_controls)
 
         # ── Themed top toolbars ─────────────────────────────────────────────
-        # Camera + View Presets together on the first row; the rest break
-        # to a second row so a 1600 px window doesn't truncate the icons.
+        # Apply-to + Camera + View Presets on the first row; the rest
+        # wrap to a second row so a 1600 px window doesn't truncate icons.
         self._toolbars = build_viewer_toolbars(self.multi_view, session, self)
+        # Remember the Apply-to toolbar specifically so other widgets
+        # (Scene Browser bridge, section Apply routing) can query it.
+        self._apply_target_toolbar = next(
+            (tb for tb in self._toolbars if tb.__class__.__name__ == "ApplyTargetToolBar"),
+            None,
+        )
         for index, tb in enumerate(self._toolbars):
             tb.setMovable(True)
             tb.setFloatable(True)
             tb.setObjectName(f"ViewerToolBar_{tb.windowTitle().replace(' ', '_')}")
             self.addToolBar(QtCore.Qt.TopToolBarArea, tb)
-            # Break after the View Presets toolbar so it sits beside Camera
-            # and the rest wrap to the next line below.
-            if index == 1:
+            # Break after View Presets (index 2) so Apply-to + Camera +
+            # View Presets stay on row 1 and the rest wrap to row 2.
+            if index == 2:
                 self.addToolBarBreak(QtCore.Qt.TopToolBarArea)
 
         self.toolbar = self._toolbars[0] if self._toolbars else None
@@ -438,21 +444,15 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             self._set_display_apply_target("pane")
 
     def _set_display_apply_target(self, target: str) -> None:
-        """Flip the Display dock's "Apply to" combo without firing the user
-        signal so the combo is just visually moved (no spurious refresh).
+        """Set the global Apply-to selector and optionally surface Display.
+
+        Originally flipped a combo inside :class:`DisplaySection`; the
+        selector now lives in :class:`ApplyTargetToolBar` so we forward
+        to :meth:`set_apply_target`.  The Display dock is still raised
+        to the front when hidden so the user can see what will change.
         """
+        self.set_apply_target(target)
         display_dock = self._docks.get("display")
-        page = self._side_pages.get("display")
-        if page is None or not hasattr(page, "apply_target_combo"):
-            return
-        combo = page.apply_target_combo
-        index = combo.findData(target)
-        if index < 0:
-            return
-        block = combo.blockSignals(True)
-        combo.setCurrentIndex(index)
-        combo.blockSignals(block)
-        # Raise Display so the user sees the routing change.
         if display_dock is not None and not display_dock.isVisible():
             display_dock.setVisible(True)
             display_dock.raise_()
@@ -503,6 +503,28 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         reset_act = QtGui.QAction("Reset window layout", self)
         reset_act.triggered.connect(self._reset_window_layout)
         view_menu.addAction(reset_act)
+
+    # ── Apply-to target (consumed by every editor dock) ─────────────────────
+
+    def apply_target(self) -> str:
+        """Return the active Apply-to selection: ``"all"`` / ``"tab"`` / ``"pane"``."""
+        tb = getattr(self, "_apply_target_toolbar", None)
+        if tb is None:
+            return "all"
+        try:
+            return tb.target()
+        except Exception:
+            return "all"
+
+    def set_apply_target(self, value: str) -> None:
+        """Flip the Apply-to combo from code (e.g. the Scene Browser bridge)."""
+        tb = getattr(self, "_apply_target_toolbar", None)
+        if tb is None:
+            return
+        try:
+            tb.set_target(value)
+        except Exception:
+            pass
 
     # ── Theme switching ─────────────────────────────────────────────────────
 

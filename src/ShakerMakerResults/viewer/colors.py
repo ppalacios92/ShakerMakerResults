@@ -10,9 +10,9 @@ BACKGROUND_PRESETS = {
     "White": "#ffffff",
     "Gray": "#d7d9dd",
     # Cool dark slate — matches the dark UI palette so the renderer
-    # background reads consistently with the rest of the chrome when the
-    # user picks the dark theme.
-    "Dark": "#363f49",
+    # background reads consistently with the rest of the chrome when
+    # the user picks the dark theme.
+    "Dark": "#303841",
 }
 
 COLORMAP_OPTIONS = (

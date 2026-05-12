@@ -286,6 +286,102 @@ class _SectionBase(QtWidgets.QWidget):
     def _fmt_xyz(xyz) -> str:
         return "-" if xyz is None else f"{xyz[0]:.1f}, {xyz[1]:.1f}, {xyz[2]:.1f}"
 
+    # ── Apply-to target plumbing (shared by every editor section) ───────────
+
+    def _resolve_apply_target(self) -> str:
+        """Return the active Apply-to value from the window toolbar."""
+        w = self.window()
+        if w is not None and hasattr(w, "apply_target"):
+            try:
+                return w.apply_target()
+            except Exception:
+                pass
+        return "all"
+
+    def _apply_target_panes(self) -> list:
+        """Resolve the current Apply-to selection into a list of ViewPanes.
+
+        Empty list ⇒ the section should fall back to the global apply.
+        """
+        target = self._resolve_apply_target()
+        if target == "all":
+            return []
+        w = self.window()
+        multi = getattr(w, "multi_view", None) if w is not None else None
+        if multi is None:
+            return []
+        if target == "tab":
+            current = getattr(multi, "current", None) or multi
+            return list(getattr(current, "_panes", []) or [])
+        pane = getattr(multi, "active_pane", None)
+        return [pane] if pane is not None else []
+
+    @staticmethod
+    def _iter_all_panes(multi):
+        """Yield every pane across every tab of *multi*."""
+        tabs = getattr(multi, "_tabs", None)
+        if tabs is None:
+            for pane in getattr(multi, "_panes", []) or []:
+                yield pane
+            return
+        for i in range(tabs.count()):
+            area = tabs.widget(i)
+            for pane in getattr(area, "_panes", []) or []:
+                yield pane
+
+    def _route_apply(
+        self,
+        *,
+        pane_payload: dict,
+        global_apply,
+        clear_attrs=None,
+    ) -> None:
+        """Route an Apply through the active target.
+
+        * ``pane_payload`` — ``{pane_state_attr: value}``; written to
+          each target pane's ``pane_state`` when target ≠ all.
+        * ``global_apply`` — zero-arg callable run when target == all.
+        * ``clear_attrs`` — names to ``clear_overrides`` on every pane
+          in the "all" path so per-pane overrides don't shadow the new
+          global value.  Defaults to ``pane_payload.keys()``.
+        """
+        target = self._resolve_apply_target()
+        w = self.window()
+        multi = getattr(w, "multi_view", None) if w is not None else None
+        attrs = list(clear_attrs) if clear_attrs is not None else list(pane_payload.keys())
+
+        if target == "all":
+            if multi is not None:
+                for pane in self._iter_all_panes(multi):
+                    ps = getattr(pane, "pane_state", None)
+                    if ps is not None:
+                        try:
+                            ps.clear_overrides(attrs)
+                        except Exception:
+                            pass
+            try:
+                global_apply()
+            except Exception:
+                pass
+            return
+
+        for pane in self._apply_target_panes():
+            ps = getattr(pane, "pane_state", None)
+            if ps is None:
+                continue
+            for attr_name, value in pane_payload.items():
+                try:
+                    setattr(ps, attr_name, value)
+                except Exception:
+                    pass
+            scene = getattr(pane, "scene", None)
+            if scene is not None:
+                try:
+                    scene.rebuild_scalar_actor(render=False)
+                    pane.plotter.render()
+                except Exception:
+                    pass
+
 
 # ── Lightweight section widgets ───────────────────────────────────────────────
 
@@ -616,11 +712,23 @@ class VectorFieldSection(_SectionBase):
     def _apply(self):
         if self._syncing:
             return
-        self.session.apply_vector_field_settings(
-            enabled=self.enabled_cb.isChecked(),
-            demand=str(self.demand_combo.currentData()),
-            scale=self.scale_spin.value(),
-            colormap=str(self.cmap_combo.currentData() or "viridis"),
+        enabled = self.enabled_cb.isChecked()
+        demand = str(self.demand_combo.currentData())
+        scale = self.scale_spin.value()
+        colormap = str(self.cmap_combo.currentData() or "viridis")
+        self._route_apply(
+            pane_payload={
+                "vector_field_enabled":  enabled,
+                "vector_field_demand":   demand,
+                "vector_field_scale":    scale,
+                "vector_field_colormap": colormap,
+            },
+            global_apply=lambda: self.session.apply_vector_field_settings(
+                enabled=enabled,
+                demand=demand,
+                scale=scale,
+                colormap=colormap,
+            ),
         )
         self._clear_dirty()
 
@@ -1043,36 +1151,10 @@ class DisplaySection(_SectionBase):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(8)
-
-        # ── Apply target selector ────────────────────────────────────────
-        # Drives where _apply() writes the values:
-        #   "all"  → session global (current behaviour; clears overrides
-        #            on every pane so the global change is visible)
-        #   "tab"  → every pane in the currently visible MultiViewArea
-        #            (writes overrides on each pane.pane_state)
-        #   "pane" → only the active pane (writes overrides on its
-        #            pane_state)
-        # ``window.set_apply_target_for_display(...)`` lets the Scene
-        # Browser flip the combo when the user picks a tab / pane in the
-        # tree.
-        target_box = QtWidgets.QWidget()
-        target_lay = QtWidgets.QHBoxLayout(target_box)
-        target_lay.setContentsMargins(0, 0, 0, 0)
-        target_lay.setSpacing(6)
-        target_lbl = QtWidgets.QLabel("Apply to")
-        target_lbl.setToolTip(
-            "Which viewports the Apply button writes to.\n"
-            "All panes  — writes to the global state; every pane sees it.\n"
-            "Current tab — only panes in the visible tab.\n"
-            "Active pane — only the pane you last clicked."
-        )
-        target_lay.addWidget(target_lbl)
-        self.apply_target_combo = QtWidgets.QComboBox()
-        self.apply_target_combo.addItem("All panes", "all")
-        self.apply_target_combo.addItem("Current tab", "tab")
-        self.apply_target_combo.addItem("Active pane", "pane")
-        target_lay.addWidget(self.apply_target_combo, 1)
-        outer.addWidget(target_box)
+        # Apply-to selector lives in the global toolbar
+        # (:class:`~.toolbar.ApplyTargetToolBar`) — every editor dock
+        # reads it through ``self._resolve_apply_target()`` so the user
+        # has a single visible place to choose where Apply writes.
 
         # ── Field group ───────────────────────────────────────────────────
         field_box = QtWidgets.QGroupBox("Field")
@@ -1260,41 +1342,11 @@ class DisplaySection(_SectionBase):
             show_background=values.show_background,
         )
 
-    # ── Apply target plumbing ─────────────────────────────────────────────
-
-    def _resolve_apply_target(self) -> str:
-        """Return the active "Apply to" target string."""
-        try:
-            return str(self.apply_target_combo.currentData() or "all")
-        except Exception:
-            return "all"
-
-    def _target_panes(self) -> list:
-        """Resolve the current "Apply to" selection to a list of ViewPanes.
-
-        Returns an empty list for the ``"all"`` target — that path stays
-        on the global session.apply_display_settings codepath unchanged.
-        """
-        target = self._resolve_apply_target()
-        if target == "all":
-            return []
-        window = self.window()
-        multi = getattr(window, "multi_view", None) if window is not None else None
-        if multi is None:
-            return []
-        if target == "tab":
-            current = getattr(multi, "current", None) or multi
-            return list(getattr(current, "_panes", []) or [])
-        # "pane"
-        pane = getattr(multi, "active_pane", None)
-        return [pane] if pane is not None else []
-
     # ── Single atomic apply ───────────────────────────────────────────────
 
     def _apply(self):
         if self._syncing:
             return
-        target = self._resolve_apply_target()
         cmap_value = self.cmap_combo.currentText()
         vmin = self.vmin_spin.value()
         vmax = self.vmax_spin.value()
@@ -1303,22 +1355,20 @@ class DisplaySection(_SectionBase):
         component = str(self.component_combo.currentData())
         gf_subfault = self.gf_subfault_spin.value()
 
-        if target == "all":
-            # Global path — also drop every per-pane override for these
-            # attributes so the global value is what every pane actually
-            # shows after this Apply.  ``demand`` is included so a pane
-            # that had a per-pane demand reverts to the new global.
-            window = self.window()
-            multi = getattr(window, "multi_view", None) if window is not None else None
-            if multi is not None:
-                for pane in self._iter_all_panes(multi):
-                    pane_state = getattr(pane, "pane_state", None)
-                    if pane_state is not None:
-                        pane_state.clear_overrides(
-                            ("demand", "component", "colormap",
-                             "user_vmin", "user_vmax", "clamp_enabled")
-                        )
-            self.session.apply_display_settings(
+        # ``demand`` MUST be in the pane payload — otherwise an Active
+        # pane Apply would keep reading the session global demand and
+        # the user ends up with the wrong field rendered (e.g. accel
+        # data clamped to the velocity range they typed).
+        self._route_apply(
+            pane_payload={
+                "demand":        demand,
+                "component":     component,
+                "colormap":      cmap_value,
+                "user_vmin":     vmin,
+                "user_vmax":     vmax,
+                "clamp_enabled": clamp,
+            },
+            global_apply=lambda: self.session.apply_display_settings(
                 demand=demand,
                 component=component,
                 gf_subfault_id=gf_subfault,
@@ -1326,52 +1376,9 @@ class DisplaySection(_SectionBase):
                 vmin=vmin,
                 vmax=vmax,
                 clamp_enabled=clamp,
-            )
-            self._clear_dirty()
-            return
-
-        # Per-pane / per-tab path: write to each pane's overlay.
-        panes = self._target_panes()
-        if not panes:
-            self._clear_dirty()
-            return
-        for pane in panes:
-            pane_state = getattr(pane, "pane_state", None)
-            if pane_state is None:
-                continue
-            # IMPORTANT: ``demand`` MUST be written too — otherwise the
-            # pane keeps reading the session global demand and the user
-            # ends up with the wrong field rendered (e.g. accel data
-            # clamped to the velocity range they typed).  All other
-            # display attributes follow.
-            pane_state.demand = demand
-            pane_state.component = component
-            pane_state.colormap = cmap_value
-            pane_state.user_vmin = vmin
-            pane_state.user_vmax = vmax
-            pane_state.clamp_enabled = clamp
-            # Force this pane to re-render with the new overlay.
-            scene = getattr(pane, "scene", None)
-            if scene is not None:
-                try:
-                    scene.rebuild_scalar_actor(render=False)
-                    pane.plotter.render()
-                except Exception:
-                    pass
+            ),
+        )
         self._clear_dirty()
-
-    @staticmethod
-    def _iter_all_panes(multi):
-        """Yield every pane across every tab of *multi* (tabbed or not)."""
-        tabs = getattr(multi, "_tabs", None)
-        if tabs is None:
-            for pane in getattr(multi, "_panes", []) or []:
-                yield pane
-            return
-        for i in range(tabs.count()):
-            area = tabs.widget(i)
-            for pane in getattr(area, "_panes", []) or []:
-                yield pane
 
     def _on_demand_changed(self):
         if self._syncing:
@@ -1541,12 +1548,37 @@ class WarpSection(_SectionBase):
     def _apply(self):
         if self._syncing:
             return
-        self.session.apply_warp_settings(
-            warp_enabled=self.warp_cb.isChecked(),
-            warp_axes=(self.x_cb.isChecked(), self.y_cb.isChecked(), self.z_cb.isChecked()),
-            warp_scale=self.scale_spin.value(),
+        warp_enabled = self.warp_cb.isChecked()
+        warp_axes = (
+            self.x_cb.isChecked(),
+            self.y_cb.isChecked(),
+            self.z_cb.isChecked(),
         )
-        self.session.set_ghost_warp_reference(self.ghost_cb.isChecked())
+        warp_scale = self.scale_spin.value()
+        # Ghost reference is a *global* visual hint (single state flag
+        # consumed by every scene) — keep it on session.state regardless
+        # of target.  The warp parameters themselves honour the
+        # Apply-to selector via the shared _route_apply helper.
+        try:
+            self.session.set_ghost_warp_reference(self.ghost_cb.isChecked())
+        except Exception:
+            pass
+
+        def _global_apply():
+            self.session.apply_warp_settings(
+                warp_enabled=warp_enabled,
+                warp_axes=warp_axes,
+                warp_scale=warp_scale,
+            )
+
+        self._route_apply(
+            pane_payload={
+                "disp_warp_enabled": warp_enabled,
+                "warp_axes":         warp_axes,
+                "warp_scale":        warp_scale,
+            },
+            global_apply=_global_apply,
+        )
         self._clear_dirty()
 
 

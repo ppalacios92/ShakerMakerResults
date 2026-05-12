@@ -237,6 +237,61 @@ class _AllWindowsState:
         self._subscribers.append(cb)
 
 
+# ── Global "Apply to" toolbar ─────────────────────────────────────────────────
+
+
+class ApplyTargetToolBar(_ToolBarBase):
+    """Single "Apply to" selector consumed by every editor dock.
+
+    Display, Vector Field, Color By, Warp and any future editor all read
+    from this one combo to decide whether their Apply button writes to
+    the global ``session.state`` or to the active pane / current tab's
+    per-pane override layer.  Putting it in a toolbar (not inside any
+    particular dock) makes the routing visible regardless of which dock
+    the user has open.
+    """
+
+    targetChanged = QtCore.Signal(str)
+
+    def __init__(self, multi_view, session, all_state: "_AllWindowsState", parent=None):
+        super().__init__("Apply to", multi_view, session, parent)
+        self._all_state = all_state
+        label = QtWidgets.QLabel(" Apply to ")
+        label.setToolTip(
+            "Which viewports the Apply buttons write to.\n"
+            "All panes — global change visible everywhere.\n"
+            "Current tab — only panes in the visible tab.\n"
+            "Active pane — only the pane you last clicked."
+        )
+        self.addWidget(label)
+
+        self._combo = QtWidgets.QComboBox()
+        self._combo.addItem("All panes", "all")
+        self._combo.addItem("Current tab", "tab")
+        self._combo.addItem("Active pane", "pane")
+        self._combo.setMinimumWidth(140)
+        self._combo.currentIndexChanged.connect(
+            lambda *_: self.targetChanged.emit(self.target())
+        )
+        self.addWidget(self._combo)
+
+    def target(self) -> str:
+        try:
+            return str(self._combo.currentData() or "all")
+        except Exception:
+            return "all"
+
+    def set_target(self, value: str) -> None:
+        idx = self._combo.findData(str(value))
+        if idx < 0:
+            return
+        block = self._combo.blockSignals(True)
+        try:
+            self._combo.setCurrentIndex(idx)
+        finally:
+            self._combo.blockSignals(block)
+
+
 # ── View presets toolbar (replaces the old vertical CameraViewRail) ──────────
 
 #: ``(group, key, label, icon_name, tooltip)`` — drives both the toolbar
@@ -810,12 +865,14 @@ class DisplayToolBar(_ToolBarBase):
 def build_viewer_toolbars(multi_view, session, parent) -> list[_ToolBarBase]:
     """Construct every themed toolbar in the order the window expects.
 
-    Two rows by default — the window groups the first four in row 1 and the
-    last three in row 2 via ``addToolBarBreak``.  Order matters: the View
-    menu lists them top-to-bottom in this exact order.
+    The "Apply to" selector comes first so it is always the leftmost
+    control — every editor dock (Display / Vector Field / Color By /
+    Warp) reads from it.  The window groups the first three in row 1
+    (Apply-to + Camera + View Presets) and the rest wrap to row 2.
     """
     state = _AllWindowsState(multi_view)
     return [
+        ApplyTargetToolBar(multi_view, session, state, parent),
         CameraToolBar(multi_view, session, state, parent),
         ViewPresetsToolBar(multi_view, session, state, parent),
         OverlaysToolBar(multi_view, session, state, parent),
@@ -826,6 +883,7 @@ def build_viewer_toolbars(multi_view, session, parent) -> list[_ToolBarBase]:
 
 
 __all__ = [
+    "ApplyTargetToolBar",
     "CameraToolBar",
     "ViewPresetsToolBar",
     "OverlaysToolBar",
