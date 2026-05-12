@@ -80,9 +80,10 @@ def _settings() -> "QtCore.QSettings":
 #: ``key`` matches the dock factory in ``_init_dock_factories``.
 _DOCK_SPECS: list[tuple[str, str, str, bool]] = [
     # Left column — inspection / data context + global appearance.
-    # Scene Browser starts hidden by default (it adds little over a click
-    # on the Properties tab directly); discoverable through View → Panels.
-    ("pipeline",    "Scene Browser",    "left",  False),
+    # Scene Browser is back on by default: it now shows the live tabs +
+    # panes tree with a per-pane state summary, so it actually drives
+    # the workflow (click a pane → Display targets only that pane).
+    ("pipeline",    "Scene Browser",    "left",  True),
     ("properties",  "Properties",       "left",  True),
     ("information", "Information",      "left",  True),
     ("appearance",  "Appearance",       "left",  True),
@@ -196,11 +197,23 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             dock.setVisible(visible)
         self._apply_default_dock_grouping()
 
-        # Pipeline browser drives the active properties tab — bridge wires it.
+        # Scene Browser drives the Display "Apply to" target — bind it to
+        # the live multi-view and hook the selection signal.
         pipeline = self._docks.get("pipeline")
         if pipeline is not None:
             try:
+                pipeline.browser.set_multi_view(self.multi_view)
+            except Exception:
+                pass
+            try:
                 pipeline.browser.activeNodeChanged.connect(self._on_pipeline_node_changed)
+            except Exception:
+                pass
+            # Rebuild the tree whenever the tab / pane structure changes.
+            try:
+                tabs = getattr(self.multi_view, "_tabs", None)
+                if tabs is not None:
+                    tabs.currentChanged.connect(lambda *_: pipeline.refresh("full"))
             except Exception:
                 pass
 
@@ -353,29 +366,88 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Pipeline ↔ Properties bridge ────────────────────────────────────────
 
     def _on_pipeline_node_changed(self, node_key: str) -> None:
-        """Focus the matching Properties tab when the pipeline selection changes."""
+        """Route a Scene-Browser selection out to the rest of the viewer.
+
+        The key encodes what was clicked:
+
+        * ``"root"`` — Active Views top-level → Display target = "All panes".
+        * ``"tab:<i>"`` — a tab → Display target = "Current tab".  Also
+          switches the multi-view to that tab.
+        * ``"pane:<tab>/<pane>"`` — a pane → Display target = "Active
+          pane".  Activates the pane so the toolbar / status bar follow.
+        * Auxiliary keys (stations, selection, gf, geographic) → focus
+          the matching Properties tab.
+        """
+        # ── Properties tab routing (auxiliary nodes) ────────────────────────
         props = self._docks.get("properties")
-        if props is None or not hasattr(props, "focus_tab"):
-            return
-        # Map pipeline node keys → properties tab names.  Warp is no
-        # longer a tab here (moved to its own dock on the right), so
-        # GF → Visibility as the closest meaningful target.
-        tab_for_node = {
-            NODE_ROOT:       "Node",
-            NODE_STATIONS:   "Node",        # stations table lives inside the Node tab
+        auxiliary_for_node = {
+            NODE_STATIONS:   "Node",
             NODE_SELECTION:  "Node",
             NODE_GF:         "Visibility",
             NODE_GEOGRAPHIC: "Geographic",
         }
-        target = tab_for_node.get(node_key)
-        if target is not None:
+        if node_key in auxiliary_for_node and props is not None and hasattr(props, "focus_tab"):
             try:
-                props.focus_tab(target)
+                props.focus_tab(auxiliary_for_node[node_key])
                 if not props.isVisible():
                     props.setVisible(True)
                     props.raise_()
             except Exception:
                 pass
+            return
+
+        # ── Display "Apply to" target routing ───────────────────────────────
+        if node_key == NODE_ROOT:
+            self._set_display_apply_target("all")
+            return
+
+        if node_key.startswith(f"{NODE_TAB}:"):
+            try:
+                tab_idx = int(node_key.split(":", 1)[1])
+            except ValueError:
+                return
+            tabs = getattr(self.multi_view, "_tabs", None)
+            if tabs is not None and 0 <= tab_idx < tabs.count():
+                tabs.setCurrentIndex(tab_idx)
+            self._set_display_apply_target("tab")
+            return
+
+        if node_key.startswith(f"{NODE_PANE}:"):
+            try:
+                tab_idx, pane_idx = (int(x) for x in node_key.split(":", 1)[1].split("/"))
+            except ValueError:
+                return
+            tabs = getattr(self.multi_view, "_tabs", None)
+            if tabs is not None and 0 <= tab_idx < tabs.count():
+                tabs.setCurrentIndex(tab_idx)
+                area = tabs.widget(tab_idx)
+                panes = list(getattr(area, "_panes", []) or [])
+                if 0 <= pane_idx < len(panes):
+                    try:
+                        area._set_active_pane(panes[pane_idx])
+                    except Exception:
+                        pass
+            self._set_display_apply_target("pane")
+
+    def _set_display_apply_target(self, target: str) -> None:
+        """Flip the Display dock's "Apply to" combo without firing the user
+        signal so the combo is just visually moved (no spurious refresh).
+        """
+        display_dock = self._docks.get("display")
+        page = self._side_pages.get("display")
+        if page is None or not hasattr(page, "apply_target_combo"):
+            return
+        combo = page.apply_target_combo
+        index = combo.findData(target)
+        if index < 0:
+            return
+        block = combo.blockSignals(True)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(block)
+        # Raise Display so the user sees the routing change.
+        if display_dock is not None and not display_dock.isVisible():
+            display_dock.setVisible(True)
+            display_dock.raise_()
 
     # ── Menu bar ────────────────────────────────────────────────────────────
 
@@ -585,7 +657,9 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         """Refresh every visible side-panel page with *reason*.
 
         Hidden / collapsed docks are skipped, and lazy pages re-materialise
-        themselves only when the user actually shows them.
+        themselves only when the user actually shows them.  The Scene
+        Browser additionally re-reads the live tabs / panes structure so
+        its per-pane state summary stays current.
         """
         for key, page in self._side_pages.items():
             dock = self._docks.get(key)
@@ -597,6 +671,15 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                         page.refresh(reason)
                 elif hasattr(page, "refresh"):
                     page.refresh(reason)
+            except Exception:
+                pass
+        # Keep the Scene Browser in sync — it has its own refresh on the
+        # dock (PipelineBrowserDock.refresh) but its content lives one
+        # layer deeper than _side_pages, so trigger explicitly.
+        pipeline_dock = self._docks.get("pipeline")
+        if pipeline_dock is not None and pipeline_dock.isVisible():
+            try:
+                pipeline_dock.refresh(reason)
             except Exception:
                 pass
 

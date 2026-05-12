@@ -1,31 +1,33 @@
-"""ParaView-style pipeline browser for the viewer.
+"""Live "Scene Browser" tree — tabs, panes and auxiliary scene nodes.
 
-Today the viewer manages a single :class:`~ShakerMakerResults.ShakerMakerData`
-model per window.  The pipeline browser surfaces the *structure* of that
-model the same way ParaView surfaces sources / filters in its Pipeline
-Browser dock:
+The browser is a thin reflection of what the central
+:class:`~.multi_view.TabbedMultiViewArea` currently holds:
 
-    builtin:
-      ◉ <project name>                   (root source — the loaded .h5drm)
-         ├─ 📍 Stations  (n)             ← editable in Properties → Stations
-         ├─ ◎ Selected Nodes (n)         ← multi-selection set
-         ├─ ⚡ GF database  (✓ / —)      ← informational, drives demand=gf
-         └─ 🧭 Geographic transform      ← UTM + transform matrix
+    ▾ Active Views
+       ▾ Main view             ← tab
+          • 3D NE   accel/resultant · viridis · range
+          • Top     vel/z · seismic · range
+       ▸ View 2                 ← tab
+    Stations (n)
+    Selected Nodes (n)
+    Green Functions
+    Geographic
 
-Selecting a tree item activates the matching tab in the right-hand
-*Properties* dock so the user can edit the relevant settings without
-hunting around.  No data-loading code is touched — this widget is purely
-a navigation surface over the existing :class:`ViewerSession` state.
+Selecting any node emits :pyattr:`activeNodeChanged` with a string
+identifier the window uses to flip the Display dock's "Apply to" combo
+between **Active pane**, **Current tab** and **All panes**.  That way
+the user can right-click → ``Apply``  on a single pane without leaving
+the tree.
 
-The pipeline node identifiers are stable strings (``"root"``, ``"stations"``,
-``"selection"``, ``"gf"``, ``"geographic"``) and travel through Qt's
-``Qt::UserRole`` data slot.  They're forwarded to subscribers (the
-properties dock, etc.) via the ``activeNodeChanged`` signal.
+The widget never holds references to live ViewPanes — it stores their
+``id(pane)`` only and asks the multi-view to resolve them at click time.
+This keeps the browser cheap to rebuild and immune to dangling pointer
+issues when the user closes a tab or pane.
 """
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Optional
 
 from ._imports import require_viewer_dependencies
 from .theme import active_palette
@@ -33,47 +35,41 @@ from .theme import active_palette
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
 
 
-# ── Node identifiers used as Qt::UserRole payload ────────────────────────────
-
-#: Strings that travel as the tree-item ``UserRole`` data.  These are the
-#: stable contract between :class:`PipelineBrowserDock` and any subscriber.
+# ── Stable node identifiers ──────────────────────────────────────────────────
+#: Sent through ``activeNodeChanged`` so the window can route the selection.
 NODE_ROOT       = "root"
+NODE_TAB        = "tab"            # qualified at runtime: "tab:<index>"
+NODE_PANE       = "pane"           # qualified at runtime: "pane:<tab>/<index>"
 NODE_STATIONS   = "stations"
 NODE_SELECTION  = "selection"
 NODE_GF         = "gf"
 NODE_GEOGRAPHIC = "geographic"
 
-#: Friendly default title shown for each node.  Counts are appended at runtime.
-_NODE_TITLES = {
-    NODE_ROOT:       "{name}",
-    NODE_STATIONS:   "Stations ({n})",
-    NODE_SELECTION:  "Selected Nodes ({n})",
-    NODE_GF:         "Green Functions",
-    NODE_GEOGRAPHIC: "Geographic Transform",
+
+_ROOT_LABEL  = "Active Views"
+
+
+# ── SVG marker for tab / pane / auxiliary nodes ──────────────────────────────
+
+_NODE_SVG_PATHS = {
+    NODE_ROOT:       "M5 5h14v14H5V5zm2 2v10h10V7H7z",
+    NODE_TAB:        "M3 4h18v4H3V4zm0 6h18v10H3V10z",
+    NODE_PANE:       "M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z",
+    NODE_STATIONS:   "M12 2C8 2 5 5 5 9c0 5 7 13 7 13s7-8 7-13c0-4-3-7-7-7zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z",
+    NODE_SELECTION:  "M12 2 4 7v10l8 5 8-5V7l-8-5zm0 3 5 3v8l-5 3-5-3V8l5-3z",
+    NODE_GF:         "M4 5h16v2H4V5zm0 6h16v2H4v-2zm0 6h16v2H4v-2z",
+    NODE_GEOGRAPHIC: "M12 2a10 10 0 1 0 .001 20.001A10 10 0 0 0 12 2zm-1 18a8 8 0 0 1 0-16v16zm2 0V4a8 8 0 0 1 0 16z",
 }
 
 
 def _icon_for(node_key: str, palette) -> QtGui.QIcon:
-    """Return a small monochrome SVG icon for *node_key*.
-
-    Drawing the icons inline (instead of importing :mod:`.icons`) keeps the
-    pipeline browser visually independent from the toolbar / dock chrome and
-    lets us re-tint them on theme changes without invalidating other caches.
-    """
-    palette_color = palette.accent if node_key == NODE_ROOT else palette.text_2
-    svg_paths = {
-        NODE_ROOT:       "M5 5h14v14H5V5zm2 2v10h10V7H7z",                     # filled square
-        NODE_STATIONS:   "M12 2C8 2 5 5 5 9c0 5 7 13 7 13s7-8 7-13c0-4-3-7-7-7zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z",
-        NODE_SELECTION:  "M12 2 4 7v10l8 5 8-5V7l-8-5zm0 3 5 3v8l-5 3-5-3V8l5-3z",
-        NODE_GF:          "M4 5h16v2H4V5zm0 6h16v2H4v-2zm0 6h16v2H4v-2z",        # equalizer-ish
-        NODE_GEOGRAPHIC: "M12 2a10 10 0 1 0 .001 20.001A10 10 0 0 0 12 2zm-1 18a8 8 0 0 1 0-16v16zm2 0V4a8 8 0 0 1 0 16z",
-    }
-    path = svg_paths.get(node_key)
+    color = palette.accent if node_key in (NODE_ROOT, NODE_TAB) else palette.text_2
+    path = _NODE_SVG_PATHS.get(node_key)
     if path is None:
         return QtGui.QIcon()
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" '
-        f'viewBox="0 0 24 24"><path fill="{palette_color}" d="{path}"/></svg>'
+        f'viewBox="0 0 24 24"><path fill="{color}" d="{path}"/></svg>'
     ).encode("utf-8")
     pixmap = QtGui.QPixmap(16, 16)
     pixmap.fill(QtCore.Qt.transparent)
@@ -81,15 +77,15 @@ def _icon_for(node_key: str, palette) -> QtGui.QIcon:
     return QtGui.QIcon(pixmap)
 
 
-# ── Widget ───────────────────────────────────────────────────────────────────
+# ── Tree widget ──────────────────────────────────────────────────────────────
+
 
 class PipelineBrowser(QtWidgets.QTreeWidget):
-    """Tree widget that lists the active model and its auxiliary nodes.
+    """Live tree mirroring TabbedMultiViewArea + a few auxiliary nodes.
 
-    The widget owns no data of its own; it reads the live state of the
-    :class:`ViewerSession` every time :meth:`refresh` is called and rebuilds
-    the tree in-place (the tree is tiny — a handful of nodes — so a full
-    rebuild is cheaper than a diff).
+    The window injects the multi-view via ``set_multi_view`` (so the
+    constructor only needs the session); we keep the multi-view in a
+    weak attribute and rebuild the tree on demand.
     """
 
     activeNodeChanged = QtCore.Signal(str)
@@ -97,6 +93,7 @@ class PipelineBrowser(QtWidgets.QTreeWidget):
     def __init__(self, session, parent=None):
         super().__init__(parent)
         self.session = session
+        self._multi_view = None
         self.setObjectName("PipelineBrowser")
         self.setHeaderHidden(True)
         self.setColumnCount(1)
@@ -106,109 +103,143 @@ class PipelineBrowser(QtWidgets.QTreeWidget):
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.setRootIsDecorated(True)
         self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        # Click directly emits the change so subscribers don't wait for a
-        # selectionChanged round-trip.
         self.itemSelectionChanged.connect(self._on_selection_changed)
         self.refresh()
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # ── External wiring ─────────────────────────────────────────────────────
 
-    def refresh(self) -> None:
-        """Rebuild the tree from the current :class:`ViewerSession` state."""
-        # Preserve the active node across the rebuild so it doesn't bounce
-        # back to the root every time the model's counts change.
-        previous = self.active_node_key()
+    def set_multi_view(self, multi_view) -> None:
+        """Bind to a ``TabbedMultiViewArea`` instance and rebuild."""
+        self._multi_view = multi_view
+        self.refresh()
+
+    # ── Tree (re)build ──────────────────────────────────────────────────────
+
+    def refresh(self, reason: str | None = None) -> None:
+        """Rebuild the tree from the current scene structure.
+
+        ``reason`` is accepted to match the dock-page refresh signature
+        used everywhere else; the implementation is reason-agnostic — a
+        full rebuild is cheap because the tree only has a handful of
+        nodes — except for ``"time"`` which is skipped to keep playback
+        free of widget churn.
+        """
+        if reason == "time":
+            return
+        previous_key = self.active_node_key() or NODE_ROOT
         self.blockSignals(True)
         self.clear()
         palette = active_palette()
 
-        summary = self.session.adapter.summary()
-        project_name = getattr(summary, "name", "model") or "model"
-
-        root = QtWidgets.QTreeWidgetItem([_NODE_TITLES[NODE_ROOT].format(name=project_name)])
+        root = QtWidgets.QTreeWidgetItem([_ROOT_LABEL])
         root.setData(0, QtCore.Qt.UserRole, NODE_ROOT)
         root.setIcon(0, _icon_for(NODE_ROOT, palette))
-        root.setToolTip(0, f"Source: {project_name}")
         font = root.font(0)
         font.setBold(True)
         root.setFont(0, font)
         self.addTopLevelItem(root)
 
-        stations = QtWidgets.QTreeWidgetItem(
-            [_NODE_TITLES[NODE_STATIONS].format(n=self._station_count())]
-        )
-        stations.setData(0, QtCore.Qt.UserRole, NODE_STATIONS)
-        stations.setIcon(0, _icon_for(NODE_STATIONS, palette))
-        root.addChild(stations)
+        # Tabs + panes — live structure from the multi-view.
+        self._build_tabs(root, palette)
 
-        selection = QtWidgets.QTreeWidgetItem(
-            [_NODE_TITLES[NODE_SELECTION].format(n=self._selection_count())]
-        )
-        selection.setData(0, QtCore.Qt.UserRole, NODE_SELECTION)
-        selection.setIcon(0, _icon_for(NODE_SELECTION, palette))
-        root.addChild(selection)
-
-        gf_status = "loaded" if self._has_gf() else "—"
-        gf_title = f"{_NODE_TITLES[NODE_GF]}  ({gf_status})"
-        gf = QtWidgets.QTreeWidgetItem([gf_title])
-        gf.setData(0, QtCore.Qt.UserRole, NODE_GF)
-        gf.setIcon(0, _icon_for(NODE_GF, palette))
-        if not self._has_gf():
-            gf.setForeground(0, QtGui.QBrush(QtGui.QColor(palette.text_muted)))
-        root.addChild(gf)
-
-        geo = QtWidgets.QTreeWidgetItem([_NODE_TITLES[NODE_GEOGRAPHIC]])
-        geo.setData(0, QtCore.Qt.UserRole, NODE_GEOGRAPHIC)
-        geo.setIcon(0, _icon_for(NODE_GEOGRAPHIC, palette))
-        root.addChild(geo)
+        # Auxiliary nodes (Stations, Selection set, GF, Geographic).
+        self._build_auxiliary(palette)
 
         self.expandAll()
 
-        # Restore selection (or default to root on first build).
-        target = previous or NODE_ROOT
-        self._select_node_key(target)
+        # Restore selection if the previously selected node still exists.
+        self._select_node_key(previous_key)
+
         self.blockSignals(False)
-        # Always fire so listeners can sync on initial build too.
         self._on_selection_changed()
 
-    def active_node_key(self) -> str | None:
+    def _build_tabs(self, root: QtWidgets.QTreeWidgetItem, palette) -> None:
+        tabs = self._tabs_widget()
+        if tabs is None:
+            return
+        for tab_index in range(tabs.count()):
+            area = tabs.widget(tab_index)
+            tab_label = tabs.tabText(tab_index) or f"View {tab_index + 1}"
+            tab_item = QtWidgets.QTreeWidgetItem([tab_label])
+            tab_item.setData(0, QtCore.Qt.UserRole, f"{NODE_TAB}:{tab_index}")
+            tab_item.setIcon(0, _icon_for(NODE_TAB, palette))
+            root.addChild(tab_item)
+
+            panes = list(getattr(area, "_panes", []) or [])
+            for pane_index, pane in enumerate(panes):
+                pane_label = self._pane_label(pane, pane_index)
+                pane_item = QtWidgets.QTreeWidgetItem([pane_label])
+                pane_item.setData(
+                    0, QtCore.Qt.UserRole,
+                    f"{NODE_PANE}:{tab_index}/{pane_index}",
+                )
+                pane_item.setIcon(0, _icon_for(NODE_PANE, palette))
+                # Tint pane rows that carry one or more per-pane overrides so
+                # the user can scan the tree to spot "weird" panes at a
+                # glance.
+                pane_state = getattr(pane, "pane_state", None)
+                if pane_state is not None and pane_state.overridden_names():
+                    pane_item.setForeground(0, QtGui.QBrush(QtGui.QColor(palette.accent_dark)))
+                tab_item.addChild(pane_item)
+
+    def _build_auxiliary(self, palette) -> None:
+        # Auxiliary nodes live at the same top level as Active Views.
+        stations = QtWidgets.QTreeWidgetItem([f"Stations ({self._station_count()})"])
+        stations.setData(0, QtCore.Qt.UserRole, NODE_STATIONS)
+        stations.setIcon(0, _icon_for(NODE_STATIONS, palette))
+        self.addTopLevelItem(stations)
+
+        selection = QtWidgets.QTreeWidgetItem(
+            [f"Selected Nodes ({self._selection_count()})"]
+        )
+        selection.setData(0, QtCore.Qt.UserRole, NODE_SELECTION)
+        selection.setIcon(0, _icon_for(NODE_SELECTION, palette))
+        self.addTopLevelItem(selection)
+
+        gf_status = "loaded" if self._has_gf() else "—"
+        gf_item = QtWidgets.QTreeWidgetItem([f"Green Functions  ({gf_status})"])
+        gf_item.setData(0, QtCore.Qt.UserRole, NODE_GF)
+        gf_item.setIcon(0, _icon_for(NODE_GF, palette))
+        if not self._has_gf():
+            gf_item.setForeground(0, QtGui.QBrush(QtGui.QColor(palette.text_muted)))
+        self.addTopLevelItem(gf_item)
+
+        geo_item = QtWidgets.QTreeWidgetItem(["Geographic Transform"])
+        geo_item.setData(0, QtCore.Qt.UserRole, NODE_GEOGRAPHIC)
+        geo_item.setIcon(0, _icon_for(NODE_GEOGRAPHIC, palette))
+        self.addTopLevelItem(geo_item)
+
+    # ── Labels ──────────────────────────────────────────────────────────────
+
+    def _pane_label(self, pane, index: int) -> str:
+        """One-line summary used as the visible tree label for a pane."""
+        label = getattr(pane, "label", None) or f"Pane {index + 1}"
+        state = getattr(pane, "pane_state", None)
+        if state is None:
+            return str(label)
+        try:
+            demand = state.demand
+            component = state.component
+            cmap = state.colormap or "—"
+            warp = "warp on" if state.disp_warp_enabled else "warp off"
+            return f"{label}    {demand}/{component} · {cmap} · {warp}"
+        except Exception:
+            return str(label)
+
+    # ── Accessors ───────────────────────────────────────────────────────────
+
+    def active_node_key(self) -> Optional[str]:
         items = self.selectedItems()
         if not items:
             return None
         return items[0].data(0, QtCore.Qt.UserRole)
-
-    def select_node(self, key: str) -> None:
-        self._select_node_key(key)
-
-    # ── Internals ───────────────────────────────────────────────────────────
-
-    def _station_count(self) -> int:
-        try:
-            tags = self.session.current_station_tags()
-            return int(len(tags))
-        except Exception:
-            return 0
-
-    def _selection_count(self) -> int:
-        try:
-            multi = getattr(self.session.state, "multi_selection", None)
-            return int(len(multi or ()))
-        except Exception:
-            return 0
-
-    def _has_gf(self) -> bool:
-        try:
-            adapter = self.session.adapter
-            return bool(getattr(adapter, "has_gf", False) and getattr(adapter, "has_map", False))
-        except Exception:
-            return False
 
     def _select_node_key(self, key: str) -> None:
         for index in range(self.topLevelItemCount()):
             root = self.topLevelItem(index)
             if self._select_in_subtree(root, key):
                 return
-        # Fall back to root if the requested node is not found.
+        # Fall back to top-most item (Active Views).
         if self.topLevelItemCount():
             self.topLevelItem(0).setSelected(True)
 
@@ -222,6 +253,32 @@ class PipelineBrowser(QtWidgets.QTreeWidget):
                 return True
         return False
 
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _tabs_widget(self):
+        multi = self._multi_view
+        if multi is None:
+            return None
+        return getattr(multi, "_tabs", None)
+
+    def _station_count(self) -> int:
+        try:
+            return int(len(self.session.current_station_tags()))
+        except Exception:
+            return 0
+
+    def _selection_count(self) -> int:
+        try:
+            return int(len(getattr(self.session.state, "multi_selection", ()) or ()))
+        except Exception:
+            return 0
+
+    def _has_gf(self) -> bool:
+        adapter = getattr(self.session, "adapter", None)
+        return bool(
+            getattr(adapter, "has_gf", False) and getattr(adapter, "has_map", False)
+        )
+
     def _on_selection_changed(self) -> None:
         key = self.active_node_key()
         if key is not None:
@@ -229,6 +286,7 @@ class PipelineBrowser(QtWidgets.QTreeWidget):
 
 
 # ── Dock wrapper ─────────────────────────────────────────────────────────────
+
 
 class PipelineBrowserDock(QtWidgets.QDockWidget):
     """:class:`QDockWidget` shell around :class:`PipelineBrowser`.
@@ -249,19 +307,15 @@ class PipelineBrowserDock(QtWidgets.QDockWidget):
         self.setWidget(self.browser)
 
     def refresh(self, reason: str = "full") -> None:
-        """Match the refresh signature used by every other dock page."""
-        # Anything that could change a count or status (selection, stations,
-        # gf loaded) refreshes the tree.  ``time`` is the high-frequency
-        # update path during playback — skip it.
-        if reason == "time":
-            return
-        self.browser.refresh()
+        self.browser.refresh(reason)
 
 
 __all__ = [
     "PipelineBrowser",
     "PipelineBrowserDock",
     "NODE_ROOT",
+    "NODE_TAB",
+    "NODE_PANE",
     "NODE_STATIONS",
     "NODE_SELECTION",
     "NODE_GF",
