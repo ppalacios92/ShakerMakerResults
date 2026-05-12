@@ -901,7 +901,13 @@ class ViewerScene:
             else:
                 scalar_bar_args.update({"width": 0.08, "height": 0.56})
             if self.session.state.legend_show_background:
-                scalar_bar_args["background_color"] = "#ffffff"
+                # Use a colour that contrasts with the renderer background
+                # without being pure white in dark mode (which used to leave
+                # a glaring white box around the colormap).  Light bg → off
+                # white panel surface; dark bg → palette surface so the bar
+                # sits a touch lighter than the scene.
+                from .theme import active_palette
+                scalar_bar_args["background_color"] = active_palette().surface
             kwargs["scalar_bar_args"] = scalar_bar_args
         actor = self.plotter.add_points(self.point_cloud, **kwargs)
         self._point_actor_rgb = rgb_scalars
@@ -1017,10 +1023,11 @@ class ViewerScene:
             bg_name = getattr(self.session.state, "background", "White")
             rgb = _hex_to_rgb(BACKGROUND_PRESETS.get(bg_name, "#ffffff"))
 
-        # Rec. 709 luminance.
+        # Rec. 709 luminance.  Dark renderer background → bone-tinted text
+        # to match the "hueso" theme; light background → near-black text.
         luminance = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
         if luminance < 0.45:
-            return "#9aa4b1" if secondary else "#e7ebf2"
+            return "#aea495" if secondary else "#e8dfca"   # dim bone / bone
         return "#555555" if secondary else "#172033"
 
 
