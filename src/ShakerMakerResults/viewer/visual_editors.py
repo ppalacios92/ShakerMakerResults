@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ._imports import require_viewer_dependencies
+from .cmap_preview import ColormapPreview
 from .colors import COLORMAP_OPTIONS
 from .icons import icon
 from .theme import LIGHT_PALETTE
@@ -104,9 +105,12 @@ class TransferFunctionDialog(QtWidgets.QDialog):
         preview_box = QtWidgets.QGroupBox("Preview")
         preview_layout = QtWidgets.QVBoxLayout(preview_box)
         preview_layout.setContentsMargins(8, 8, 8, 8)
-        self.preview = QtWidgets.QLabel()
-        self.preview.setMinimumHeight(34)
-        self.preview.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        # Live colormap strip with arrow markers.  Same widget the side
+        # panel uses, just taller and with the marker count driven by the
+        # "Bins" spinbox so the user sees the ramp segmentation update in
+        # real time as they tweak Discretize / Bins / Invert.
+        self.preview = ColormapPreview(self.session.current_colormap())
+        self.preview.setMinimumHeight(44)
         preview_layout.addWidget(self.preview)
         root.addWidget(preview_box)
 
@@ -127,11 +131,13 @@ class TransferFunctionDialog(QtWidgets.QDialog):
 
         self.discrete_cb = QtWidgets.QCheckBox("Discretize colors")
         self.discrete_cb.setChecked(bool(self.session.state.colormap_discrete))
+        self.discrete_cb.toggled.connect(self._refresh_preview)
 
         self.bin_spin = QtWidgets.QSpinBox()
         self.bin_spin.setRange(3, 64)
         self.bin_spin.setValue(int(self.session.state.colormap_bins))
         self.bin_spin.setEnabled(self.discrete_cb.isChecked())
+        self.bin_spin.valueChanged.connect(self._refresh_preview)
         self.discrete_cb.toggled.connect(self.bin_spin.setEnabled)
 
         self.nan_btn = _ColorButton(self.session.state.nan_color)
@@ -212,40 +218,36 @@ class TransferFunctionDialog(QtWidgets.QDialog):
         )
 
     def _refresh_preview(self):
+        """Push the current dialog state into the live ColormapPreview.
+
+        The preview reflects three things:
+
+        * the selected colormap name (with the ``_r`` suffix toggled on
+          when "Invert ramp" is checked);
+        * the marker count — N triangles = ``bins`` when Discretize is on,
+          otherwise a fixed 5 markers as a visual reference;
+        * (implicitly) the discretize state — the marker grid hints at the
+          discrete-bin segmentation the actual scene will render.
+
+        Drag-to-edit-individual-stops is queued for a follow-up; this
+        commit focuses on showing a live, correct preview that responds
+        to every change in the dialog without the old QGradient stop
+        warnings (which came from the previous CSS-percent gradient).
+        """
         cmap = str(self.cmap_combo.currentText() or "viridis")
         if self.invert_cb.isChecked() and not cmap.endswith("_r"):
             cmap = f"{cmap}_r"
         elif not self.invert_cb.isChecked() and cmap.endswith("_r"):
             cmap = cmap[:-2]
-        stops = []
         try:
-            import matplotlib.pyplot as plt
-
-            cm = plt.get_cmap(cmap)
-            for idx in range(10):
-                r, g, b, _ = cm(idx / 9.0)
-                stops.append(
-                    (
-                        idx * 11.111,
-                        int(r * 255),
-                        int(g * 255),
-                        int(b * 255),
-                    )
-                )
+            self.preview.setColormap(cmap)
         except Exception:
-            stops = [
-                (0, 43, 88, 118),
-                (50, 78, 121, 167),
-                (100, 234, 169, 52),
-            ]
-        chunks = [f"stop:{pos:.1f}% rgb({r},{g},{b})" for pos, r, g, b in stops]
-        self.preview.setStyleSheet(
-            "QLabel {"
-            f" background: qlineargradient(x1:0, y1:0, x2:1, y2:0, {', '.join(chunks)});"
-            " border: 1px solid #b9c3d0;"
-            " border-radius: 5px;"
-            "}"
-        )
+            pass
+        try:
+            count = int(self.bin_spin.value()) if self.discrete_cb.isChecked() else 5
+            self.preview.setMarkerCount(max(2, count))
+        except Exception:
+            pass
 
 
 class LegendEditorDialog(QtWidgets.QDialog):

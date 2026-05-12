@@ -23,12 +23,15 @@ from .colors import colormap_strip_bytes
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
 
 
-# Geometry constants — small enough that several previews stack nicely
-# inside a form layout row.
-_STRIP_HEIGHT = 16
+# Geometry constants — the *default* compact size used by the form-row
+# previews on the side-panel sections.  Larger consumers (e.g. the
+# TransferFunctionDialog) can bump ``setMinimumHeight`` on the instance
+# and the strip automatically uses the extra vertical space; the marker
+# row stays fixed at the bottom of the widget.
+_DEFAULT_STRIP_HEIGHT = 16
 _MARKER_HEIGHT = 6
 _PADDING_X = 2
-_TOTAL_HEIGHT = _STRIP_HEIGHT + _MARKER_HEIGHT + 4
+_DEFAULT_TOTAL_HEIGHT = _DEFAULT_STRIP_HEIGHT + _MARKER_HEIGHT + 4
 
 
 class ColormapPreview(QtWidgets.QWidget):
@@ -44,11 +47,16 @@ class ColormapPreview(QtWidgets.QWidget):
     def __init__(self, name: str = "viridis", parent=None):
         super().__init__(parent)
         self.setObjectName("CmapPreview")
-        self.setMinimumHeight(_TOTAL_HEIGHT)
-        self.setMaximumHeight(_TOTAL_HEIGHT + 2)
+        # Default to the compact size used by the side-panel form rows.
+        # Consumers that want a taller preview (e.g. the color-mapping
+        # dialog) just call ``setMinimumHeight(...)`` on the instance and
+        # the strip auto-grows; the marker row stays anchored at the
+        # bottom.  Maximum height is intentionally unbounded so a
+        # ``QVBoxLayout.addWidget(..., 1)`` can stretch the widget too.
+        self.setMinimumHeight(_DEFAULT_TOTAL_HEIGHT)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.MinimumExpanding,
-            QtWidgets.QSizePolicy.Fixed,
+            QtWidgets.QSizePolicy.Preferred,
         )
         self.setCursor(QtCore.Qt.PointingHandCursor)
 
@@ -111,24 +119,29 @@ class ColormapPreview(QtWidgets.QWidget):
         )
 
     def _strip_rect(self) -> QtCore.QRect:
+        # Reserve the bottom band for marker triangles; the gradient strip
+        # fills everything above.  This keeps the markers anchored at the
+        # bottom edge regardless of how tall the widget is laid out.
+        reserved_below = _MARKER_HEIGHT + 4
+        strip_h = max(self.height() - reserved_below - 2, 12)
         return QtCore.QRect(
             _PADDING_X,
             1,
             max(self.width() - 2 * _PADDING_X, 1),
-            _STRIP_HEIGHT,
+            strip_h,
         )
 
     def _paint_strip(self, painter: QtGui.QPainter) -> None:
         rect = self._strip_rect()
+        strip_w = max(rect.width(), 2)
+        strip_h = max(rect.height(), 2)
         try:
-            raw = colormap_strip_bytes(self._cmap, max(rect.width(), 2), _STRIP_HEIGHT)
+            raw = colormap_strip_bytes(self._cmap, strip_w, strip_h)
         except Exception:
             # Fallback: neutral gray when matplotlib cannot resolve the cmap.
             painter.fillRect(rect, QtGui.QColor("#808080"))
             return
-        image = QtGui.QImage(
-            raw, max(rect.width(), 2), _STRIP_HEIGHT, QtGui.QImage.Format_RGBA8888
-        )
+        image = QtGui.QImage(raw, strip_w, strip_h, QtGui.QImage.Format_RGBA8888)
         painter.drawImage(rect, image)
         # Thin border so the strip reads as a single tile against dark
         # and light themes alike.
