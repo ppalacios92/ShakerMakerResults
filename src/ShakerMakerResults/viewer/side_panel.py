@@ -514,6 +514,430 @@ class NodeSearchSection(_SectionBase):
             self.station_table.blockSignals(old)
 
 
+# ── Vector Field section ─────────────────────────────────────────────────────
+
+class VectorFieldSection(_SectionBase):
+    """Stand-alone editor for the arrow-glyph vector field overlay.
+
+    Used to be a sub-group inside :class:`DisplaySection`; now lives in its
+    own dock so the user does not confuse the vector overlay's color ramp /
+    apply with the main field's color ramp / apply.  Backend is unchanged —
+    every Apply goes through :meth:`ViewerSession.apply_vector_field_settings`.
+    """
+
+    _REFRESH_REASONS = frozenset({"init", "full", "vector_field"})
+    _VECTOR_DEMANDS = [
+        ("disp",  "Displacement"),
+        ("vel",   "Velocity"),
+        ("accel", "Acceleration"),
+    ]
+
+    def __init__(self, session, parent=None):
+        super().__init__(session, parent)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(8)
+
+        box = QtWidgets.QGroupBox("Vector Field")
+        form = QtWidgets.QFormLayout(box)
+        form.setContentsMargins(6, 4, 6, 6)
+
+        self.enabled_cb = QtWidgets.QCheckBox("Show arrow glyphs")
+        self.enabled_cb.toggled.connect(lambda *_: self._set_dirty())
+        form.addRow("", self.enabled_cb)
+
+        self.demand_combo = QtWidgets.QComboBox()
+        for val, lbl in self._VECTOR_DEMANDS:
+            self.demand_combo.addItem(lbl, val)
+        self.demand_combo.currentIndexChanged.connect(lambda *_: self._set_dirty())
+        form.addRow("Field", self.demand_combo)
+
+        self.cmap_combo = QtWidgets.QComboBox()
+        for cmap in COLORMAP_OPTIONS:
+            self.cmap_combo.addItem(cmap, cmap)
+        self.cmap_combo.currentTextChanged.connect(lambda *_: self._set_dirty())
+        self.cmap_preview = ColormapPreview(self.cmap_combo.currentText())
+        self.cmap_combo.currentTextChanged.connect(self.cmap_preview.setColormap)
+        form.addRow("Color ramp", _stack(self.cmap_combo, self.cmap_preview))
+
+        self.scale_spin = QtWidgets.QDoubleSpinBox()
+        self.scale_spin.setRange(0.01, 100.0)
+        self.scale_spin.setValue(1.0)
+        self.scale_spin.setSingleStep(0.25)
+        self.scale_spin.setDecimals(2)
+        self.scale_spin.setSuffix("×")
+        self.scale_spin.valueChanged.connect(lambda *_: self._set_dirty())
+        form.addRow("Scale", self.scale_spin)
+
+        outer.addWidget(box)
+        outer.addWidget(
+            self._make_apply_button(self._apply, "Ladruno computing vectors…")
+        )
+        outer.addStretch(1)
+        self.refresh("init")
+
+    # ── Refresh ────────────────────────────────────────────────────────────
+
+    def refresh(self, reason: str = "full") -> None:
+        if reason not in self._REFRESH_REASONS and self._dirty:
+            return
+        self._syncing = True
+        try:
+            block = self.enabled_cb.blockSignals(True)
+            self.enabled_cb.setChecked(bool(self.session.state.vector_field_enabled))
+            self.enabled_cb.blockSignals(block)
+
+            self._set_combo_data(self.demand_combo, self.session.state.vector_field_demand)
+            self._set_combo(self.cmap_combo, self.session.state.vector_field_colormap)
+            self.cmap_preview.setColormap(self.cmap_combo.currentText())
+
+            block = self.scale_spin.blockSignals(True)
+            self.scale_spin.setValue(float(self.session.state.vector_field_scale))
+            self.scale_spin.blockSignals(block)
+            self._clear_dirty()
+        finally:
+            self._syncing = False
+
+    # ── Apply ──────────────────────────────────────────────────────────────
+
+    def _apply(self):
+        if self._syncing:
+            return
+        self.session.apply_vector_field_settings(
+            enabled=self.enabled_cb.isChecked(),
+            demand=str(self.demand_combo.currentData()),
+            scale=self.scale_spin.value(),
+            colormap=str(self.cmap_combo.currentData() or "viridis"),
+        )
+        self._clear_dirty()
+
+
+# ── Static Color (Color By) section ──────────────────────────────────────────
+
+class StaticColorSection(_SectionBase):
+    """Stand-alone editor for the static colour-by overlay.
+
+    Pulled out of :class:`DisplaySection` so the dense Newmark / Arias
+    parameter list does not crowd the Field + Color Map editor.  All
+    state still lives in :class:`ViewerSession`; every Apply routes
+    through :meth:`ViewerSession.apply_static_color_settings`.
+    """
+
+    _REFRESH_REASONS = frozenset({
+        "init", "full", "static_color", "playback",
+    })
+    _STATIC_COLOR_LABELS = {
+        "elevation_z": "Elevation Z",
+        "newmark_sa": "Sa / Newmark",
+        "arias": "Arias",
+    }
+
+    def __init__(self, session, parent=None):
+        super().__init__(session, parent)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(8)
+
+        box = QtWidgets.QGroupBox("Color By")
+        form = QtWidgets.QFormLayout(box)
+        form.setContentsMargins(6, 4, 6, 6)
+
+        self.source_combo = QtWidgets.QComboBox()
+        self.source_combo.addItem("Default", None)
+        for color_by_value in VALID_STATIC_COLOR_BY:
+            self.source_combo.addItem(
+                self._STATIC_COLOR_LABELS.get(color_by_value, color_by_value),
+                color_by_value,
+            )
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+
+        self.cmap_combo = QtWidgets.QComboBox()
+        for cmap in COLORMAP_OPTIONS:
+            self.cmap_combo.addItem(cmap, cmap)
+        self.cmap_combo.currentTextChanged.connect(lambda *_: self._set_dirty())
+        self.cmap_preview = ColormapPreview(self.cmap_combo.currentText())
+        self.cmap_combo.currentTextChanged.connect(self.cmap_preview.setColormap)
+
+        self.auto_lbl = QtWidgets.QLabel("-")
+        self.vmin_spin = self._value_spin()
+        self.vmax_spin = self._value_spin()
+        self.vmin_spin.valueChanged.connect(lambda *_: self._set_dirty())
+        self.vmax_spin.valueChanged.connect(lambda *_: self._set_dirty())
+
+        self.clamp_cb = QtWidgets.QCheckBox("Clamp to range")
+        self.clamp_cb.toggled.connect(lambda *_: self._set_dirty())
+
+        self.reset_btn = QtWidgets.QPushButton("Reset to auto")
+        self.reset_btn.clicked.connect(self._reset_range)
+        self.transfer_btn = QtWidgets.QPushButton("Advanced color editor")
+        self.transfer_btn.clicked.connect(self._open_transfer_editor)
+        self.legend_btn = QtWidgets.QPushButton("Legend settings")
+        self.legend_btn.clicked.connect(self._open_legend_editor)
+
+        # Newmark parameters.
+        self.newmark_T_spin = QtWidgets.QDoubleSpinBox()
+        self.newmark_T_spin.setDecimals(3)
+        self.newmark_T_spin.setRange(0.0, 20.0)
+        self.newmark_T_spin.setSingleStep(0.05)
+        self.newmark_T_spin.setValue(0.0)
+        self.newmark_T_spin.valueChanged.connect(lambda *_: self._set_dirty())
+
+        self.newmark_component_combo = QtWidgets.QComboBox()
+        for component in ("resultant", "z", "e", "n"):
+            self.newmark_component_combo.addItem(component, component)
+        self.newmark_component_combo.currentIndexChanged.connect(lambda *_: self._set_dirty())
+
+        self.newmark_data_combo = QtWidgets.QComboBox()
+        for demand in ("accel", "vel", "disp"):
+            self.newmark_data_combo.addItem(demand, demand)
+        self.newmark_data_combo.currentIndexChanged.connect(lambda *_: self._set_dirty())
+
+        self.newmark_spectral_combo = QtWidgets.QComboBox()
+        for spectral_type in ("PSa", "Sa", "PSv", "Sv", "Sd"):
+            self.newmark_spectral_combo.addItem(spectral_type, spectral_type)
+        self.newmark_spectral_combo.currentIndexChanged.connect(lambda *_: self._set_dirty())
+
+        self.newmark_factor_spin = self._value_spin()
+        self.newmark_factor_spin.setValue(1.0 / 9.81)
+        self.newmark_factor_spin.valueChanged.connect(lambda *_: self._set_dirty())
+
+        self.newmark_jobs_spin = QtWidgets.QSpinBox()
+        self.newmark_jobs_spin.setRange(-32, 128)
+        self.newmark_jobs_spin.setValue(-2)
+        self.newmark_jobs_spin.setToolTip("-1 uses all CPUs; -2 uses all minus one.")
+        self.newmark_jobs_spin.valueChanged.connect(lambda *_: self._set_dirty())
+
+        # Wave blend (only meaningful for Elevation Z).
+        self.wave_blend_cb = QtWidgets.QCheckBox("Blend wave propagation")
+        self.wave_blend_cb.setToolTip(
+            "During playback the wave field shifts the elevation colour.\n"
+            "Disable it for pure topography during the animation."
+        )
+        self.wave_blend_cb.toggled.connect(lambda *_: self._set_dirty())
+
+        self.wave_blend_strength_spin = QtWidgets.QDoubleSpinBox()
+        self.wave_blend_strength_spin.setRange(0.0, 1.0)
+        self.wave_blend_strength_spin.setSingleStep(0.05)
+        self.wave_blend_strength_spin.setDecimals(2)
+        self.wave_blend_strength_spin.setValue(0.5)
+        self.wave_blend_strength_spin.setToolTip(
+            "How strongly the wave shifts the elevation colour.\n"
+            "0.00 = pure topography  ·  1.00 = full elevation range."
+        )
+        self.wave_blend_strength_spin.valueChanged.connect(lambda *_: self._set_dirty())
+        self.wave_blend_cb.toggled.connect(
+            lambda checked: self.wave_blend_strength_spin.setEnabled(checked)
+        )
+
+        self.apply_button = QtWidgets.QPushButton("Apply")
+        self.apply_button.setEnabled(False)
+        self.apply_button.clicked.connect(self._apply_with_busy)
+
+        form.addRow("Source", self.source_combo)
+        form.addRow("Color ramp", _stack(self.cmap_combo, self.cmap_preview))
+        form.addRow("Auto range", self.auto_lbl)
+        form.addRow("User min", self.vmin_spin)
+        form.addRow("User max", self.vmax_spin)
+        form.addRow("", self.clamp_cb)
+        form.addRow("", self.reset_btn)
+        form.addRow("", self.transfer_btn)
+        form.addRow("", self.legend_btn)
+        form.addRow("T target", self.newmark_T_spin)
+        form.addRow("Component", self.newmark_component_combo)
+        form.addRow("Data", self.newmark_data_combo)
+        form.addRow("Sa type", self.newmark_spectral_combo)
+        form.addRow("Factor", self.newmark_factor_spin)
+        form.addRow("Jobs", self.newmark_jobs_spin)
+        form.addRow("", self.wave_blend_cb)
+        form.addRow("Blend strength", self.wave_blend_strength_spin)
+        form.addRow("", self.apply_button)
+
+        outer.addWidget(box)
+        outer.addStretch(1)
+        self.refresh("init")
+
+    # ── Refresh ────────────────────────────────────────────────────────────
+
+    def refresh(self, reason: str = "full") -> None:
+        if reason not in self._REFRESH_REASONS and self._dirty:
+            return
+        self._syncing = True
+        try:
+            current_static = self.session.current_static_color_by()
+            self._set_combo_data(self.source_combo, current_static)
+            self._set_combo(self.cmap_combo, self.session.current_static_colormap())
+            self.cmap_preview.setColormap(self.cmap_combo.currentText())
+            lo, hi = self.session.current_static_auto_limits()
+            self.auto_lbl.setText(f"{lo:.4g}  /  {hi:.4g}")
+            static_vmin, static_vmax = self.session.current_static_user_range()
+            if static_vmin is None or static_vmax is None:
+                static_vmin, static_vmax = lo, hi
+            self.vmin_spin.setValue(float(static_vmin))
+            self.vmax_spin.setValue(float(static_vmax))
+            self.clamp_cb.setChecked(self.session.current_static_clamp_enabled())
+            newmark = self.session.current_newmark_static_settings()
+            self.newmark_T_spin.setValue(float(newmark["T_target"]))
+            self._set_combo_data(self.newmark_component_combo, newmark["component"])
+            self._set_combo_data(self.newmark_data_combo, newmark["data_type"])
+            self._set_combo_data(self.newmark_spectral_combo, newmark["spectral_type"])
+            self.newmark_factor_spin.setValue(float(newmark["factor"]))
+            self.newmark_jobs_spin.setValue(int(newmark["n_jobs"]))
+            block = self.wave_blend_cb.blockSignals(True)
+            self.wave_blend_cb.setChecked(self.session.current_wave_blend_enabled())
+            self.wave_blend_cb.blockSignals(block)
+            block = self.wave_blend_strength_spin.blockSignals(True)
+            self.wave_blend_strength_spin.setValue(self.session.current_wave_blend_strength())
+            self.wave_blend_strength_spin.blockSignals(block)
+            self.wave_blend_strength_spin.setEnabled(self.session.current_wave_blend_enabled())
+            self._clear_dirty()
+
+            # Per-source enable / disable.
+            allow = not self.session.state.is_playing
+            self.source_combo.setEnabled(allow)
+            self.cmap_combo.setEnabled(allow)
+            self.vmin_spin.setEnabled(allow)
+            self.vmax_spin.setEnabled(allow)
+            self.clamp_cb.setEnabled(allow)
+            self.reset_btn.setEnabled(allow)
+            source = self.source_combo.currentData()
+            analysis_active = source in ("newmark_sa", "arias")
+            for widget in (
+                self.newmark_component_combo,
+                self.newmark_data_combo,
+                self.newmark_factor_spin,
+                self.newmark_jobs_spin,
+            ):
+                widget.setEnabled(allow and analysis_active)
+            self.newmark_T_spin.setEnabled(allow and source == "newmark_sa")
+            self.newmark_spectral_combo.setEnabled(allow and source == "newmark_sa")
+            self.wave_blend_cb.setEnabled(allow)
+            self.wave_blend_strength_spin.setEnabled(
+                allow and self.session.current_wave_blend_enabled()
+            )
+            self.apply_button.setEnabled(allow and self._dirty)
+        finally:
+            self._syncing = False
+
+    # ── Slots ──────────────────────────────────────────────────────────────
+
+    def _set_dirty(self, dirty: bool = True) -> None:
+        if self._syncing:
+            return
+        self._dirty = bool(dirty)
+        if not self.session.state.is_playing:
+            self.apply_button.setEnabled(self._dirty)
+
+    def _clear_dirty(self) -> None:
+        self._dirty = False
+        self.apply_button.setEnabled(False)
+
+    def _on_source_changed(self, *_):
+        if self._syncing:
+            return
+        source = self.source_combo.currentData()
+        analysis_active = source in ("newmark_sa", "arias")
+        playing = self.session.state.is_playing
+        for widget in (
+            self.newmark_component_combo,
+            self.newmark_data_combo,
+            self.newmark_factor_spin,
+            self.newmark_jobs_spin,
+        ):
+            widget.setEnabled(analysis_active and not playing)
+        self.newmark_T_spin.setEnabled(source == "newmark_sa" and not playing)
+        self.newmark_spectral_combo.setEnabled(source == "newmark_sa" and not playing)
+        self._set_dirty(True)
+
+    def _reset_range(self):
+        lo, hi = self.session.current_static_auto_limits()
+        for spin, val in ((self.vmin_spin, lo), (self.vmax_spin, hi)):
+            block = spin.blockSignals(True)
+            spin.setValue(val)
+            spin.blockSignals(block)
+        block = self.clamp_cb.blockSignals(True)
+        self.clamp_cb.setChecked(False)
+        self.clamp_cb.blockSignals(block)
+        self._set_dirty(True)
+
+    def _open_transfer_editor(self):
+        dlg = TransferFunctionDialog(self.session, self.window())
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        values = dlg.values()
+        self.session.apply_transfer_function_preferences(
+            colormap=values.colormap,
+            inverted=values.invert,
+            discrete=values.discrete,
+            bins=values.bins,
+            nan_color=values.nan_color,
+            below_color=values.below_color,
+            above_color=values.above_color,
+            use_below=values.use_below,
+            use_above=values.use_above,
+            symmetric_range=values.symmetric_range,
+            percentile_clip=values.percentile_clip,
+        )
+
+    def _open_legend_editor(self):
+        dlg = LegendEditorDialog(self.session, self.window())
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        values = dlg.values()
+        self.session.apply_legend_preferences(
+            visible=values.visible,
+            title=values.title,
+            orientation=values.orientation,
+            position=values.position,
+            label_count=values.label_count,
+            label_font_size=values.label_font_size,
+            title_font_size=values.title_font_size,
+            show_outline=values.show_outline,
+            show_background=values.show_background,
+        )
+
+    # ── Apply ──────────────────────────────────────────────────────────────
+
+    def _apply(self):
+        if self._syncing:
+            return
+        self.session.apply_static_color_settings(
+            color_by=self.source_combo.currentData(),
+            colormap=self.cmap_combo.currentText(),
+            vmin=self.vmin_spin.value(),
+            vmax=self.vmax_spin.value(),
+            clamp_enabled=self.clamp_cb.isChecked(),
+            wave_blend_enabled=self.wave_blend_cb.isChecked(),
+            wave_blend_strength=(
+                self.wave_blend_strength_spin.value()
+                if self.wave_blend_cb.isChecked()
+                else 0.0
+            ),
+            newmark_T_target=self.newmark_T_spin.value(),
+            newmark_component=str(self.newmark_component_combo.currentData()),
+            newmark_data_type=str(self.newmark_data_combo.currentData()),
+            newmark_spectral_type=str(self.newmark_spectral_combo.currentData()),
+            newmark_factor=self.newmark_factor_spin.value(),
+            newmark_n_jobs=self.newmark_jobs_spin.value(),
+        )
+        self._clear_dirty()
+
+    def _apply_with_busy(self):
+        source = self.source_combo.currentData()
+        if source == "newmark_sa":
+            msg = (
+                "Computing Newmark surface color...\n"
+                "This uses the same parallel cached spectrum path as plot_surface_newmark."
+            )
+        elif source == "arias":
+            msg = (
+                "Computing Arias surface color...\n"
+                "This uses the same parallel cached intensity path as plot_surface_arias."
+            )
+        else:
+            msg = "Applying color by..."
+        self._run_heavy(self._apply, msg)
+
+
 class DisplaySection(_SectionBase):
     """Merged Field + Color Map panel — one Apply triggers one 3-D rebuild.
 
@@ -542,23 +966,9 @@ class DisplaySection(_SectionBase):
         "init", "full", "demand", "component",
         "appearance", "color_range", "panel_apply",
     })
-    _VECTOR_DEMANDS = [
-        ("disp",  "Displacement"),
-        ("vel",   "Velocity"),
-        ("accel", "Acceleration"),
-    ]
-    _STATIC_COLOR_REFRESH_REASONS = frozenset({
-        "init", "full", "static_color", "playback",
-    })
-    _STATIC_COLOR_LABELS = {
-        "elevation_z": "Elevation Z",
-        "newmark_sa": "Sa / Newmark",
-        "arias": "Arias",
-    }
 
     def __init__(self, session, parent=None):
         super().__init__(session, parent)
-        self._static_color_dirty = False
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(8)
@@ -629,334 +1039,46 @@ class DisplaySection(_SectionBase):
         outer.addWidget(
             self._make_apply_button(self._apply, "Applying display settings…")
         )
-
-        # ── Vector Field group ────────────────────────────────────────────
-        vector_box = QtWidgets.QGroupBox("Vector Field")
-        vector_form = QtWidgets.QFormLayout(vector_box)
-        vector_form.setContentsMargins(6, 4, 6, 6)
-
-        self.vector_enabled_cb = QtWidgets.QCheckBox("Show arrow glyphs")
-        self.vector_enabled_cb.toggled.connect(lambda *_: self._set_vector_dirty())
-        vector_form.addRow("", self.vector_enabled_cb)
-
-        self.vector_demand_combo = QtWidgets.QComboBox()
-        for val, lbl in self._VECTOR_DEMANDS:
-            self.vector_demand_combo.addItem(lbl, val)
-        self.vector_demand_combo.currentIndexChanged.connect(lambda *_: self._set_vector_dirty())
-        vector_form.addRow("Field", self.vector_demand_combo)
-
-        self.vector_cmap_combo = QtWidgets.QComboBox()
-        for cmap in COLORMAP_OPTIONS:
-            self.vector_cmap_combo.addItem(cmap, cmap)
-        self.vector_cmap_combo.currentTextChanged.connect(lambda *_: self._set_vector_dirty())
-        self.vector_cmap_preview = ColormapPreview(self.vector_cmap_combo.currentText())
-        self.vector_cmap_combo.currentTextChanged.connect(self.vector_cmap_preview.setColormap)
-        vector_form.addRow("Color ramp", _stack(self.vector_cmap_combo, self.vector_cmap_preview))
-
-        self.vector_scale_spin = QtWidgets.QDoubleSpinBox()
-        self.vector_scale_spin.setRange(0.01, 100.0)
-        self.vector_scale_spin.setValue(1.0)
-        self.vector_scale_spin.setSingleStep(0.25)
-        self.vector_scale_spin.setDecimals(2)
-        self.vector_scale_spin.setSuffix("×")
-        self.vector_scale_spin.valueChanged.connect(lambda *_: self._set_vector_dirty())
-        vector_form.addRow("Scale", self.vector_scale_spin)
-
-        self.vector_apply_btn = QtWidgets.QPushButton("Apply")
-        self.vector_apply_btn.setEnabled(False)
-        self.vector_apply_btn.clicked.connect(
-            lambda: self._run_heavy(self._apply_vector_field, "Ladruno computing vectors…")
-        )
-        vector_form.addRow("", self.vector_apply_btn)
-        outer.addWidget(vector_box)
-
-        static_color_box = QtWidgets.QGroupBox("Color By")
-        static_color_form = QtWidgets.QFormLayout(static_color_box)
-        static_color_form.setContentsMargins(6, 4, 6, 6)
-
-        self.static_color_combo = QtWidgets.QComboBox()
-        self.static_color_combo.addItem("Default", None)
-        for color_by_value in VALID_STATIC_COLOR_BY:
-            self.static_color_combo.addItem(
-                self._STATIC_COLOR_LABELS.get(color_by_value, color_by_value),
-                color_by_value,
-            )
-        self.static_color_combo.currentIndexChanged.connect(self._on_static_color_source_changed)
-
-        self.static_cmap_combo = QtWidgets.QComboBox()
-        for cmap in COLORMAP_OPTIONS:
-            self.static_cmap_combo.addItem(cmap, cmap)
-        self.static_cmap_combo.currentTextChanged.connect(lambda *_: self._set_static_color_dirty())
-        self.static_cmap_preview = ColormapPreview(self.static_cmap_combo.currentText())
-        self.static_cmap_combo.currentTextChanged.connect(self.static_cmap_preview.setColormap)
-
-        self.static_auto_lbl = QtWidgets.QLabel("-")
-        self.static_vmin_spin = self._value_spin()
-        self.static_vmax_spin = self._value_spin()
-        self.static_vmin_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
-        self.static_vmax_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
-
-        self.static_clamp_cb = QtWidgets.QCheckBox("Clamp to range")
-        self.static_clamp_cb.toggled.connect(lambda *_: self._set_static_color_dirty())
-
-        self.static_reset_btn = QtWidgets.QPushButton("Reset to auto")
-        self.static_reset_btn.clicked.connect(self._reset_static_range)
-        self.static_transfer_btn = QtWidgets.QPushButton("Advanced color editor")
-        self.static_transfer_btn.clicked.connect(self._open_transfer_editor)
-        self.static_legend_btn = QtWidgets.QPushButton("Legend settings")
-        self.static_legend_btn.clicked.connect(self._open_legend_editor)
-
-        self.newmark_T_spin = QtWidgets.QDoubleSpinBox()
-        self.newmark_T_spin.setDecimals(3)
-        self.newmark_T_spin.setRange(0.0, 20.0)
-        self.newmark_T_spin.setSingleStep(0.05)
-        self.newmark_T_spin.setValue(0.0)
-        self.newmark_T_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
-
-        self.newmark_component_combo = QtWidgets.QComboBox()
-        for component in ("resultant", "z", "e", "n"):
-            self.newmark_component_combo.addItem(component, component)
-        self.newmark_component_combo.currentIndexChanged.connect(lambda *_: self._set_static_color_dirty())
-
-        self.newmark_data_combo = QtWidgets.QComboBox()
-        for demand in ("accel", "vel", "disp"):
-            self.newmark_data_combo.addItem(demand, demand)
-        self.newmark_data_combo.currentIndexChanged.connect(lambda *_: self._set_static_color_dirty())
-
-        self.newmark_spectral_combo = QtWidgets.QComboBox()
-        for spectral_type in ("PSa", "Sa", "PSv", "Sv", "Sd"):
-            self.newmark_spectral_combo.addItem(spectral_type, spectral_type)
-        self.newmark_spectral_combo.currentIndexChanged.connect(lambda *_: self._set_static_color_dirty())
-
-        self.newmark_factor_spin = self._value_spin()
-        self.newmark_factor_spin.setValue(1.0 / 9.81)
-        self.newmark_factor_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
-
-        self.newmark_jobs_spin = QtWidgets.QSpinBox()
-        self.newmark_jobs_spin.setRange(-32, 128)
-        self.newmark_jobs_spin.setValue(-2)
-        self.newmark_jobs_spin.setToolTip("-1 uses all CPUs; -2 uses all minus one.")
-        self.newmark_jobs_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
-
-        # ── Wave blend controls ───────────────────────────────────────────
-        self.wave_blend_cb = QtWidgets.QCheckBox("Blend wave propagation")
-        self.wave_blend_cb.setToolTip(
-            "During playback the wave field shifts the elevation colour.\n"
-            "Disable it for pure topography during the animation."
-        )
-        self.wave_blend_cb.toggled.connect(lambda *_: self._set_static_color_dirty())
-
-        self.wave_blend_strength_spin = QtWidgets.QDoubleSpinBox()
-        self.wave_blend_strength_spin.setRange(0.0, 1.0)
-        self.wave_blend_strength_spin.setSingleStep(0.05)
-        self.wave_blend_strength_spin.setDecimals(2)
-        self.wave_blend_strength_spin.setValue(0.5)
-        self.wave_blend_strength_spin.setToolTip(
-            "How strongly the wave shifts the elevation colour.\n"
-            "0.00 = pure topography  ·  1.00 = full elevation range."
-        )
-        self.wave_blend_strength_spin.valueChanged.connect(lambda *_: self._set_static_color_dirty())
-        # Only meaningful when the checkbox is on
-        self.wave_blend_cb.toggled.connect(
-            lambda checked: self.wave_blend_strength_spin.setEnabled(checked)
-        )
-
-        self.static_apply_btn = QtWidgets.QPushButton("Apply")
-        self.static_apply_btn.setEnabled(False)
-        self.static_apply_btn.clicked.connect(self._apply_static_color_with_busy)
-
-        static_color_form.addRow("Source", self.static_color_combo)
-        static_color_form.addRow(
-            "Color ramp",
-            _stack(self.static_cmap_combo, self.static_cmap_preview),
-        )
-        static_color_form.addRow("Auto range", self.static_auto_lbl)
-        static_color_form.addRow("User min", self.static_vmin_spin)
-        static_color_form.addRow("User max", self.static_vmax_spin)
-        static_color_form.addRow("", self.static_clamp_cb)
-        static_color_form.addRow("", self.static_reset_btn)
-        static_color_form.addRow("", self.static_transfer_btn)
-        static_color_form.addRow("", self.static_legend_btn)
-        static_color_form.addRow("T target", self.newmark_T_spin)
-        static_color_form.addRow("Component", self.newmark_component_combo)
-        static_color_form.addRow("Data", self.newmark_data_combo)
-        static_color_form.addRow("Sa type", self.newmark_spectral_combo)
-        static_color_form.addRow("Factor", self.newmark_factor_spin)
-        static_color_form.addRow("Jobs", self.newmark_jobs_spin)
-        static_color_form.addRow("", self.wave_blend_cb)
-        static_color_form.addRow("Blend strength", self.wave_blend_strength_spin)
-        static_color_form.addRow("", self.static_apply_btn)
-        outer.addWidget(static_color_box)
         outer.addStretch(1)
         self.refresh("init")
 
     # ── Sync from session state ───────────────────────────────────────────
 
-    def _set_vector_dirty(self):
-        if not self._syncing:
-            self.vector_apply_btn.setEnabled(True)
-
-    def _clear_vector_dirty(self):
-        self.vector_apply_btn.setEnabled(False)
-
-    def _apply_vector_field(self):
-        if self._syncing:
-            return
-        self.session.apply_vector_field_settings(
-            enabled=self.vector_enabled_cb.isChecked(),
-            demand=str(self.vector_demand_combo.currentData()),
-            scale=self.vector_scale_spin.value(),
-            colormap=str(self.vector_cmap_combo.currentData() or "viridis"),
-        )
-        self._clear_vector_dirty()
-
-    def _sync_vector_ui(self):
-        self._syncing = True
-        try:
-            b = self.vector_enabled_cb.blockSignals(True)
-            self.vector_enabled_cb.setChecked(self.session.state.vector_field_enabled)
-            self.vector_enabled_cb.blockSignals(b)
-            self._set_combo_data(self.vector_demand_combo, self.session.state.vector_field_demand)
-            self._set_combo(self.vector_cmap_combo, self.session.state.vector_field_colormap)
-            self.vector_cmap_preview.setColormap(self.vector_cmap_combo.currentText())
-            b = self.vector_scale_spin.blockSignals(True)
-            self.vector_scale_spin.setValue(self.session.state.vector_field_scale)
-            self.vector_scale_spin.blockSignals(b)
-        finally:
-            self._syncing = False
-
     def refresh(self, reason: str = "full"):
-        if reason == "vector_field":
-            self._sync_vector_ui()
+        # Vector field and static color have moved to their own docks
+        # (VectorFieldSection / StaticColorSection); ignore those reasons here.
+        if reason in ("vector_field", "static_color"):
             return
-        sync_display = reason in self._REFRESH_REASONS or not self._dirty
-        sync_static = reason in self._STATIC_COLOR_REFRESH_REASONS or not self._static_color_dirty
-        if not sync_display and not sync_static:
+        if reason not in self._REFRESH_REASONS and self._dirty:
             return
         self._syncing = True
         try:
-            if sync_display:
-                self._set_combo_data(self.demand_combo, self.session.state.demand)
-                self._populate_component_combo(
-                    self.session.state.demand,
-                    selected_component=self.session.state.component,
-                )
-                gf_count = self.session.gf_subfault_count()
-                gf_max = max(gf_count - 1, 0)
-                self.gf_subfault_spin.setMaximum(gf_max)
-                # TODO: Keep the UI pinned to the current GF subfault domain so a
-                # stale value never leaks into Display -> Green Functions apply.
-                self.gf_subfault_spin.setValue(min(self.session.current_display_gf_subfault(), gf_max))
-                self.gf_subfault_spin.setEnabled(self.session.state.demand == "gf")
-                self._set_combo(
-                    self.cmap_combo,
-                    self.session.state.colormap or colormap_for_component(self.session.state.component),
-                )
-                self.cmap_preview.setColormap(self.cmap_combo.currentText())
-                lo, hi = self._field_auto_limits()
-                self.auto_lbl.setText(f"{lo:.4g}  /  {hi:.4g}")
-                if (self.session.state.user_vmin is None
-                        or self.session.state.user_vmax is None):
-                    self.session.state.set_user_color_range(lo, hi)
-                self.vmin_spin.setValue(float(self.session.state.user_vmin))
-                self.vmax_spin.setValue(float(self.session.state.user_vmax))
-                self.clamp_cb.setChecked(self.session.state.clamp_enabled)
-                self._clear_dirty()
-                # Sync vector field UI
-                self._sync_vector_ui()
-                self._clear_vector_dirty()
-            if sync_static:
-                current_static = self.session.current_static_color_by()
-                self._set_combo_data(self.static_color_combo, current_static)
-                self._set_combo(self.static_cmap_combo, self.session.current_static_colormap())
-                self.static_cmap_preview.setColormap(self.static_cmap_combo.currentText())
-                lo, hi = self.session.current_static_auto_limits()
-                self.static_auto_lbl.setText(f"{lo:.4g}  /  {hi:.4g}")
-                static_vmin, static_vmax = self.session.current_static_user_range()
-                if static_vmin is None or static_vmax is None:
-                    static_vmin, static_vmax = lo, hi
-                self.static_vmin_spin.setValue(float(static_vmin))
-                self.static_vmax_spin.setValue(float(static_vmax))
-                self.static_clamp_cb.setChecked(self.session.current_static_clamp_enabled())
-                newmark = self.session.current_newmark_static_settings()
-                self.newmark_T_spin.setValue(float(newmark["T_target"]))
-                self._set_combo_data(self.newmark_component_combo, newmark["component"])
-                self._set_combo_data(self.newmark_data_combo, newmark["data_type"])
-                self._set_combo_data(self.newmark_spectral_combo, newmark["spectral_type"])
-                self.newmark_factor_spin.setValue(float(newmark["factor"]))
-                self.newmark_jobs_spin.setValue(int(newmark["n_jobs"]))
-                # Wave blend controls
-                b = self.wave_blend_cb.blockSignals(True)
-                self.wave_blend_cb.setChecked(self.session.current_wave_blend_enabled())
-                self.wave_blend_cb.blockSignals(b)
-                b = self.wave_blend_strength_spin.blockSignals(True)
-                self.wave_blend_strength_spin.setValue(self.session.current_wave_blend_strength())
-                self.wave_blend_strength_spin.blockSignals(b)
-                self.wave_blend_strength_spin.setEnabled(self.session.current_wave_blend_enabled())
-                self._clear_static_color_dirty()
-            allow_static = not self.session.state.is_playing
-            self.static_color_combo.setEnabled(allow_static)
-            self.static_cmap_combo.setEnabled(allow_static)
-            self.static_vmin_spin.setEnabled(allow_static)
-            self.static_vmax_spin.setEnabled(allow_static)
-            self.static_clamp_cb.setEnabled(allow_static)
-            self.static_reset_btn.setEnabled(allow_static)
-            source = self.static_color_combo.currentData()
-            analysis_active = source in ("newmark_sa", "arias")
-            for widget in (
-                self.newmark_component_combo,
-                self.newmark_data_combo,
-                self.newmark_factor_spin,
-                self.newmark_jobs_spin,
-            ):
-                widget.setEnabled(allow_static and analysis_active)
-            self.newmark_T_spin.setEnabled(allow_static and source == "newmark_sa")
-            self.newmark_spectral_combo.setEnabled(allow_static and source == "newmark_sa")
-            self.wave_blend_cb.setEnabled(allow_static)
-            self.wave_blend_strength_spin.setEnabled(
-                allow_static and self.session.current_wave_blend_enabled()
+            self._set_combo_data(self.demand_combo, self.session.state.demand)
+            self._populate_component_combo(
+                self.session.state.demand,
+                selected_component=self.session.state.component,
             )
-            self.static_apply_btn.setEnabled(allow_static and self._static_color_dirty)
+            gf_count = self.session.gf_subfault_count()
+            gf_max = max(gf_count - 1, 0)
+            self.gf_subfault_spin.setMaximum(gf_max)
+            self.gf_subfault_spin.setValue(min(self.session.current_display_gf_subfault(), gf_max))
+            self.gf_subfault_spin.setEnabled(self.session.state.demand == "gf")
+            self._set_combo(
+                self.cmap_combo,
+                self.session.state.colormap or colormap_for_component(self.session.state.component),
+            )
+            self.cmap_preview.setColormap(self.cmap_combo.currentText())
+            lo, hi = self._field_auto_limits()
+            self.auto_lbl.setText(f"{lo:.4g}  /  {hi:.4g}")
+            if (self.session.state.user_vmin is None
+                    or self.session.state.user_vmax is None):
+                self.session.state.set_user_color_range(lo, hi)
+            self.vmin_spin.setValue(float(self.session.state.user_vmin))
+            self.vmax_spin.setValue(float(self.session.state.user_vmax))
+            self.clamp_cb.setChecked(self.session.state.clamp_enabled)
+            self._clear_dirty()
         finally:
             self._syncing = False
-
-    def _set_static_color_dirty(self, dirty: bool = True):
-        if self._syncing:
-            return
-        self._static_color_dirty = bool(dirty)
-        if not self.session.state.is_playing:
-            self.static_apply_btn.setEnabled(self._static_color_dirty)
-
-    def _clear_static_color_dirty(self):
-        self._static_color_dirty = False
-        self.static_apply_btn.setEnabled(False)
-
-    def _on_static_color_source_changed(self, *_):
-        if self._syncing:
-            return
-        source = self.static_color_combo.currentData()
-        analysis_active = source in ("newmark_sa", "arias")
-        for widget in (
-            self.newmark_component_combo,
-            self.newmark_data_combo,
-            self.newmark_factor_spin,
-            self.newmark_jobs_spin,
-        ):
-            widget.setEnabled(analysis_active and not self.session.state.is_playing)
-        self.newmark_T_spin.setEnabled(source == "newmark_sa" and not self.session.state.is_playing)
-        self.newmark_spectral_combo.setEnabled(source == "newmark_sa" and not self.session.state.is_playing)
-        self._set_static_color_dirty(True)
-
-    def _reset_static_range(self):
-        lo, hi = self.session.current_static_auto_limits()
-        for spin, val in ((self.static_vmin_spin, lo), (self.static_vmax_spin, hi)):
-            b = spin.blockSignals(True)
-            spin.setValue(val)
-            spin.blockSignals(b)
-        b = self.static_clamp_cb.blockSignals(True)
-        self.static_clamp_cb.setChecked(False)
-        self.static_clamp_cb.blockSignals(b)
-        self._set_static_color_dirty(True)
 
     def _field_auto_limits(self) -> tuple[float, float]:
         gf_subfault = self.session.current_display_gf_subfault() if self.session.state.demand == "gf" else 0
@@ -1028,46 +1150,6 @@ class DisplaySection(_SectionBase):
             clamp_enabled=self.clamp_cb.isChecked(),
         )
         self._clear_dirty()
-
-    def _apply_static_color(self):
-        if self._syncing:
-            return
-        self.session.apply_static_color_settings(
-            color_by=self.static_color_combo.currentData(),
-            colormap=self.static_cmap_combo.currentText(),
-            vmin=self.static_vmin_spin.value(),
-            vmax=self.static_vmax_spin.value(),
-            clamp_enabled=self.static_clamp_cb.isChecked(),
-            wave_blend_enabled=self.wave_blend_cb.isChecked(),
-            wave_blend_strength=(
-                self.wave_blend_strength_spin.value()
-                if self.wave_blend_cb.isChecked()
-                else 0.0
-            ),
-            newmark_T_target=self.newmark_T_spin.value(),
-            newmark_component=str(self.newmark_component_combo.currentData()),
-            newmark_data_type=str(self.newmark_data_combo.currentData()),
-            newmark_spectral_type=str(self.newmark_spectral_combo.currentData()),
-            newmark_factor=self.newmark_factor_spin.value(),
-            newmark_n_jobs=self.newmark_jobs_spin.value(),
-        )
-        self._clear_static_color_dirty()
-
-    def _apply_static_color_with_busy(self):
-        source = self.static_color_combo.currentData()
-        if source == "newmark_sa":
-            msg = (
-                "Computing Newmark surface color...\n"
-                "This uses the same parallel cached spectrum path as plot_surface_newmark."
-            )
-        elif source == "arias":
-            msg = (
-                "Computing Arias surface color...\n"
-                "This uses the same parallel cached intensity path as plot_surface_arias."
-            )
-        else:
-            msg = "Applying color by..."
-        self._run_heavy(self._apply_static_color, msg)
 
     def _on_demand_changed(self):
         if self._syncing:

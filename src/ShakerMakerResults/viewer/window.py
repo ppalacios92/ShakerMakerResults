@@ -46,6 +46,8 @@ from .pipeline_browser import (
 from .properties_dock import PropertiesDock
 from .side_panel import (
     DisplaySection,
+    StaticColorSection,
+    VectorFieldSection,
     _LazyPage,
     _PageScrollArea,
     _ResponsesAnalysisTabs,
@@ -83,8 +85,10 @@ _DOCK_SPECS: list[tuple[str, str, str, bool]] = [
     ("responses",   "Responses",        "left",  True),
     ("gf",          "Green Functions",  "left",  False),
     # Right column — visual editors
-    ("display",     "Display",          "right", True),
-    ("appearance",  "Appearance",       "right", True),
+    ("display",      "Display",      "right", True),
+    ("vector_field", "Vector Field", "right", False),
+    ("color_by",     "Color By",     "right", False),
+    ("appearance",   "Appearance",   "right", True),
 ]
 
 _DOCK_AREAS = {
@@ -227,11 +231,13 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._lazy_dock_factories["appearance"]  = lambda parent=self: AppearanceDock(session, parent)
 
         # Sections that live inside a generic dock wrapper.
-        self._lazy_dock_factories["display"]   = lambda: DisplaySection(session)
-        self._lazy_dock_factories["responses"] = lambda: _LazyPage(
+        self._lazy_dock_factories["display"]      = lambda: DisplaySection(session)
+        self._lazy_dock_factories["vector_field"] = lambda: VectorFieldSection(session)
+        self._lazy_dock_factories["color_by"]     = lambda: StaticColorSection(session)
+        self._lazy_dock_factories["responses"]    = lambda: _LazyPage(
             lambda: _ResponsesAnalysisTabs(session)
         )
-        self._lazy_dock_factories["gf"]        = lambda: _LazyPage(lambda: GFPanel(session))
+        self._lazy_dock_factories["gf"]           = lambda: _LazyPage(lambda: GFPanel(session))
 
     # ── Dock building ───────────────────────────────────────────────────────
 
@@ -295,11 +301,16 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         gf = self._docks.get("gf")
         if responses is not None and gf is not None:
             self.tabifyDockWidget(responses, gf)
-        # Right side: Appearance tabs behind Display.
+        # Right side: stack Vector Field, Color By and Appearance behind
+        # Display so they share the right-area real-estate as tabs.  The
+        # user clicks the tab they need without losing context of the
+        # main Display panel.
         display = self._docks.get("display")
-        appearance = self._docks.get("appearance")
-        if display is not None and appearance is not None:
-            self.tabifyDockWidget(display, appearance)
+        for key in ("vector_field", "color_by", "appearance"):
+            sibling = self._docks.get(key)
+            if display is not None and sibling is not None:
+                self.tabifyDockWidget(display, sibling)
+        if display is not None:
             display.raise_()
 
         # Set reasonable initial widths so the central view stays dominant.
