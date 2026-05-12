@@ -88,11 +88,27 @@ class _ColorButton(QtWidgets.QToolButton):
 class TransferFunctionDialog(QtWidgets.QDialog):
     """Professional color-mapping dialog that keeps the viewer layout intact."""
 
-    def __init__(self, session, parent=None):
+    def __init__(self, session, parent=None, *, initial_colormap: str | None = None):
         super().__init__(parent)
         self.session = session
         self.setWindowTitle("Color Mapping")
         self.setMinimumWidth(520)
+
+        # Resolve the "initial colormap" — the caller (typically a side-
+        # panel section) passes the value its own combo currently shows,
+        # which may differ from ``session.current_colormap()`` when the
+        # user has changed the combo without clicking Apply yet.  Falling
+        # back to the session value keeps the legacy single-arg call sites
+        # working.
+        resolved_initial = (initial_colormap or self.session.current_colormap()).strip()
+        # Strip "_r" suffix so the combo + Invert checkbox can drive it
+        # independently below.
+        if resolved_initial.endswith("_r"):
+            base_name = resolved_initial[:-2]
+            self._initial_inverted = True
+        else:
+            base_name = resolved_initial
+            self._initial_inverted = bool(self.session.state.colormap_inverted)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -107,9 +123,10 @@ class TransferFunctionDialog(QtWidgets.QDialog):
         preview_layout.setContentsMargins(8, 8, 8, 8)
         # Live colormap strip with arrow markers.  Same widget the side
         # panel uses, just taller and with the marker count driven by the
-        # "Bins" spinbox so the user sees the ramp segmentation update in
-        # real time as they tweak Discretize / Bins / Invert.
-        self.preview = ColormapPreview(self.session.current_colormap())
+        # "Bins" spinbox so the user sees the ramp segmentation update
+        # in real time as they tweak Discretize / Bins / Invert / marker
+        # colours.
+        self.preview = ColormapPreview(base_name)
         self.preview.setMinimumHeight(44)
         preview_layout.addWidget(self.preview)
         root.addWidget(preview_box)
@@ -122,11 +139,16 @@ class TransferFunctionDialog(QtWidgets.QDialog):
         self.cmap_combo = QtWidgets.QComboBox()
         for cmap in COLORMAP_OPTIONS:
             self.cmap_combo.addItem(cmap, cmap)
-        self.cmap_combo.setCurrentText(self.session.current_colormap())
+        # Use the resolved initial cmap (caller's choice) instead of the
+        # global session value — fixes the "dialog shows viridis even
+        # though the side panel has RdBu_r selected" mismatch.
+        self.cmap_combo.setCurrentText(base_name)
         self.cmap_combo.currentTextChanged.connect(self._refresh_preview)
 
         self.invert_cb = QtWidgets.QCheckBox("Invert ramp")
-        self.invert_cb.setChecked(bool(self.session.state.colormap_inverted))
+        # Use the value derived from the caller's initial cmap so a
+        # name ending in "_r" lands as Invert=True.
+        self.invert_cb.setChecked(bool(self._initial_inverted))
         self.invert_cb.toggled.connect(self._refresh_preview)
 
         self.discrete_cb = QtWidgets.QCheckBox("Discretize colors")
@@ -217,6 +239,16 @@ class TransferFunctionDialog(QtWidgets.QDialog):
             percentile_clip=float(self.percentile_spin.value()),
         )
 
+    def build_custom_colormap(self):
+        """Return a custom :class:`matplotlib.colors.Colormap` honouring the
+        user-picked marker colours, or ``None`` when no marker was edited.
+
+        The session uses this to override the named preset so the 3-D
+        scene renders the same gradient the user is seeing in the
+        Preview strip.
+        """
+        return self.preview.build_custom_colormap()
+
     def _refresh_preview(self):
         """Push the current dialog state into the live ColormapPreview.
 
@@ -240,6 +272,10 @@ class TransferFunctionDialog(QtWidgets.QDialog):
         elif not self.invert_cb.isChecked() and cmap.endswith("_r"):
             cmap = cmap[:-2]
         try:
+            if cmap != self.preview._cmap:  # noqa: SLF001 — internal sentinel
+                # Switching presets invalidates any per-marker overrides
+                # the user had painted onto the previous ramp.
+                self.preview.clearMarkerOverrides()
             self.preview.setColormap(cmap)
         except Exception:
             pass

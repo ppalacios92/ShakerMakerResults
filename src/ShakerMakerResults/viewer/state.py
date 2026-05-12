@@ -18,6 +18,14 @@ class ViewerState:
     selected_node: int | str | None = None
     background: str = "White"
     colormap: str | None = None
+    #: Optional custom :class:`matplotlib.colors.Colormap` that overrides
+    #: the named colormap above when set.  Populated by the Advanced
+    #: Color Editor when the user paints individual stops via the preview
+    #: triangles; cleared whenever the user picks a different named
+    #: preset.  Pyvista's ``add_points(cmap=...)`` accepts a Colormap
+    #: instance directly, so no registration with matplotlib's global
+    #: cmap registry is necessary.
+    colormap_object: object | None = None
     point_size: float | None = None
     show_scalar_bar: bool = True
     colormap_inverted: bool = False

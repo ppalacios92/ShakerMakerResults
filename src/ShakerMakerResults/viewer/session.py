@@ -378,8 +378,21 @@ class ViewerSession:
         use_above: bool,
         symmetric_range: bool,
         percentile_clip: float,
+        custom_colormap_object=None,
     ):
+        """Apply preferences from the Advanced Color Editor.
+
+        ``custom_colormap_object`` is an optional
+        :class:`matplotlib.colors.Colormap` instance built from the
+        per-stop triangle colours the user picked in the preview.  When
+        provided it overrides the named ``colormap``; passing ``None``
+        clears any previous custom palette so the named preset is used.
+        """
         self.state.set_colormap(colormap)
+        # Store / clear the custom Colormap instance.  We assign
+        # directly (no setter on state.py) — ``current_colormap`` reads
+        # it and pyvista accepts the instance.
+        self.state.colormap_object = custom_colormap_object
         self.state.set_transfer_function_preferences(
             inverted=inverted,
             discrete=discrete,
@@ -1278,7 +1291,16 @@ class ViewerSession:
         st = state if state is not None else self.state
         return BACKGROUND_PRESETS[st.background]
 
-    def current_colormap(self, *, state=None) -> str:
+    def current_colormap(self, *, state=None):
+        """Return the active colormap.
+
+        Usually a matplotlib name (``str``).  When the user has built a
+        custom palette through the Advanced Color Editor (per-stop
+        triangle colours), this returns the underlying
+        :class:`matplotlib.colors.Colormap` instance instead — pyvista
+        accepts either form, and we propagate the object directly so we
+        do not need to register it in matplotlib's global cmap registry.
+        """
         st = state if state is not None else self.state
         if self.current_wave_blend_active():
             return self._current_wave_colormap()
@@ -1287,6 +1309,9 @@ class ViewerSession:
                 self._static_color_map,
                 inverted=st.colormap_inverted,
             )
+        custom = getattr(st, "colormap_object", None)
+        if custom is not None:
+            return custom
         return effective_colormap_name(
             st.colormap or colormap_for_component(st.component),
             inverted=st.colormap_inverted,

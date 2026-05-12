@@ -633,7 +633,7 @@ class VectorFieldSection(_SectionBase):
         to the active scalar field; the vector overlay then re-renders
         with the new ramp on its next Apply.
         """
-        dlg = TransferFunctionDialog(self.session, self.window())
+        dlg = TransferFunctionDialog(self.session, self.window(), initial_colormap=self.cmap_combo.currentText())
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         values = dlg.values()
@@ -649,6 +649,7 @@ class VectorFieldSection(_SectionBase):
             use_above=values.use_above,
             symmetric_range=values.symmetric_range,
             percentile_clip=values.percentile_clip,
+            custom_colormap_object=dlg.build_custom_colormap(),
         )
 
 
@@ -924,7 +925,7 @@ class StaticColorSection(_SectionBase):
         self._set_dirty(True)
 
     def _open_transfer_editor(self):
-        dlg = TransferFunctionDialog(self.session, self.window())
+        dlg = TransferFunctionDialog(self.session, self.window(), initial_colormap=self.cmap_combo.currentText())
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         values = dlg.values()
@@ -940,6 +941,7 @@ class StaticColorSection(_SectionBase):
             use_above=values.use_above,
             symmetric_range=values.symmetric_range,
             percentile_clip=values.percentile_clip,
+            custom_colormap_object=dlg.build_custom_colormap(),
         )
 
     def _open_legend_editor(self):
@@ -1222,7 +1224,7 @@ class DisplaySection(_SectionBase):
         self._set_dirty(True)
 
     def _open_transfer_editor(self):
-        dlg = TransferFunctionDialog(self.session, self.window())
+        dlg = TransferFunctionDialog(self.session, self.window(), initial_colormap=self.cmap_combo.currentText())
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         values = dlg.values()
@@ -1238,6 +1240,7 @@ class DisplaySection(_SectionBase):
             use_above=values.use_above,
             symmetric_range=values.symmetric_range,
             percentile_clip=values.percentile_clip,
+            custom_colormap_object=dlg.build_custom_colormap(),
         )
 
     def _open_legend_editor(self):

@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 from ._imports import require_viewer_dependencies
-from .colors import colormap_strip_bytes
+from .colors import _matplotlib_cmap, colormap_strip_bytes
 
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
 
@@ -212,7 +212,15 @@ class ColormapPreview(QtWidgets.QWidget):
         strip_w = max(rect.width(), 2)
         strip_h = max(rect.height(), 2)
         try:
-            raw = colormap_strip_bytes(self._cmap, strip_w, strip_h)
+            if self._marker_overrides:
+                # Build a one-off LinearSegmentedColormap that interpolates
+                # between the marker positions, replacing the base cmap's
+                # value at each overridden marker.  This way picking white
+                # for the middle triangle actually pushes the gradient
+                # through white at that point.
+                raw = self._custom_strip_bytes(strip_w, strip_h)
+            else:
+                raw = colormap_strip_bytes(self._cmap, strip_w, strip_h)
         except Exception:
             # Fallback: neutral gray when matplotlib cannot resolve the cmap.
             painter.fillRect(rect, QtGui.QColor("#808080"))
@@ -256,6 +264,68 @@ class ColormapPreview(QtWidgets.QWidget):
                 painter.setPen(QtCore.Qt.NoPen)
                 painter.setBrush(QtGui.QBrush(self._marker_color))
             painter.drawPolygon(triangle)
+
+    # ── Custom colormap from marker overrides ──────────────────────────────
+
+    def _custom_strip_bytes(self, width: int, height: int) -> bytes:
+        """Build a gradient strip that honours per-marker colour overrides.
+
+        Each marker is treated as a stop along the 0..1 axis.  Stops the
+        user has not customised inherit the base matplotlib cmap's value
+        at that position; overridden stops use the picked colour.  A
+        ``LinearSegmentedColormap`` interpolates between consecutive
+        stops, so picking white for the middle marker bends the ramp
+        through white at the middle.
+        """
+        import numpy as np
+        from matplotlib.colors import LinearSegmentedColormap
+
+        base_cmap = _matplotlib_cmap(self._cmap)
+        n = max(int(self._marker_count), 2)
+        stops: list[tuple[float, tuple[float, float, float]]] = []
+        for i in range(n):
+            pos = float(i) / float(n - 1)
+            if i in self._marker_overrides:
+                color = self._marker_overrides[i]
+                rgb = (color.redF(), color.greenF(), color.blueF())
+            else:
+                r, g, b, _ = base_cmap(pos)
+                rgb = (float(r), float(g), float(b))
+            stops.append((pos, rgb))
+        cmap = LinearSegmentedColormap.from_list(
+            f"{self._cmap}_custom_preview", stops, N=256
+        )
+        gradient = np.linspace(0.0, 1.0, max(int(width), 2), dtype=np.float32)
+        row = (cmap(gradient)[:, :4] * 255.0).astype(np.uint8, copy=False)
+        img = np.broadcast_to(row[None, :, :], (max(int(height), 1), row.shape[0], 4))
+        return np.ascontiguousarray(img).tobytes()
+
+    def build_custom_colormap(self):
+        """Return a ``matplotlib.colors.Colormap`` honouring marker overrides,
+        or ``None`` when no marker has been recoloured.
+
+        Used by :class:`TransferFunctionDialog` to push the user's
+        per-marker palette to the actual renderer on OK.
+        """
+        if not self._marker_overrides:
+            return None
+        from matplotlib.colors import LinearSegmentedColormap
+
+        base_cmap = _matplotlib_cmap(self._cmap)
+        n = max(int(self._marker_count), 2)
+        stops = []
+        for i in range(n):
+            pos = float(i) / float(n - 1)
+            if i in self._marker_overrides:
+                color = self._marker_overrides[i]
+                rgb = (color.redF(), color.greenF(), color.blueF())
+            else:
+                r, g, b, _ = base_cmap(pos)
+                rgb = (float(r), float(g), float(b))
+            stops.append((pos, rgb))
+        return LinearSegmentedColormap.from_list(
+            f"{self._cmap}_custom", stops, N=256
+        )
 
     # ── Color picking ──────────────────────────────────────────────────────
 
