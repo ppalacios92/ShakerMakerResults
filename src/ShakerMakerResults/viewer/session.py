@@ -851,7 +851,8 @@ class ViewerSession:
     def jump_time(self, delta: int = 10):
         return self.step_time(delta)
 
-    def current_scalars(self):
+    def current_scalars(self, *, state=None):
+        st = state if state is not None else self.state
         if self._static_color_by == "elevation_z":
             if self.current_wave_blend_active():
                 return self._elevation_wave_rgb_blend()
@@ -860,11 +861,14 @@ class ViewerSession:
             return self._newmark_surface_scalars()
         if self._static_color_by == "arias":
             return self._arias_surface_scalars()
-        gf_subfault = self._display_gf_subfault if self.state.demand == GF_DEMAND else 0
+        gf_subfault = self._display_gf_subfault if st.demand == GF_DEMAND else 0
+        # time_index is intentionally read from the GLOBAL state — the
+        # animation clock is shared across panes (per the per-pane
+        # whitelist in pane_state).
         return self.adapter.scalar_snapshot(
             self.state.time_index,
-            self.state.demand,
-            self.state.component,
+            st.demand,
+            st.component,
             subfault_id=gf_subfault,
         )
 
@@ -978,30 +982,31 @@ class ViewerSession:
         self._wave_global_max = w_abs
         return w_abs
 
-    def current_visible_points(self):
+    def current_visible_points(self, *, state=None):
+        # Visibility filters are global (whitelist in pane_state.py),
+        # so we read from self.state directly; ``state`` is accepted
+        # for signature symmetry but ignored here.
         return self.adapter.visible_points(
             show_internal=self.state.show_internal,
             show_external=self.state.show_external,
             show_qa=self.state.show_qa,
         )
 
-    def current_warped_points(self) -> "np.ndarray":
+    def current_warped_points(self, *, state=None) -> "np.ndarray":
         """Return visible points displaced by the current displacement field.
 
-        When ``disp_warp_enabled`` is False returns the base visible points so
-        callers need not branch on warp state.
-
-        This method is called on **every animation frame** when warp is active,
-        so it deliberately avoids ``current_visible_points()`` which runs an
-        O(N) Python list-comprehension to update ``_visible_node_ids``.  That
-        update is needed for node-picking but not for rendering — we call
-        ``current_visible_points()`` only in ``_rebuild_point_cloud()`` (scene
-        rebuilds), not on every frame.
+        Warp parameters (enabled / axes / scale) are *per-pane* so the
+        caller can pass its pane overlay via ``state=``.  When ``state``
+        is None we fall back to the global session state — preserving
+        the legacy single-pane behaviour for any caller that has not
+        been updated.
         """
         import numpy as _np
+        st = state if state is not None else self.state
 
-        # Compute the boolean mask without triggering the _visible_node_ids
-        # list-comprehension that lives in visible_points().
+        # Compute the boolean mask without triggering the
+        # _visible_node_ids list-comprehension that lives in visible_points().
+        # Visibility filters are global so use self.state for them.
         mask = self.adapter.visibility_mask(
             show_internal=self.state.show_internal,
             show_external=self.state.show_external,
@@ -1009,7 +1014,12 @@ class ViewerSession:
         )
         base = self.adapter._display_points[mask]
 
-        if not self.state.disp_warp_enabled:
+        if not st.disp_warp_enabled:
+            # Per-pane warp state — cache key must include the pane
+            # identity through the warp parameters, otherwise two panes
+            # with different warp settings would thrash the single
+            # cache slot.  Visibility flags are global so they stay in
+            # the key for legacy callers.
             key = ("base", self.state.show_internal, self.state.show_external, self.state.show_qa)
             if self._warped_points_cache_key == key and self._warped_points_cache is not None:
                 return self._warped_points_cache
@@ -1017,7 +1027,7 @@ class ViewerSession:
             self._warped_points_cache = base
             return base
 
-        scale = self.state.warp_scale
+        scale = st.warp_scale
         if scale is None:
             scale = self.adapter.suggested_warp_scale()
         scale = float(scale)
@@ -1025,7 +1035,7 @@ class ViewerSession:
             "warp",
             self.state.time_index,
             scale,
-            tuple(self.state.warp_axes),
+            tuple(st.warp_axes),
             self.state.show_internal,
             self.state.show_external,
             self.state.show_qa,
@@ -1039,7 +1049,7 @@ class ViewerSession:
         disp_all[:, 2] *= -1.0
         disp_visible = disp_all[mask]                      # (N_visible, 3) [E, N, Z]
 
-        axes = self.state.warp_axes                        # (x_enable, y_enable, z_enable)
+        axes = st.warp_axes                                 # (x_enable, y_enable, z_enable)
         axis_mask = _np.array([float(axes[0]), float(axes[1]), float(axes[2])])
         try:
             warped = base + scale * disp_visible * axis_mask[_np.newaxis, :]
@@ -1049,25 +1059,29 @@ class ViewerSession:
         self._warped_points_cache = warped
         return warped
 
-    def current_visible_scalars(self):
+    def current_visible_scalars(self, *, state=None):
+        # Visibility filters stay global (whitelist in pane_state.py),
+        # but the underlying scalar values follow the pane's demand /
+        # component / time index combination.
         return self.adapter.visible_scalars(
-            self.current_scalars(),
+            self.current_scalars(state=state),
             show_internal=self.state.show_internal,
             show_external=self.state.show_external,
             show_qa=self.state.show_qa,
         )
 
-    def default_color_limits(self) -> tuple[float, float]:
+    def default_color_limits(self, *, state=None) -> tuple[float, float]:
+        st = state if state is not None else self.state
         if self._static_color_by == "elevation_z":
             return self.adapter.elevation_limits()
         if self._static_color_by == "newmark_sa":
             return scalar_limits(self._newmark_surface_scalars(), "resultant")
         if self._static_color_by == "arias":
             return scalar_limits(self._arias_surface_scalars(), "resultant")
-        gf_subfault = self._display_gf_subfault if self.state.demand == GF_DEMAND else 0
+        gf_subfault = self._display_gf_subfault if st.demand == GF_DEMAND else 0
         return self.adapter.default_scalar_limits(
-            self.state.demand,
-            self.state.component,
+            st.demand,
+            st.component,
             subfault_id=gf_subfault,
         )
 
@@ -1119,13 +1133,13 @@ class ViewerSession:
             return vmin, vmax
         if scalars is None:
             try:
-                lo, hi = self.default_color_limits()
+                lo, hi = self.default_color_limits(state=st)
                 if st.symmetric_color_range:
                     vmax = max(abs(float(lo)), abs(float(hi)))
                     return -vmax, vmax
                 return lo, hi
             except Exception:
-                scalars = self.current_visible_scalars()
+                scalars = self.current_visible_scalars(state=st)
         try:
             import numpy as np
 

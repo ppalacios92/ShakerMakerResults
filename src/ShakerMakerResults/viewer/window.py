@@ -351,13 +351,17 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         # Left side: tab the secondary panels (Appearance, Responses) under
         # Information so the visible-by-default column doesn't grow taller
         # than the screen.  Pipeline + Properties stay un-tabbed at top.
+        # Responses is raised to the front of the tab stack so the
+        # analytic plots are discoverable on first launch — Information
+        # is one click away on the adjacent tab.
         information = self._docks.get("information")
         for key in ("appearance", "responses"):
             sibling = self._docks.get(key)
             if information is not None and sibling is not None:
                 self.tabifyDockWidget(information, sibling)
-        if information is not None:
-            information.raise_()
+        responses = self._docks.get("responses")
+        if responses is not None:
+            responses.raise_()
 
         # Set reasonable initial widths so the central view stays dominant.
         if "pipeline" in self._docks and "display" in self._docks:

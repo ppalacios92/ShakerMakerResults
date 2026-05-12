@@ -164,7 +164,7 @@ class ViewerScene:
         if self._gf_pin_active():
             scalars = self._scalars_for_gf_pin()
         else:
-            scalars = self.session.current_visible_scalars()
+            scalars = self.session.current_visible_scalars(state=self.state)
         domain_idx = self._domain_index_array()
         if domain_idx is not None:
             scalars = scalars[domain_idx]
@@ -203,7 +203,7 @@ class ViewerScene:
                 self.plotter.render()
             return
         try:
-            new_pts = self.session.current_warped_points()
+            new_pts = self.session.current_warped_points(state=self.state)
             domain_idx = self._domain_index_array()
             if domain_idx is not None:
                 new_pts = new_pts[domain_idx]
@@ -232,7 +232,7 @@ class ViewerScene:
         try:
             import numpy as np
 
-            base_points = self.session.current_visible_points()
+            base_points = self.session.current_visible_points(state=self.state)
             domain_idx = self._domain_index_array()
             if domain_idx is not None:
                 base_points = base_points[domain_idx]
@@ -826,7 +826,7 @@ class ViewerScene:
         if self.point_cloud is not None and "active_scalars" in self.point_cloud.point_data:
             scalars = self.point_cloud.point_data["active_scalars"]
         else:
-            scalars = self.session.current_visible_scalars()
+            scalars = self.session.current_visible_scalars(state=self.state)
         if self.point_actor is not None:
             self.point_actor.mapper.scalar_range = self.session.current_color_limits(scalars, state=self.state)
         if render:
@@ -854,8 +854,8 @@ class ViewerScene:
         # this rebuild.  current_warped_points() was refactored to skip this
         # O(N) Python list-comprehension on every animation frame, so we call
         # current_visible_points() explicitly here (rebuild is not a hot path).
-        self.session.current_visible_points()
-        points = self.session.current_warped_points()
+        self.session.current_visible_points(state=self.state)
+        points = self.session.current_warped_points(state=self.state)
         if lightweight:
             scalars = self.session.adapter.visible_scalars(
                 self.session.adapter.elevation_snapshot(),
@@ -866,7 +866,7 @@ class ViewerScene:
         elif self._gf_pin_active():
             scalars = self._scalars_for_gf_pin()
         else:
-            scalars = self.session.current_visible_scalars()
+            scalars = self.session.current_visible_scalars(state=self.state)
 
         # Per-pane visual domain (selection filters).
         self._visual_node_ids_list = None

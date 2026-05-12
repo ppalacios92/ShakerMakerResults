@@ -40,10 +40,14 @@ from typing import Any, Iterable
 
 
 #: Attributes that *cannot* be overridden per pane.
-#: They either describe the application as a whole (animation clock,
-#: cache state, playback) or the user's current selection set (which is
-#: shared by every viewport on purpose so the trace panel highlights
-#: stay consistent).
+#:
+#: Only application-wide axes that would desynchronise multiple panes
+#: are listed here — the animation clock, playback state, and the
+#: shared selection set.  Everything else (including ``demand`` /
+#: ``component``) is per-pane, even though that means two panes can
+#: hold different cached series at the same time; the adapter cache
+#: already supports the extra triplet and the user explicitly asked
+#: for "all visual attributes per pane".
 _GLOBAL_ONLY: frozenset[str] = frozenset(
     {
         "time_index",
@@ -55,10 +59,6 @@ _GLOBAL_ONLY: frozenset[str] = frozenset(
         "show_internal",
         "show_external",
         "show_qa",
-        # Data-loading axis — switching demand per pane would force an
-        # extra cached triplet for that pane; left global so the cache
-        # budget stays predictable.
-        "demand",
     }
 )
 
