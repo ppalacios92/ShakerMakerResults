@@ -45,6 +45,7 @@ class ViewerScene:
         # component independently of the global side-panel selection.
         self._gf_component_pin: str | None = None
         self._gf_label_actor = None    # text actor showing the component label
+        self._gf_label_text: str | None = None  # remembered for re-render on theme switch
 
     # GF component pin.
 
@@ -63,6 +64,7 @@ class ViewerScene:
             except Exception:
                 pass
             self._gf_label_actor = None
+        self._gf_label_text = label if component is not None else None
         # Add a new label when a pin is being set.
         if label:
             try:
@@ -763,6 +765,31 @@ class ViewerScene:
 
     def apply_appearance(self, render: bool = True):
         self.plotter.set_background(self.session.current_background_color())
+        # VTK text actors bake their colour at creation time — the branding
+        # block and the GF component label keep their *original* foreground
+        # colour even after the renderer background changes.  Remove and
+        # re-add them so they always read against the current scene.
+        try:
+            self.plotter.remove_actor("branding", render=False)
+        except Exception:
+            pass
+        self._add_branding()
+        if self._gf_component_pin is not None and self._gf_label_actor is not None:
+            try:
+                self.plotter.remove_actor(self._gf_label_actor, render=False)
+            except Exception:
+                pass
+            self._gf_label_actor = None
+            try:
+                self._gf_label_actor = self.plotter.add_text(
+                    self._gf_label_text or self._gf_component_pin,
+                    position="upper_right",
+                    font_size=9,
+                    color=self._foreground_color(),
+                    render=False,
+                )
+            except Exception:
+                pass
         self.rebuild_scalar_actor(render=render)
         self.refresh_selection(render=False)
         self.refresh_multi_selection(render=False)
