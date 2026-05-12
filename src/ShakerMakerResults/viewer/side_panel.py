@@ -674,6 +674,9 @@ class StaticColorSection(_SectionBase):
 
     def __init__(self, session, parent=None):
         super().__init__(session, parent)
+        # Same lock-on-edit semantics as DisplaySection for the
+        # static color User min / User max spinboxes.
+        self._range_user_locked = False
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(8)
@@ -702,8 +705,10 @@ class StaticColorSection(_SectionBase):
         self.auto_lbl = QtWidgets.QLabel("-")
         self.vmin_spin = self._value_spin()
         self.vmax_spin = self._value_spin()
-        self.vmin_spin.valueChanged.connect(lambda *_: self._set_dirty())
-        self.vmax_spin.valueChanged.connect(lambda *_: self._set_dirty())
+        # Same lock-on-edit semantics as DisplaySection — the spinboxes
+        # stay where the user left them until they press Reset to auto.
+        self.vmin_spin.valueChanged.connect(lambda *_: self._on_user_range_edited())
+        self.vmax_spin.valueChanged.connect(lambda *_: self._on_user_range_edited())
 
         self.clamp_cb = QtWidgets.QCheckBox("Clamp to range")
         self.clamp_cb.toggled.connect(lambda *_: self._set_dirty())
@@ -815,8 +820,12 @@ class StaticColorSection(_SectionBase):
             static_vmin, static_vmax = self.session.current_static_user_range()
             if static_vmin is None or static_vmax is None:
                 static_vmin, static_vmax = lo, hi
-            self.vmin_spin.setValue(float(static_vmin))
-            self.vmax_spin.setValue(float(static_vmax))
+            # Respect the user-locked range — once the user types a
+            # value in User min / max we leave the spinboxes alone
+            # until they press Reset to auto.
+            if not self._range_user_locked:
+                self.vmin_spin.setValue(float(static_vmin))
+                self.vmax_spin.setValue(float(static_vmax))
             self.clamp_cb.setChecked(self.session.current_static_clamp_enabled())
             newmark = self.session.current_newmark_static_settings()
             self.newmark_T_spin.setValue(float(newmark["T_target"]))
@@ -902,6 +911,16 @@ class StaticColorSection(_SectionBase):
         block = self.clamp_cb.blockSignals(True)
         self.clamp_cb.setChecked(False)
         self.clamp_cb.blockSignals(block)
+        # Release the lock so refresh resumes auto-syncing from session state.
+        self._range_user_locked = False
+        self._set_dirty(True)
+
+    def _on_user_range_edited(self) -> None:
+        """User typed a value in User min / max — lock the range and
+        flag the section dirty so Apply re-reads our values."""
+        if self._syncing:
+            return
+        self._range_user_locked = True
         self._set_dirty(True)
 
     def _open_transfer_editor(self):
@@ -1014,6 +1033,11 @@ class DisplaySection(_SectionBase):
 
     def __init__(self, session, parent=None):
         super().__init__(session, parent)
+        # When the user types a value into User min / User max we lock
+        # the range — subsequent refreshes leave the spinboxes alone so
+        # the typed values stay visible.  "Reset to auto" clears the
+        # lock so the spinboxes resume auto-syncing with session state.
+        self._range_user_locked = False
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(8)
@@ -1089,8 +1113,13 @@ class DisplaySection(_SectionBase):
         self.auto_lbl  = QtWidgets.QLabel("-")
         self.vmin_spin = self._value_spin()
         self.vmax_spin = self._value_spin()
-        self.vmin_spin.valueChanged.connect(lambda *_: self._set_dirty())
-        self.vmax_spin.valueChanged.connect(lambda *_: self._set_dirty())
+        # Connecting to ``_on_user_range_edited`` (not just ``_set_dirty``)
+        # also flips the lock flag so subsequent refreshes leave the
+        # spinboxes alone.  ``valueChanged`` does not fire while signals
+        # are blocked (i.e. while refresh is auto-populating), so the
+        # lock only flips on a real user-driven edit.
+        self.vmin_spin.valueChanged.connect(lambda *_: self._on_user_range_edited())
+        self.vmax_spin.valueChanged.connect(lambda *_: self._on_user_range_edited())
 
         self.clamp_cb = QtWidgets.QCheckBox("Clamp to range")
         self.clamp_cb.toggled.connect(lambda *_: self._set_dirty())
@@ -1149,12 +1178,26 @@ class DisplaySection(_SectionBase):
             if (self.session.state.user_vmin is None
                     or self.session.state.user_vmax is None):
                 self.session.state.set_user_color_range(lo, hi)
-            self.vmin_spin.setValue(float(self.session.state.user_vmin))
-            self.vmax_spin.setValue(float(self.session.state.user_vmax))
+            # ``_range_user_locked`` is set to True once the user has
+            # typed anything into User min / User max.  While locked we
+            # keep the typed values in the spinboxes regardless of what
+            # the session global says — the user retains full control
+            # over the range until they press "Reset to auto".
+            if not self._range_user_locked:
+                self.vmin_spin.setValue(float(self.session.state.user_vmin))
+                self.vmax_spin.setValue(float(self.session.state.user_vmax))
             self.clamp_cb.setChecked(self.session.state.clamp_enabled)
             self._clear_dirty()
         finally:
             self._syncing = False
+
+    def _on_user_range_edited(self) -> None:
+        """User typed a value in User min / max — lock the range and
+        flag the section dirty so Apply re-reads our values."""
+        if self._syncing:
+            return
+        self._range_user_locked = True
+        self._set_dirty(True)
 
     def _field_auto_limits(self) -> tuple[float, float]:
         gf_subfault = self.session.current_display_gf_subfault() if self.session.state.demand == "gf" else 0
@@ -1173,6 +1216,9 @@ class DisplaySection(_SectionBase):
         b = self.clamp_cb.blockSignals(True)
         self.clamp_cb.setChecked(False)
         self.clamp_cb.blockSignals(b)
+        # Clear the lock so future refreshes resume auto-syncing the
+        # spinboxes with session state until the user edits them again.
+        self._range_user_locked = False
         self._set_dirty(True)
 
     def _open_transfer_editor(self):
