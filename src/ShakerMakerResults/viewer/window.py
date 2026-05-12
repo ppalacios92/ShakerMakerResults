@@ -38,9 +38,11 @@ from .multi_view import TabbedMultiViewArea
 from .pipeline_browser import (
     NODE_GEOGRAPHIC,
     NODE_GF,
+    NODE_PANE,
     NODE_ROOT,
     NODE_SELECTION,
     NODE_STATIONS,
+    NODE_TAB,
     PipelineBrowserDock,
 )
 from .properties_dock import PropertiesDock
