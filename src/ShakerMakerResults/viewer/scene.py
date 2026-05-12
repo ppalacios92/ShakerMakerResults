@@ -838,6 +838,17 @@ class ViewerScene:
         else:
             clim = self.session.current_color_limits(scalars)
             bar_title = self._scalar_bar_title()
+        # PyVista keeps every scalar bar it has ever added in a per-plotter
+        # registry keyed by title.  Without this clean-up step every call to
+        # ``add_points(show_scalar_bar=True, ...)`` stacks a new bar on top
+        # of the old one — labels, ticks and the title pile up.  Clearing
+        # the registry first guarantees exactly one scalar bar per render.
+        try:
+            scalar_bars = getattr(self.plotter, "scalar_bars", None)
+            if scalar_bars is not None and hasattr(scalar_bars, "clear"):
+                scalar_bars.clear()
+        except Exception:
+            pass
         kwargs = {
             "scalars": "active_scalars",
             "render_points_as_spheres": True,

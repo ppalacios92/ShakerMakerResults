@@ -101,11 +101,18 @@ class _ToolBarBase(QtWidgets.QToolBar):
         return self._multi_view.active_plotter
 
     def _visible_panes(self):
-        panes = list(getattr(self._multi_view, "_panes", []))
-        current_layout = getattr(self._multi_view, "_current_layout", "1×1")
-        layout_n = getattr(self._multi_view, "_layout_n", {})
-        needed = int(layout_n.get(current_layout, len(panes) or 1))
-        return panes[: max(0, min(needed, len(panes)))]
+        # Every entry in MultiViewArea._panes is on screen now that the
+        # recursive split / close model owns the splitter tree.  Falling
+        # back to ``visible_panes()`` keeps the proxy working through
+        # ``TabbedMultiViewArea`` as well.
+        target = getattr(self._multi_view, "current", None) or self._multi_view
+        visible = getattr(target, "visible_panes", None)
+        if callable(visible):
+            try:
+                return list(visible())
+            except Exception:
+                pass
+        return list(getattr(target, "_panes", []))
 
     def _target_plotters(self, all_windows: bool):
         if all_windows:
@@ -249,16 +256,19 @@ _VIEW_PRESET_ENTRIES: list[tuple[str, str, str, str, str]] = [
 
 
 class ViewPresetsToolBar(_ToolBarBase):
-    """The 10 camera-preset buttons that used to live on the left rail.
+    """Camera-preset buttons + the GF 3×3 toggle.
 
-    Each button calls :class:`~.multi_view.MultiViewArea` ``_apply_camera_preset``
-    on the current tab so the active pane (or every pane, when "All windows" is
-    on) snaps to the requested orientation.
+    Each preset button calls :class:`~.multi_view.MultiViewArea`
+    ``_apply_camera_preset`` on the current tab.  The trailing GF button
+    flips :class:`~.multi_view.MultiViewArea.toggle_gf_mode` so the user
+    can enter or leave the tensor view from the same toolbar that holds
+    the orthographic / iso presets.
     """
 
     def __init__(self, multi_view, session, all_state: "_AllWindowsState", parent=None):
         super().__init__("View Presets", multi_view, session, parent)
         self._all_state = all_state
+        self._gf_button: QtWidgets.QToolButton | None = None
 
         previous_group: str | None = None
         for group, key, label, icon_name, tooltip in _VIEW_PRESET_ENTRIES:
@@ -275,6 +285,31 @@ class ViewPresetsToolBar(_ToolBarBase):
             btn.setFixedHeight(26)
             btn.clicked.connect(lambda _c=False, k=key: self._apply_preset(k))
             self.addWidget(btn)
+
+        # ── GF tensor view (3×3 grid + auto-warmup + component pins) ────────
+        self.addSeparator()
+        self._gf_button = QtWidgets.QToolButton(self)
+        self._gf_button.setText("GF")
+        self._gf_button.setToolTip(
+            "Toggle the 3×3 Green Function tensor view.\n"
+            "Replaces the current panes with a 9-pane grid pinned to G_ij\n"
+            "and switches the active demand to GF.  Press again to restore\n"
+            "the previous demand and a single pane."
+        )
+        self._gf_button.setCheckable(True)
+        self._gf_button.setAutoRaise(True)
+        self._gf_button.setFixedHeight(26)
+        # GF needs a touch more visual weight than a plain preset — use the
+        # accent color so it reads as "special action" instead of "axis".
+        palette = active_palette()
+        self._gf_button.setStyleSheet(
+            f"QToolButton {{ color: {palette.accent_dark}; font-weight: bold; "
+            f"padding: 0 8px; }}"
+            f"QToolButton:checked {{ background: {palette.surface_3}; "
+            f"border: 1px solid {palette.accent}; border-radius: 3px; }}"
+        )
+        self._gf_button.toggled.connect(self._on_gf_toggled)
+        self.addWidget(self._gf_button)
 
     def _apply_preset(self, key: str) -> None:
         # Prefer the per-tab MultiViewArea entry point so the "All windows"
@@ -317,6 +352,27 @@ class ViewPresetsToolBar(_ToolBarBase):
                 p.render()
             except Exception:
                 pass
+
+    def _on_gf_toggled(self, checked: bool) -> None:
+        """Forward the checkbox state to the current MultiViewArea."""
+        c = getattr(self._multi_view, "current", None)
+        target = c if c is not None else self._multi_view
+        try:
+            if checked:
+                if not getattr(target, "in_gf_mode", False):
+                    enter = getattr(target, "enter_gf_mode", None)
+                    if callable(enter):
+                        enter()
+            else:
+                if getattr(target, "in_gf_mode", False):
+                    leave = getattr(target, "exit_gf_mode", None)
+                    if callable(leave):
+                        leave()
+        except Exception:
+            # Roll back the button if the action failed so visual state stays honest.
+            block = self._gf_button.blockSignals(True)
+            self._gf_button.setChecked(getattr(target, "in_gf_mode", False))
+            self._gf_button.blockSignals(block)
 
 
 # ── Camera toolbar (presets + ortho/rotate + All windows toggle) ─────────────

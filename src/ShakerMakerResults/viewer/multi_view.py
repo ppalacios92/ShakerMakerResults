@@ -39,31 +39,12 @@ _PANE_DEFAULTS: list[str] = [
     "3D NE", "Top", "Front", "Right", "3D NW", "3D SW", "3D SE",
 ]
 
-#: (layout name, number of panes required) — order matches the toolbar.
+#: Kept as a legacy export — the new MultiViewArea uses recursive split /
+#: close instead of a fixed list of preset layouts, but downstream code or
+#: documentation may still reference :data:`LAYOUT_PRESETS`.
 LAYOUT_PRESETS: list[tuple[str, int]] = [
-    ("1×1", 1),
-    ("1×2", 2),
-    ("2×1", 2),
-    ("2×2", 4),
-    ("2+1", 3),
-    ("1+2", 3),
-    ("GF",  9),   # 3×3 Green Function tensor viewer
+    ("free", 99),
 ]
-
-# Promotion targets used by the per-frame split buttons.  The button never
-# shrinks the layout — it only "grows" to the next sensible preset along the
-# requested axis, mirroring ParaView's pqViewFrame.SplitHorizontal /
-# SplitVertical behaviour without rewriting the splitter tree from scratch.
-_SPLIT_H_PROMOTIONS: dict[str, str] = {
-    "1×1": "1×2",
-    "2×1": "2×2",
-    "1+2": "2×2",
-}
-_SPLIT_V_PROMOTIONS: dict[str, str] = {
-    "1×1": "2×1",
-    "1×2": "2×2",
-    "2+1": "2×2",
-}
 
 # GF layout: (adapter component id, viewport label) in row-major order.
 _GF_LAYOUT_COMPONENTS: list[tuple[str, str]] = [
@@ -402,48 +383,29 @@ class MultiViewArea(QtWidgets.QWidget):
         self._maximized_frame: ViewFrame | None = None
         self._active_pane: ViewPane | None = None
         self.on_active_pane_changed = None
-        self._current_layout: str = "1×1"
-        self._container: QtWidgets.QWidget | None = None
-        self._layout_n: dict[str, int] = dict(LAYOUT_PRESETS)
+        # Layout is now driven by per-frame split / close buttons rather than
+        # by a preset selector bar.  These attributes are kept (and faked) so
+        # the legacy toolbar code that reads ``_current_layout`` /
+        # ``_layout_n`` doesn't break.
+        self._current_layout: str = "free"
+        self._layout_n: dict[str, int] = {"free": 99}
         self._apply_camera_to_all_panes = False
         # Demand + component active before the GF 3×3 layout; both restored on exit.
         self._pre_gf_demand: str | None = None
         self._pre_gf_component: str | None = None
+        self._in_gf_mode: bool = False
+        # GF mode keeps a snapshot of the splitter tree so we can return to
+        # whatever the user had before launching the 3×3 view.
+        self._pre_gf_snapshot: tuple | None = None
+        # Mapping kept for backwards compat with toolbar / window code that
+        # still reads ``_layout_buttons`` (e.g. theme refresh).  Always empty
+        # in the new tree-based UI.
+        self._layout_buttons: dict[str, QtWidgets.QPushButton] = {}
+        self._layout_bar = None
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-
-        # ── Layout selector bar ───────────────────────────────────────────────
-        bar = QtWidgets.QWidget()
-        bar.setFixedHeight(30)
-        palette = active_palette()
-        bar.setStyleSheet(
-            f"background: {palette.surface_2}; "
-            f"border-bottom: 1px solid {palette.border};"
-        )
-        blay = QtWidgets.QHBoxLayout(bar)
-        blay.setContentsMargins(6, 3, 6, 3)
-        blay.setSpacing(3)
-
-        lbl = QtWidgets.QLabel("Layout:")
-        lbl.setStyleSheet(f"color: {palette.text_2}; font-size: 11px;")
-        blay.addWidget(lbl)
-
-        self._layout_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for name, _n in LAYOUT_PRESETS:
-            btn = QtWidgets.QPushButton(name)
-            w = 36 if name == "GF" else 44
-            btn.setFixedSize(w, 22)
-            btn.setCheckable(True)
-            btn.clicked.connect(lambda _c, n=name: self._switch_layout(n))
-            self._layout_buttons[name] = btn
-            blay.addWidget(btn)
-        self._refresh_layout_button_styles()
-
-        blay.addStretch(1)
-        root.addWidget(bar)
-        self._layout_bar = bar
 
         # ── Content area ──────────────────────────────────────────────────────
         # The vertical CameraViewRail used to live here.  As of the ParaView-
@@ -460,12 +422,15 @@ class MultiViewArea(QtWidgets.QWidget):
         self._content_stack = QtWidgets.QStackedWidget()
         body_lay.addWidget(self._content_stack, 1)
 
+        # Page 0 — the root container that holds the splitter tree (or the
+        # solitary frame in a 1-pane configuration).
         self._grid_host = QtWidgets.QWidget()
         self._grid_lay = QtWidgets.QVBoxLayout(self._grid_host)
         self._grid_lay.setContentsMargins(0, 0, 0, 0)
         self._grid_lay.setSpacing(0)
         self._content_stack.addWidget(self._grid_host)             # index 0
 
+        # Page 1 — host used when a single frame is temporarily maximised.
         self._max_host = QtWidgets.QWidget()
         self._max_lay = QtWidgets.QVBoxLayout(self._max_host)
         self._max_lay.setContentsMargins(0, 0, 0, 0)
@@ -474,46 +439,23 @@ class MultiViewArea(QtWidgets.QWidget):
 
         root.addWidget(body, 1)
 
-        # Start with a single pane.
-        self._switch_layout("1×1")
+        # ── Initial pane ─────────────────────────────────────────────────────
+        # Start with exactly one viewport; the user adds more via the
+        # split-H / split-V buttons that live on each view's title-bar.
+        first_pane = self._create_pane(_PANE_DEFAULTS[0])
+        first_frame = self._frame_for(first_pane)
+        self._grid_lay.addWidget(first_frame)
+        self._set_active_pane(first_pane)
+        self._refresh_close_visibility()
 
     # ── Theme ─────────────────────────────────────────────────────────────────
 
     def refresh_theme(self) -> None:
         """Repaint chrome and frame icons after a palette swap."""
-        palette = active_palette()
-        self._layout_bar.setStyleSheet(
-            f"background: {palette.surface_2}; "
-            f"border-bottom: 1px solid {palette.border};"
-        )
-        self._refresh_layout_button_styles()
+        # The old layout-selector bar is gone; only the per-frame title-bars
+        # need to be re-tinted.
         for frame in list(self._frames.values()):
             frame.refresh_theme()
-        # _view_rail is None now that the rail moved to the top toolbar — keep
-        # the attribute for backwards compatibility but skip the refresh.
-
-    def _refresh_layout_button_styles(self) -> None:
-        palette = active_palette()
-        for name, btn in self._layout_buttons.items():
-            if name == "GF":
-                btn.setStyleSheet(
-                    f"QPushButton {{ border: 1px solid {palette.accent_dark}; "
-                    f"border-radius: 3px; background: {palette.surface_3}; "
-                    f"color: {palette.accent_dark}; font-size: 11px; "
-                    f"font-weight: bold; }}"
-                    f"QPushButton:checked {{ background: {palette.surface_3}; "
-                    f"color: {palette.navy}; border-color: {palette.accent}; }}"
-                    f"QPushButton:hover:!checked {{ background: {palette.surface_3}; }}"
-                )
-            else:
-                btn.setStyleSheet(
-                    f"QPushButton {{ border: 1px solid {palette.border}; "
-                    f"border-radius: 3px; background: {palette.surface}; "
-                    f"color: {palette.text}; font-size: 11px; }}"
-                    f"QPushButton:checked {{ background: {palette.surface_3}; "
-                    f"color: {palette.navy}; border-color: {palette.accent}; }}"
-                    f"QPushButton:hover:!checked {{ background: {palette.surface_3}; }}"
-                )
 
     # ── Frame helpers ─────────────────────────────────────────────────────────
 
@@ -533,19 +475,29 @@ class MultiViewArea(QtWidgets.QWidget):
             self._frames[pane] = frame
         return frame
 
-    def _frame_close_visibility(self, panes: list[ViewPane]) -> None:
-        """Show / hide each frame's close button depending on the current layout.
+    def _create_pane(self, label: str = "3D NE") -> ViewPane:
+        """Instantiate a new :class:`ViewPane` and register it in ``self._panes``."""
+        pane = ViewPane(
+            self.session,
+            label=label,
+            on_activated=self._on_pane_activated,
+            parent=self,
+        )
+        self._panes.append(pane)
+        return pane
 
-        Closing the only frame in a 1×1 layout would leave an empty grid, so
-        we just hide the button instead of disabling it (matches ParaView).
+    def _refresh_close_visibility(self) -> None:
+        """Show / hide every frame's close button.
+
+        The very last remaining pane never shows a close button — closing it
+        would leave the grid empty.  Once a second pane exists the close
+        button reappears on both.
         """
-        allow_close = len(panes) > 1
-        for pane in panes:
-            frame = self._frames.get(pane)
-            if frame is not None:
-                frame.set_close_button_visible(allow_close)
+        allow_close = len(self._panes) > 1
+        for frame in self._frames.values():
+            frame.set_close_button_visible(allow_close)
 
-    # ── Layout switching ──────────────────────────────────────────────────────
+    # ── Camera presets ────────────────────────────────────────────────────────
 
     def _apply_camera_preset(self, key: str) -> None:
         """Apply a camera preset from the left view rail."""
@@ -568,8 +520,9 @@ class MultiViewArea(QtWidgets.QWidget):
         return [self._active_pane] if self._active_pane is not None else []
 
     def visible_panes(self) -> list[ViewPane]:
-        needed = self._layout_n.get(self._current_layout, 1)
-        return self._panes[: max(0, min(needed, len(self._panes)))]
+        """Every live pane is visible — the recursive splitter tree decides
+        the geometry; there is no longer a layout-preset filter."""
+        return list(self._panes)
 
     def apply_selection_filter(self, mode: str, *, apply_to_all: bool = False):
         panes = self.visible_panes() if apply_to_all else [self._active_pane]
@@ -612,156 +565,86 @@ class MultiViewArea(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _switch_layout(self, name: str):
-        """Switch to layout *name*, creating panes / frames as needed."""
-        if name not in self._layout_n:
-            return
+    # ── Recursive split / close ──────────────────────────────────────────────
 
-        # Exit any maximised view before re-laying-out the grid.
+    def _on_frame_split_h(self, frame: ViewFrame) -> None:
+        """Split *frame* horizontally — new pane appears to its right."""
+        self._split_frame(frame, QtCore.Qt.Horizontal)
+
+    def _on_frame_split_v(self, frame: ViewFrame) -> None:
+        """Split *frame* vertically — new pane appears below it."""
+        self._split_frame(frame, QtCore.Qt.Vertical)
+
+    def _split_frame(self, frame: ViewFrame, orientation) -> None:
+        """Recursively split *frame* into two along *orientation*.
+
+        Algorithm:
+
+        * If *frame*'s parent is already a ``QSplitter`` with the same
+          orientation → just insert a fresh frame next to it.  This is the
+          common case and keeps the splitter tree flat.
+        * Otherwise → wrap *frame* (and the new frame) inside a brand-new
+          mini-splitter and substitute that splitter in the original
+          parent slot.  Works at any tree depth.
+        * If *frame* is parented directly to ``_grid_lay`` (i.e. we are in
+          the 1-pane configuration) → wrap into a new top-level splitter
+          inside the grid layout.
+        """
+        # If a frame is currently maximised, restoring first keeps the
+        # parent/index lookup honest.
         if self._maximized_frame is not None:
             self._maximized_frame.set_maximized_state(False)
             self._restore_maximised_frame()
 
-        old_layout = self._current_layout
-        needed = self._layout_n.get(name, 1)
+        new_pane = self._create_pane(_PANE_DEFAULTS[len(self._panes) % len(_PANE_DEFAULTS)])
+        new_frame = self._frame_for(new_pane)
 
-        # 1. Detach all panes / frames from the current container.
-        for pane in self._panes:
-            frame = self._frames.get(pane)
-            target = frame if frame is not None else pane
-            target.setParent(self)
-            target.hide()
+        parent = frame.parentWidget()
 
-        # 2. Remove and schedule the old container for deletion.
-        if self._container is not None:
-            self._grid_lay.removeWidget(self._container)
-            self._container.setParent(None)
-            self._container.deleteLater()
-            self._container = None
-
-        # 3. Create additional panes if the layout needs more than we have.
-        while len(self._panes) < needed:
-            label = _PANE_DEFAULTS[len(self._panes) % len(_PANE_DEFAULTS)]
-            pane = ViewPane(
-                self.session,
-                label=label,
-                on_activated=self._on_pane_activated,
-                parent=self,
-            )
-            self._panes.append(pane)
-
-        # Materialise frames for every pane we are about to show.
-        panes_for_layout = self._panes[:needed]
-        for pane in panes_for_layout:
-            self._frame_for(pane)
-
-        # 4. Build the new splitter/container.
-        self._container = self._build_container(name, panes_for_layout)
-        self._grid_lay.addWidget(self._container)
-        self._container.show()
-
-        for pane in panes_for_layout:
-            frame = self._frames[pane]
-            frame.show()
-
-        # 5. Ensure a valid active pane.
-        if self._active_pane not in panes_for_layout:
-            self._set_active_pane(panes_for_layout[0] if panes_for_layout else None)
+        # Case 1 — same-orientation splitter: insert in-place.
+        if isinstance(parent, QtWidgets.QSplitter) and parent.orientation() == orientation:
+            idx = parent.indexOf(frame)
+            sizes = parent.sizes()
+            parent.insertWidget(idx + 1, new_frame)
+            # Split the existing slot in half between the original and the new frame.
+            if 0 <= idx < len(sizes):
+                half = max(1, sizes[idx] // 2)
+                sizes[idx] = half
+                sizes.insert(idx + 1, half)
+                parent.setSizes(sizes)
         else:
-            # Refresh the active flag on the (still-active) pane's frame.
-            self._set_active_pane(self._active_pane)
+            # Case 2 / 3 — different orientation or top-level: wrap.
+            new_splitter = QtWidgets.QSplitter(orientation)
+            new_splitter.setChildrenCollapsible(False)
 
-        # 6. Sync button states.
-        self._current_layout = name
-        for n, btn in self._layout_buttons.items():
-            btn.setChecked(n == name)
+            if isinstance(parent, QtWidgets.QSplitter):
+                idx = parent.indexOf(frame)
+                outer_sizes = parent.sizes()
+                # replaceWidget is available since Qt 5.13.  If unavailable
+                # we fall back to the insert/remove dance.
+                try:
+                    parent.replaceWidget(idx, new_splitter)
+                except AttributeError:
+                    frame.setParent(None)
+                    parent.insertWidget(idx, new_splitter)
+                new_splitter.addWidget(frame)
+                new_splitter.addWidget(new_frame)
+                new_splitter.setSizes([100, 100])
+                parent.setSizes(outer_sizes)
+            else:
+                # Frame is a direct child of the grid layout (single-pane root).
+                self._grid_lay.removeWidget(frame)
+                new_splitter.addWidget(frame)
+                new_splitter.addWidget(new_frame)
+                new_splitter.setSizes([100, 100])
+                self._grid_lay.addWidget(new_splitter)
 
-        # 7. Frame close visibility — hidden on the only pane of 1×1.
-        self._frame_close_visibility(panes_for_layout)
-
-        # 8. GF-specific configuration.
-        if name == "GF":
-            self._apply_gf_layout(panes_for_layout)
-        elif old_layout == "GF":
-            self._clear_gf_layout(panes_for_layout)
-
-        # Show the grid page in the content stack.
-        self._content_stack.setCurrentIndex(0)
-
-    def _build_container(
-        self, name: str, panes: list[ViewPane]
-    ) -> QtWidgets.QWidget:
-        """Assemble a splitter tree for *name* using the given pane list.
-
-        The splitter holds *frames* (so the title-bar / border are always
-        visible) rather than raw panes.
-        """
-
-        def _h(*frames) -> QtWidgets.QSplitter:
-            s = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-            s.setChildrenCollapsible(False)
-            for f in frames:
-                s.addWidget(f)
-            return s
-
-        def _v(*frames) -> QtWidgets.QSplitter:
-            s = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-            s.setChildrenCollapsible(False)
-            for f in frames:
-                s.addWidget(f)
-            return s
-
-        frames = [self._frame_for(p) for p in panes]
-
-        if name == "1×1":
-            w = QtWidgets.QWidget()
-            lay = QtWidgets.QVBoxLayout(w)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.addWidget(frames[0])
-            return w
-
-        if name == "1×2":
-            return _h(frames[0], frames[1])
-
-        if name == "2×1":
-            return _v(frames[0], frames[1])
-
-        if name == "2×2":
-            return _v(_h(frames[0], frames[1]), _h(frames[2], frames[3]))
-
-        if name == "2+1":
-            outer = _v(_h(frames[0], frames[1]), frames[2])
-            outer.setSizes([600, 300])
-            return outer
-
-        if name == "1+2":
-            outer = _v(frames[0], _h(frames[1], frames[2]))
-            outer.setSizes([300, 600])
-            return outer
-
-        if name == "GF":
-            row0 = _h(frames[0], frames[1], frames[2])
-            row1 = _h(frames[3], frames[4], frames[5])
-            row2 = _h(frames[6], frames[7], frames[8])
-            return _v(row0, row1, row2)
-
-        return _h(*frames)
-
-    # ── Frame-button handlers ────────────────────────────────────────────────
-
-    def _on_frame_split_h(self, frame: ViewFrame) -> None:
-        target = _SPLIT_H_PROMOTIONS.get(self._current_layout)
-        if target is not None:
-            self._switch_layout(target)
-
-    def _on_frame_split_v(self, frame: ViewFrame) -> None:
-        target = _SPLIT_V_PROMOTIONS.get(self._current_layout)
-        if target is not None:
-            self._switch_layout(target)
+        new_frame.show()
+        self._set_active_pane(new_pane)
+        self._refresh_close_visibility()
 
     def _on_frame_maximize_toggle(self, frame: ViewFrame, wants_maximized: bool):
         if wants_maximized:
-            # Restore any previous maximised frame first.
             if self._maximized_frame is not None and self._maximized_frame is not frame:
                 self._maximized_frame.set_maximized_state(False)
                 self._restore_maximised_frame()
@@ -779,21 +662,97 @@ class MultiViewArea(QtWidgets.QWidget):
             self._dock_frame(frame)
 
     def _on_frame_close(self, frame: ViewFrame) -> None:
-        # "Closing" reduces the current layout by one preset slot.  For the
-        # grid presets we walk back through the LAYOUT_PRESETS to the closest
-        # smaller compatible one.  This mirrors ParaView's "close pane"
-        # behaviour without rewriting splitter trees by hand.
-        downgrades = {
-            "1×2": "1×1",
-            "2×1": "1×1",
-            "2×2": "1×2",
-            "2+1": "1×2",
-            "1+2": "1×2",
-            "GF":  "1×1",
-        }
-        target = downgrades.get(self._current_layout)
-        if target is not None:
-            self._switch_layout(target)
+        """Remove *frame* from the splitter tree and collapse trivial nodes.
+
+        * Never closes the last remaining pane.
+        * After removal, if the parent splitter is left with a single child,
+          that child takes the splitter's slot in the grandparent (or in the
+          top-level grid layout).  This keeps the tree minimal and prevents
+          a chain of empty splitters from accumulating.
+        """
+        if len(self._panes) <= 1:
+            return
+
+        pane = frame.pane
+        if not isinstance(pane, ViewPane):
+            return
+
+        # Drop popout window first (if any).
+        if pane in self._popout_windows:
+            try:
+                win = self._popout_windows.pop(pane)
+                win.setCentralWidget(None)
+                win.close()
+                win.deleteLater()
+            except Exception:
+                pass
+
+        parent = frame.parentWidget()
+
+        # Remove and dispose the frame + pane.
+        if isinstance(parent, QtWidgets.QSplitter):
+            sizes = parent.sizes()
+            frame.setParent(None)
+            parent.setSizes([s for s in sizes if s])  # rebalance roughly
+        else:
+            self._grid_lay.removeWidget(frame)
+            frame.setParent(None)
+
+        try:
+            pane.dispose()
+        except Exception:
+            pass
+        try:
+            frame.deleteLater()
+        except Exception:
+            pass
+        self._frames.pop(pane, None)
+        if pane in self._panes:
+            self._panes.remove(pane)
+
+        # Collapse splitters that have been reduced to a single child.
+        if isinstance(parent, QtWidgets.QSplitter):
+            self._collapse_lonely_splitter(parent)
+
+        # Pick a new active pane.
+        if self._active_pane is pane:
+            self._set_active_pane(self._panes[0] if self._panes else None)
+        self._refresh_close_visibility()
+
+    def _collapse_lonely_splitter(self, splitter: QtWidgets.QSplitter) -> None:
+        """If *splitter* has zero or one widget left, replace it with the
+        survivor in its grandparent (or remove it entirely)."""
+        if splitter.count() > 1:
+            return
+
+        grandparent = splitter.parentWidget()
+
+        if splitter.count() == 1:
+            sole = splitter.widget(0)
+            sole.setParent(None)
+            if isinstance(grandparent, QtWidgets.QSplitter):
+                gp_idx = grandparent.indexOf(splitter)
+                gp_sizes = grandparent.sizes()
+                try:
+                    grandparent.replaceWidget(gp_idx, sole)
+                except AttributeError:
+                    splitter.setParent(None)
+                    grandparent.insertWidget(gp_idx, sole)
+                grandparent.setSizes(gp_sizes)
+                # Recurse: replacing may have left the grandparent itself
+                # with only one child if it had two and one was *this*.
+                self._collapse_lonely_splitter(grandparent)
+            else:
+                # splitter was top-level — promote sole to take its slot.
+                self._grid_lay.removeWidget(splitter)
+                self._grid_lay.addWidget(sole)
+
+        # splitter is now empty (or its sole child was promoted) — destroy.
+        try:
+            splitter.setParent(None)
+            splitter.deleteLater()
+        except Exception:
+            pass
 
     # ── Maximise / restore ───────────────────────────────────────────────────
 
@@ -824,8 +783,10 @@ class MultiViewArea(QtWidgets.QWidget):
         if isinstance(splitter, QtWidgets.QSplitter) and index is not None:
             splitter.insertWidget(index, frame)
         else:
-            # Fallback: rebuild the current layout from scratch.
-            self._switch_layout(self._current_layout)
+            # Fallback: re-attach directly to the top-level grid layout.
+            # Happens only when the maximised frame was a sole top-level
+            # child (1-pane configuration) — re-parenting is enough.
+            self._grid_lay.addWidget(frame)
         frame.show()
         self._maximized_frame = None
         self._content_stack.setCurrentIndex(0)
@@ -874,21 +835,51 @@ class MultiViewArea(QtWidgets.QWidget):
             origin_splitter.insertWidget(int(origin_index), frame)
             frame.show()
         else:
-            # Could not find an origin slot — rebuild the layout to recover.
-            self._switch_layout(self._current_layout)
+            # Could not find an origin slot — re-attach to the top grid layout
+            # so the frame still lives somewhere visible.
+            self._grid_lay.addWidget(frame)
+            frame.show()
         try:
             win.close()
             win.deleteLater()
         except Exception:
             pass
 
-    # ── GF layout helpers ─────────────────────────────────────────────────────
+    # ── GF mode (3×3 Green Function tensor view) ─────────────────────────────
 
-    def _apply_gf_layout(self, panes: list) -> None:
+    def toggle_gf_mode(self) -> bool:
+        """Flip in or out of the dedicated 3×3 GF tensor view.
+
+        Returns ``True`` if GF mode is active after the call.
+        """
+        if self._in_gf_mode:
+            self.exit_gf_mode()
+        else:
+            self.enter_gf_mode()
+        return self._in_gf_mode
+
+    @property
+    def in_gf_mode(self) -> bool:
+        return self._in_gf_mode
+
+    def enter_gf_mode(self) -> None:
+        """Tear down the current splitter tree and build a 9-pane GF grid.
+
+        The pre-existing demand / component is captured so :meth:`exit_gf_mode`
+        can restore the view the user had before launching GF mode.
+        Re-entering while already in GF mode is a no-op.
+        """
+        if self._in_gf_mode:
+            return
         session = self.session
         self._pre_gf_demand = session.state.demand
         self._pre_gf_component = session.state.component
 
+        # 1. Drop every existing pane / splitter from the tree.
+        self._teardown_all_panes()
+
+        # 2. Pre-warm all 9 GF series under one BusyDialog so playback in the
+        #    new panes is instant.
         if session.adapter.has_gf and session.adapter.has_map:
             sf = int(getattr(session, "_display_gf_subfault", 0))
             window = getattr(session, "window", None)
@@ -901,7 +892,6 @@ class MultiViewArea(QtWidgets.QWidget):
                 )
                 busy.show()
                 QtWidgets.QApplication.processEvents()
-
             for idx in range(9):
                 comp_label = _GF_LAYOUT_COMPONENTS[idx][1]
                 if busy is not None:
@@ -917,87 +907,158 @@ class MultiViewArea(QtWidgets.QWidget):
                 if busy is not None:
                     busy.set_step(idx + 1)
                     QtWidgets.QApplication.processEvents()
-
             if busy is not None:
                 busy.close()
 
-        for pane, (comp, label) in zip(panes, _GF_LAYOUT_COMPONENTS):
+        # 3. Build 9 fresh panes, pinned to G_ij.
+        gf_panes: list[ViewPane] = []
+        for comp, label in _GF_LAYOUT_COMPONENTS:
+            pane = self._create_pane(label)
             try:
-                scene = getattr(pane, "scene", None)
-                if scene is None:
-                    continue
-                try:
-                    pane.plotter.view_xy()
-                    pane.plotter.enable_parallel_projection()
-                except Exception:
-                    pass
-                scene.set_gf_component_pin(comp, label)
-                frame = self._frames.get(pane)
-                if frame is not None:
-                    frame.set_title(label)
+                pane.plotter.view_xy()
+                pane.plotter.enable_parallel_projection()
             except Exception:
                 pass
+            try:
+                pane.scene.set_gf_component_pin(comp, label)
+            except Exception:
+                pass
+            gf_panes.append(pane)
 
+        # 4. Assemble the 3×3 splitter tree (vertical of three horizontals).
+        def _row(*panes: ViewPane) -> QtWidgets.QSplitter:
+            s = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+            s.setChildrenCollapsible(False)
+            for p in panes:
+                s.addWidget(self._frame_for(p))
+            return s
+
+        root_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        root_splitter.setChildrenCollapsible(False)
+        root_splitter.addWidget(_row(gf_panes[0], gf_panes[1], gf_panes[2]))
+        root_splitter.addWidget(_row(gf_panes[3], gf_panes[4], gf_panes[5]))
+        root_splitter.addWidget(_row(gf_panes[6], gf_panes[7], gf_panes[8]))
+        self._grid_lay.addWidget(root_splitter)
+
+        # 5. Switch the session demand → GF.  The window broadcast will
+        #    rebuild each pane through its component pin.
         if session.adapter.has_gf and session.adapter.has_map:
             if session.state.demand != "gf":
                 session.set_demand("gf")
             else:
-                for pane in panes:
+                for pane in gf_panes:
                     try:
                         if pane.scene is not None:
                             pane.scene.rebuild_scalar_actor(render=False)
                             pane.plotter.render()
                     except Exception:
                         pass
-        else:
-            for pane in panes:
-                try:
-                    if pane.scene is not None:
-                        pane.scene.rebuild_scalar_actor(render=False)
-                        pane.plotter.render()
-                except Exception:
-                    pass
 
-    def _clear_gf_layout(self, panes_for_new_layout: list) -> None:
+        self._set_active_pane(gf_panes[0])
+        self._refresh_close_visibility()
+        self._in_gf_mode = True
+
+    def exit_gf_mode(self) -> None:
+        """Tear down the GF grid and restore a single pane with the prior demand."""
+        if not self._in_gf_mode:
+            return
         session = self.session
-
-        for pane in self._panes:
+        # Clear pins on every still-present pane so a stale override can't
+        # bleed into the next layout.
+        for pane in list(self._panes):
             try:
                 scene = getattr(pane, "scene", None)
-                if scene is not None and scene._gf_component_pin is not None:
+                if scene is not None and getattr(scene, "_gf_component_pin", None) is not None:
                     scene.set_gf_component_pin(None, None)
             except Exception:
                 pass
-            # Restore the frame title to the pane's original label.
-            frame = self._frames.get(pane)
-            if frame is not None:
-                frame.set_title(pane.label)
 
+        self._teardown_all_panes()
+
+        # Recreate a fresh single pane.
+        pane = self._create_pane(_PANE_DEFAULTS[0])
+        self._grid_lay.addWidget(self._frame_for(pane))
+        self._set_active_pane(pane)
+        self._refresh_close_visibility()
+
+        # Restore pre-GF demand + component.
         pre_demand = self._pre_gf_demand
-        pre_comp   = self._pre_gf_component
-        self._pre_gf_demand    = None
+        pre_comp = self._pre_gf_component
+        self._pre_gf_demand = None
         self._pre_gf_component = None
-
+        if pre_comp is not None:
+            try:
+                session.state.set_component(pre_comp)
+            except Exception:
+                pass
         if pre_demand is not None and pre_demand != session.state.demand:
-            if pre_comp is not None:
-                try:
-                    session.state.set_component(pre_comp)
-                except Exception:
-                    pass
-            session.set_demand(pre_demand)
+            try:
+                session.set_demand(pre_demand)
+            except Exception:
+                pass
         else:
-            if pre_comp is not None:
+            try:
+                if pane.scene is not None:
+                    pane.scene.rebuild_scalar_actor(render=False)
+                    pane.plotter.render()
+            except Exception:
+                pass
+
+        self._in_gf_mode = False
+
+    def _teardown_all_panes(self) -> None:
+        """Remove every widget from the grid layout and dispose every pane.
+
+        Used when entering / exiting GF mode where we want a clean slate.
+        Splitters embedded in the layout are deleted along with their
+        descendants; each pane's VTK context is released through
+        :meth:`ViewPane.dispose`.
+        """
+        # First, dispose any popout windows.
+        for win in list(self._popout_windows.values()):
+            try:
+                win.setCentralWidget(None)
+                win.close()
+                win.deleteLater()
+            except Exception:
+                pass
+        self._popout_windows.clear()
+
+        # Exit any maximised view so all frames live in the grid stack.
+        if self._maximized_frame is not None:
+            try:
+                self._maximized_frame.set_maximized_state(False)
+            except Exception:
+                pass
+            self._maximized_frame = None
+            self._content_stack.setCurrentIndex(0)
+            # Clear the maximize host (the frame inside is about to be disposed).
+            while self._max_lay.count() > 0:
+                item = self._max_lay.takeAt(0)
+                w = item.widget() if item is not None else None
+                if w is not None:
+                    w.setParent(None)
+
+        # Pop every widget out of the grid layout (splitters or solo frame).
+        while self._grid_lay.count() > 0:
+            item = self._grid_lay.takeAt(0)
+            w = item.widget() if item is not None else None
+            if w is not None:
+                w.setParent(None)
                 try:
-                    session.state.set_component(pre_comp)
+                    w.deleteLater()
                 except Exception:
                     pass
-            for pane in panes_for_new_layout:
-                try:
-                    if pane.scene is not None:
-                        pane.scene.rebuild_scalar_actor(render=False)
-                        pane.plotter.render()
-                except Exception:
-                    pass
+
+        # Dispose every pane (releases VTK + matplotlib resources).
+        for pane in list(self._panes):
+            try:
+                pane.dispose()
+            except Exception:
+                pass
+        self._panes.clear()
+        self._frames.clear()
+        self._active_pane = None
 
     # ── Active pane ───────────────────────────────────────────────────────────
 
@@ -1032,9 +1093,12 @@ class MultiViewArea(QtWidgets.QWidget):
     # ── Session broadcast ─────────────────────────────────────────────────────
 
     def on_session_updated(self, reason: str):
-        """Broadcast *reason* to every pane that is currently visible."""
-        needed = self._layout_n.get(self._current_layout, 1)
-        for pane in self._panes[:needed]:
+        """Broadcast *reason* to every live pane.
+
+        With the recursive split / close model every entry in ``self._panes``
+        is on screen, so we simply iterate over them all.
+        """
+        for pane in list(self._panes):
             pane.on_session_updated(reason)
 
     def dispose(self) -> None:
@@ -1072,17 +1136,16 @@ class MultiViewArea(QtWidgets.QWidget):
         self._panes.clear()
         self._active_pane = None
 
-        if self._container is not None:
-            try:
-                self._grid_lay.removeWidget(self._container)
-            except Exception:
-                pass
-            try:
-                self._container.setParent(None)
-                self._container.deleteLater()
-            except Exception:
-                pass
-            self._container = None
+        # Drain any remaining splitter trees still parented to the grid host.
+        while self._grid_lay.count() > 0:
+            item = self._grid_lay.takeAt(0)
+            w = item.widget() if item is not None else None
+            if w is not None:
+                try:
+                    w.setParent(None)
+                    w.deleteLater()
+                except Exception:
+                    pass
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
