@@ -256,8 +256,20 @@ class ViewerScene:
         self.point_actor = self._add_point_actor()
         if self.session.state.vector_field_enabled:
             self.refresh_vector_field(render=False)
+        # Branding doubles as the in-scene HUD (field / range / warp);
+        # rebuild it so a demand-or-warp switch reflects in the corner
+        # text without waiting for a separate appearance broadcast.
+        self._refresh_branding()
         if render:
             self.plotter.render()
+
+    def _refresh_branding(self) -> None:
+        """Remove + re-add the branding/HUD actor with the current state."""
+        try:
+            self.plotter.remove_actor("branding", render=False)
+        except Exception:
+            pass
+        self._add_branding()
 
     def refresh_selection(self, render: bool = True):
         if self.selection_actor is not None:
@@ -767,13 +779,12 @@ class ViewerScene:
         self.plotter.set_background(self.session.current_background_color())
         # VTK text actors bake their colour at creation time — the branding
         # block and the GF component label keep their *original* foreground
-        # colour even after the renderer background changes.  Remove and
-        # re-add them so they always read against the current scene.
-        try:
-            self.plotter.remove_actor("branding", render=False)
-        except Exception:
-            pass
-        self._add_branding()
+        # colour even after the renderer background changes.  Re-create the
+        # branding so it reads against the current scene.  ``rebuild_scalar_actor``
+        # below will refresh it again (with up-to-date demand / range / warp
+        # text) but doing it here first guarantees the right colour even on
+        # paths that skip the rebuild.
+        self._refresh_branding()
         if self._gf_component_pin is not None and self._gf_label_actor is not None:
             try:
                 self.plotter.remove_actor(self._gf_label_actor, render=False)
@@ -1007,21 +1018,37 @@ class ViewerScene:
         return f"{sign}{value:g}"
 
     def _add_branding(self):
-        """Add a small title block to the upper-left corner of the 3-D viewport."""
-        project_name = self.session.adapter.summary().name
-        lines = [
-            "ShakerMaker Results",
-            "By: Ladruno Team",
-            "2026 - V 1.0.0",
-            "An Interactive View for ShakerMaker Tool",
-            ".h5drm files supported",
-            f"PRY: {project_name}",
-        ]
+        """Add a compact branding + state HUD to the upper-left corner.
+
+        Two short lines:
+
+        1. ``ShakerMaker Results · <project name>`` — the sobrio header.
+        2. ``<demand>/<component> · range [vmin, vmax] · warp on/off`` —
+           a status HUD so the user always knows what the renderer is
+           showing without consulting any side dock.
+
+        Old ``By: Ladruno Team / Version / Description`` lines moved out
+        to ``Help → About`` (paper / poster captures stay clean).
+        """
+        project_name = self.session.adapter.summary().name or "model"
+        state = self.session.state
+        demand = state.demand or "—"
+        component = state.component or "—"
+        try:
+            vmin, vmax = self.session.current_color_limits()
+            range_text = f"range [{vmin:.3g}, {vmax:.3g}]"
+        except Exception:
+            range_text = "range —"
+        warp_text = "warp on" if getattr(state, "disp_warp_enabled", False) else "warp off"
+
+        header = f"ShakerMaker Results  ·  {project_name}"
+        status = f"{demand} / {component}    {range_text}    {warp_text}"
+
         try:
             self.plotter.add_text(
-                "\n".join(lines),
+                f"{header}\n{status}",
                 position="upper_left",
-                font_size=7,
+                font_size=8,
                 color=self._foreground_color(secondary=True),
                 shadow=False,
                 name="branding",

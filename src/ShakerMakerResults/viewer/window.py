@@ -79,8 +79,10 @@ def _settings() -> "QtCore.QSettings":
 #: ``(key, title, area, default_visible)``
 #: ``key`` matches the dock factory in ``_init_dock_factories``.
 _DOCK_SPECS: list[tuple[str, str, str, bool]] = [
-    # Left column — inspection / data context + global appearance
-    ("pipeline",    "Pipeline Browser", "left",  True),
+    # Left column — inspection / data context + global appearance.
+    # Scene Browser starts hidden by default (it adds little over a click
+    # on the Properties tab directly); discoverable through View → Panels.
+    ("pipeline",    "Scene Browser",    "left",  False),
     ("properties",  "Properties",       "left",  True),
     ("information", "Information",      "left",  True),
     ("appearance",  "Appearance",       "left",  True),

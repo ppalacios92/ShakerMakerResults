@@ -231,10 +231,16 @@ class PipelineBrowser(QtWidgets.QTreeWidget):
 # ── Dock wrapper ─────────────────────────────────────────────────────────────
 
 class PipelineBrowserDock(QtWidgets.QDockWidget):
-    """:class:`QDockWidget` shell around :class:`PipelineBrowser`."""
+    """:class:`QDockWidget` shell around :class:`PipelineBrowser`.
+
+    Titled "Scene Browser" externally — the old "Pipeline Browser" name
+    implied ParaView-style source/filter pipelines we do not actually
+    implement.  The new name better describes what the tree shows: the
+    objects currently composing the rendered scene.
+    """
 
     def __init__(self, session, parent=None):
-        super().__init__("Pipeline Browser", parent)
+        super().__init__("Scene Browser", parent)
         self.setObjectName("Dock_pipeline")
         self.setAllowedAreas(
             QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
