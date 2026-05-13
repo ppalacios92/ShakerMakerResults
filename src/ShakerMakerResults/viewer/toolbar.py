@@ -37,9 +37,39 @@ except ImportError:
 
 
 # ── ffmpeg path ───────────────────────────────────────────────────────────────
-# Set this to your local ffmpeg.exe if ffmpeg is not on the system PATH.
-# Leave as None to rely on the system PATH or imageio-ffmpeg auto-detection.
-FFMPEG_EXE: str | None = r"C:\Dropbox\01. Brain\10. Ph.D U ANDES\21. ffmpeg\ffmpeg-2025-09-18-git-c373636f55-essentials_build\bin\ffmpeg.exe"
+# Resolution order (first hit wins):
+#   1. ``SHAKERMAKER_FFMPEG`` env var -- explicit override per machine.
+#   2. ``shutil.which("ffmpeg")``     -- normal PATH lookup.
+#   3. ``imageio_ffmpeg`` bundled binary, when the package is installed.
+#   4. ``None``                       -- recording paths fall back to GIF
+#      output or warn the user.
+#
+# Historical note: this used to be a hard-coded path to a private Dropbox
+# install. Anyone who needs a specific binary can still point at it via
+# the env var without editing the source.
+import os as _os
+import shutil as _shutil
+
+
+def _resolve_ffmpeg_path() -> str | None:
+    """Return the ffmpeg binary path or ``None`` when no candidate is found."""
+    env_path = _os.environ.get("SHAKERMAKER_FFMPEG")
+    if env_path and _os.path.isfile(env_path):
+        return env_path
+    on_path = _shutil.which("ffmpeg")
+    if on_path:
+        return on_path
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and _os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+    return None
+
+
+FFMPEG_EXE: str | None = _resolve_ffmpeg_path()
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -85,6 +115,7 @@ class _ToolBarBase(QtWidgets.QToolBar):
     """
 
     def __init__(self, title: str, multi_view, session, parent=None):
+        """Stash references to the multi-view + session and set common toolbar defaults."""
         super().__init__(title, parent)
         self._multi_view = multi_view
         self._session = session
@@ -194,6 +225,7 @@ class _ToolBarBase(QtWidgets.QToolBar):
 
     # Optional disposer; specific toolbars override if they hold resources.
     def dispose(self) -> None:
+        """Release any per-toolbar resources. Default is a no-op; ``CaptureToolBar`` overrides."""
         return None
 
 
@@ -208,15 +240,18 @@ class _AllWindowsState:
     """
 
     def __init__(self, multi_view):
+        """Hold a reference to the multi-view and start with "All windows" off."""
         self._multi_view = multi_view
         self._enabled = False
         self._subscribers: list = []
 
     @property
     def enabled(self) -> bool:
+        """Return ``True`` when "All windows" is currently active."""
         return self._enabled
 
     def set(self, value: bool) -> None:
+        """Update the flag, push it to the multi-view and notify every subscriber."""
         value = bool(value)
         if value == self._enabled:
             return
@@ -234,6 +269,7 @@ class _AllWindowsState:
                 pass
 
     def subscribe(self, cb) -> None:
+        """Register a callback ``cb(value: bool)`` fired every time the flag flips."""
         self._subscribers.append(cb)
 
 
@@ -254,6 +290,7 @@ class ApplyTargetToolBar(_ToolBarBase):
     targetChanged = QtCore.Signal(str)
 
     def __init__(self, multi_view, session, all_state: "_AllWindowsState", parent=None):
+        """Build the "Apply to" combo with three entries (Active pane / Current tab / All panes)."""
         super().__init__("Apply to", multi_view, session, parent)
         self._all_state = all_state
         label = QtWidgets.QLabel(" Apply to ")
@@ -280,12 +317,14 @@ class ApplyTargetToolBar(_ToolBarBase):
         self.addWidget(self._combo)
 
     def target(self) -> str:
+        """Return the current "Apply to" data key (``"pane"`` / ``"tab"`` / ``"all"``)."""
         try:
             return str(self._combo.currentData() or "all")
         except Exception:
             return "all"
 
     def set_target(self, value: str) -> None:
+        """Programmatically set the combo to ``value`` (one of ``pane`` / ``tab`` / ``all``)."""
         idx = self._combo.findData(str(value))
         if idx < 0:
             return
@@ -325,6 +364,7 @@ class ViewPresetsToolBar(_ToolBarBase):
     """
 
     def __init__(self, multi_view, session, all_state: "_AllWindowsState", parent=None):
+        """Build the orthographic / iso preset buttons plus the GF 3x3 toggle."""
         super().__init__("View Presets", multi_view, session, parent)
         self._all_state = all_state
         self._gf_button: QtWidgets.QToolButton | None = None
@@ -440,6 +480,7 @@ class CameraToolBar(_ToolBarBase):
     """Camera fit / projection / rotate buttons + ``All windows`` checkbox."""
 
     def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        """Build the camera fit / ortho / rotate buttons and the All-windows checkbox."""
         super().__init__("Camera", multi_view, session, parent)
         self._all_state = all_state
 
@@ -538,6 +579,7 @@ class OverlaysToolBar(_ToolBarBase):
     """Toggle visibility of helper overlays (orientation axes, bbox, stations)."""
 
     def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        """Build the three overlay buttons (Axes / BBox / Stations) with default state."""
         super().__init__("Overlays", multi_view, session, parent)
         self._all_state = all_state
         self._show_bbox = False
@@ -624,6 +666,7 @@ class SelectionToolBar(_ToolBarBase):
     """Selection-filter buttons (delegates to MultiViewArea.apply_selection_filter)."""
 
     def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        """Build the four selection-filter buttons (Show All / Show Sel / Hide Sel / Reset)."""
         super().__init__("Selection", multi_view, session, parent)
         self._all_state = all_state
 
@@ -671,6 +714,7 @@ class CaptureToolBar(_ToolBarBase):
     """
 
     def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        """Build the Screenshot button + the Record toggle (recording starts disabled)."""
         super().__init__("Capture", multi_view, session, parent)
         self._all_state = all_state
         self._recording = False
@@ -766,6 +810,7 @@ class CaptureToolBar(_ToolBarBase):
         self._record_btn.blockSignals(False)
 
     def write_frame_if_recording(self):
+        """Grab the viewer window and push one frame to the open writer (no-op when idle)."""
         if not self._recording or self._recording_writer is None:
             return
         try:
@@ -833,6 +878,7 @@ class CaptureToolBar(_ToolBarBase):
                 pass
 
     def dispose(self) -> None:
+        """Stop any in-flight recording before the window tears the toolbar down."""
         try:
             self._stop_recording()
         except Exception:
@@ -845,6 +891,7 @@ class DisplayToolBar(_ToolBarBase):
     """Node opacity slider."""
 
     def __init__(self, multi_view, session, all_state: _AllWindowsState, parent=None):
+        """Build the opacity slider that drives ``ViewerSession.set_node_opacity``."""
         super().__init__("Display", multi_view, session, parent)
         self._all_state = all_state
 

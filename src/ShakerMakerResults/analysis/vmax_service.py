@@ -1,4 +1,15 @@
-"""vmax cache helpers."""
+"""
+vmax_service.py
+===============
+Compute (and persist) the per-component colour limits used by every
+surface / animation plot.
+
+Scanning every node of a large file would blow up RAM, so we walk the
+HDF5 datasets in chunks of ~120 rows and accumulate the per-component
+absolute maxima plus the resultant maximum. The result is stored on
+``model._vmax`` and dumped to a tiny JSON sidecar next to the original
+file (``<file>.vmax.json``) so future runs can skip the scan entirely.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +20,27 @@ import numpy as np
 
 
 def compute_vmax(model):
-    """Compute and cache global colour limits for surface plots."""
+    """Compute (and persist) per-component colour limits for ``model``.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+        The reader to mutate. On return, ``model._vmax`` holds a nested
+        dict keyed by ``data_type`` (``'accel'``, ``'vel'``, ``'disp'``)
+        and then by component (``'e'``, ``'n'``, ``'z'``, ``'resultant'``).
+
+    Returns
+    -------
+    dict
+        The same dict that ends up on ``model._vmax``. Also written to
+        ``model._vmax_cache_path`` as JSON (best-effort -- silent on
+        read-only filesystems).
+
+    Notes
+    -----
+    Reads the file in ``chunk_rows = 120`` slices so peak RAM stays
+    bounded even on very large datasets.
+    """
     data_grp = model._data_grp_for_vmax
     chunk_rows = 120
     print(f"  Computing vmax (chunk mode, {chunk_rows} rows/chunk)...")

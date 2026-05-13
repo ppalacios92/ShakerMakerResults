@@ -19,7 +19,25 @@ def plot_models_response(
     figsize=(10, 8),
     factor=1.0,
 ):
-    """Plot time-history response for multiple models, overlaid in one figure."""
+    """Overlay time-history traces from multiple models on one 3x1 figure.
+
+    Parameters
+    ----------
+    models : list of ShakerMakerData or StationData
+    node_ids : list, optional
+    target_pos : list, optional
+        Same shape rules as :func:`plot_models_arias`.
+    data_type : {'vel', 'accel', 'disp'}, default ``'vel'``
+    xlim : tuple, optional
+    figsize : tuple, default ``(10, 8)``
+    factor : float, default ``1.0``
+        Multiplier applied before plotting.
+
+    Returns
+    -------
+    None
+        Calls ``plt.show()`` directly.
+    """
     if node_ids is None and target_pos is None:
         raise ValueError("Provide node_ids or target_pos.")
     if len(models) != len(node_ids if node_ids else target_pos):
@@ -69,7 +87,29 @@ def plot_models_newmark(
     figsize=(8, 10),
     factor=1.0,
 ):
-    """Plot Newmark response spectra for multiple models, overlaid in one figure."""
+    """Overlay Newmark response spectra from multiple models on one 3x1 figure.
+
+    Parameters
+    ----------
+    models : list of ShakerMakerData or StationData
+    node_ids : list, optional
+    target_pos : list, optional
+    data_type : {'accel', 'vel', 'disp'}, default ``'accel'``
+        Source signal. When ``'accel'`` the input is converted from m/s^2
+        to g before the Newmark solver runs (``scale = 1 / 9.81``).
+    spectral_type : {'PSa', 'Sa', 'PSv', 'Sv', 'Sd'}, default ``'PSa'``
+        Which spectrum to plot. The solver returns all five, so we just
+        pick the right key.
+    xlim : tuple, default ``[0, 5]``
+        Period bounds in seconds.
+    figsize : tuple, default ``(8, 10)``
+    factor : float, default ``1.0``
+
+    Returns
+    -------
+    None
+        Calls ``plt.show()`` directly.
+    """
     if node_ids is None and target_pos is None:
         raise ValueError("Provide node_ids or target_pos.")
     if len(models) != len(node_ids if node_ids else target_pos):

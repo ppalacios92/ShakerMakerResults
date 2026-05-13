@@ -1,33 +1,41 @@
 """
 utils.py
 ========
-Shared utility functions and constants used across plotting.py and comparison.py.
+Shared utility functions used across the plotting and comparison modules.
 
-Centralises helpers that would otherwise be duplicated between modules,
-keeping shakermaker_data.py and station_data.py free of cross-dependencies.
+We keep these here -- and not on the reader classes -- so the readers stay
+free of cross-dependencies (``ShakerMakerData`` does not need to know about
+``StationData`` and vice versa). The plotting helpers reach into both
+through duck-typing checks defined below.
 
 Contents
 --------
-_R
+``_R``
     Rotation matrix that maps ShakerMaker coordinates (km, ENU) to a
-    right-handed display frame.
-_rotate(xyz_km)
-    Apply _R and convert kilometres to metres.
-_is_station(obj)
-    Duck-type check, returns True for StationData objects.
-_resolve_node(node_id, model_index, n_models)
-    Extract a scalar node index for a given model from flexible input.
-_get_signals(obj, node_idx, data_type, filtered)
-    Unified signal accessor, returns [Z, E, N] regardless of object type.
-_get_time(obj)
-    Return the time vector from either object type.
-_get_name(obj)
-    Return a short display name from either object type.
-
+    right-handed display frame (Z-up).
+``_rotate(xyz_km)``
+    Apply ``_R`` and convert kilometres to metres.
+``_is_station(obj)``
+    Duck-typed check -- ``True`` for ``StationData``-like objects.
+``_resolve_node(node_id, model_index, n_models)``
+    Pull a scalar node index for a given model out of flexible input
+    (scalar / per-model list / list of lists).
+``_get_signals(obj, node_idx, data_type, filtered)``
+    Unified accessor returning ``[Z, E, N]`` regardless of the object type.
+``_get_time(obj)``
+    Time vector accessor for either reader type.
+``_get_name(obj)``
+    Display name accessor with sensible fallbacks.
+``_fk_tensor_rotation(...)``
+    Rotate a 9-component FK Green-Function tensor into physical Z/E/N
+    components. Used by ``plot_node_gf`` / ``plot_models_gf``.
 """
 
 import numpy as np
 
+# Historical: we used to build _R explicitly from two ENU basis vectors --
+# left here as a comment so the rotation choice is traceable.
+#
 # _R = np.column_stack([
 #     np.array([0, 1, 0]),
 #     np.array([1, 0, 0]),
@@ -39,23 +47,54 @@ _R = np.array([[0, 1,  0],
                [0, 0, -1]])
 
 def _rotate(xyz_km):
-    """Apply the ShakerMaker display rotation and convert km to m."""
+    """Apply the ShakerMaker display rotation and convert km to m.
+
+    Parameters
+    ----------
+    xyz_km : np.ndarray, shape (N, 3)
+        ShakerMaker coordinates in kilometres.
+
+    Returns
+    -------
+    np.ndarray, shape (N, 3)
+        Same points expressed in the viewer / plotting frame, in metres.
+    """
     return xyz_km * 1000 @ _R
 
 
-# Comparasion
+# ---------------------------------------------------------------------------
+# Duck-typed accessors -- used by plotting / comparison helpers that need to
+# treat ``ShakerMakerData`` and ``StationData`` interchangeably without
+# importing either class (the import would create a cycle).
+# ---------------------------------------------------------------------------
 
 def _is_station(obj):
-    """Return True if obj is a StationData instance.
+    """Return ``True`` for ``StationData``-like objects.
 
-    Uses duck-typing to avoid importing StationData directly.
+    A ``StationData`` instance has ``z_v`` and lacks ``internal``; a
+    ``ShakerMakerData`` instance has both attributes.
     """
     return hasattr(obj, 'z_v') and not hasattr(obj, 'internal')
 
 def _resolve_node(node_id, model_index, n_models):
-    """Extract a scalar node index for a given model from flexible input.
+    """Pick a single node index for ``model_index`` out of flexible input.
 
-    Supports scalar, flat list (one per model), and list of lists.
+    Parameters
+    ----------
+    node_id : int, str, list, or list of lists
+        Accepted shapes:
+
+        * scalar (``int`` / ``'QA'``)         -- used for every model.
+        * list of length ``n_models``         -- one entry per model.
+        * list of lists                       -- inner list is picked by
+          model index, the first element of the inner list is returned.
+    model_index : int
+    n_models : int
+
+    Returns
+    -------
+    int or str
+        Scalar usable by ``get_node_data`` / ``get_qa_data``.
     """
     if not isinstance(node_id, list):
         return node_id
@@ -68,7 +107,23 @@ def _resolve_node(node_id, model_index, n_models):
 
 
 def _get_signals(obj, node_idx, data_type, filtered=False):
-    """Return [Z, E, N] arrays from ShakerMakerData or StationRead."""
+    """Return ``[Z, E, N]`` signal arrays from either reader type.
+
+    Parameters
+    ----------
+    obj : ShakerMakerData or StationData
+    node_idx : int or {'QA', 'qa'}
+        Ignored for ``StationData`` (a station only has one time series).
+    data_type : {'accel', 'vel', 'disp'}
+    filtered : bool, default ``False``
+        Only honoured for ``StationData`` (the simulation reader doesn't
+        have a filtered view).
+
+    Returns
+    -------
+    list of np.ndarray
+        Three component traces ordered ``[Z, E, N]``.
+    """
     if _is_station(obj):
         if data_type in ('accel', 'acceleration'):
             z, e, n = obj.acceleration_filtered if filtered else obj.acceleration
@@ -87,15 +142,18 @@ def _get_signals(obj, node_idx, data_type, filtered=False):
 
 
 def _get_time(obj):
-    """Return the time vector from any supported model object."""
+    """Return the active time vector for either reader type.
+
+    ``StationData`` stores it as ``t``; ``ShakerMakerData`` as ``time``.
+    """
     return obj.t if _is_station(obj) else obj.time
 
 
 def _get_name(obj):
-    """Return a short display name from any supported model object.
+    """Return a short display name with sensible fallbacks.
 
-    StationData returns obj.name or 'Station'.
-    ShakerMakerData returns obj.name.
+    ``StationData`` returns ``obj.name`` or ``"Station"`` when unset.
+    ``ShakerMakerData`` returns ``obj.name`` or ``"Model"`` when unset.
     """
     if _is_station(obj):
         return obj.name if obj.name else "Station"

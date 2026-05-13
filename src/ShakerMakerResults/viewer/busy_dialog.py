@@ -1,4 +1,20 @@
-"""Shared busy dialog used by long-running viewer operations."""
+"""
+busy_dialog.py
+==============
+Lightweight modal "Working..." dialog used by long-running viewer
+operations (Newmark / Arias surface scans, pre-warm of the playback
+triplet, GF subfault swaps, etc.).
+
+The dialog supports two modes:
+
+* **Deterministic** (default: ``max=0``) -- shows an indeterminate
+  marquee progress bar.
+* **Numeric** (``max=N``) -- shows a regular 0..N progress bar that
+  callers update through :meth:`set_step`.
+
+The close button is intentionally removed so the user cannot dismiss
+the dialog mid-operation and leave caches half-built.
+"""
 
 from __future__ import annotations
 

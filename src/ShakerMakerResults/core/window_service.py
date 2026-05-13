@@ -1,4 +1,27 @@
-"""Windowing helpers for :class:`ShakerMakerData`."""
+"""
+window_service.py
+=================
+Lazy windowing / resampling helpers for :class:`ShakerMakerData`.
+
+Both helpers build a new ``ShakerMakerData`` instance via
+``model.__class__.__new__`` and copy ``__dict__`` across. This avoids
+re-reading the file (which can be tens of gigabytes) while still giving
+the caller a self-contained object.
+
+State that is *shared* with the original (read-only / static):
+    ``filename``, ``xyz``, ``xyz_qa``, ``xyz_all``, ``internal``,
+    ``spacing``, ``_dt_orig``, ``_tstart``, ``_n_nodes``,
+    ``_data_grp``, ``_meta_grp``, ``_qa_grp``, GF metadata, vmax sidecar.
+
+State that is *reinitialised* on the new instance:
+    ``_node_cache``, ``_gf_cache``, ``_spectrum_cache``, plus a fresh
+    ``time`` / ``gf_time`` and the relevant ``_window_mask`` /
+    ``_resample_cache``.
+
+Mutating either object's signal cache won't bleed into the other -- but
+mutating ``xyz`` or ``internal`` will, because we share the same arrays.
+That's intentional: those arrays should be treated as read-only.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +29,25 @@ import numpy as np
 
 
 def get_window(model, t_start, t_end):
-    """Return a time-windowed copy without reading signal data eagerly."""
+    """Return a time-windowed *view* of ``model`` without reading signal data.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+    t_start, t_end : float
+        Window bounds in seconds (inclusive).
+
+    Returns
+    -------
+    ShakerMakerData
+        New instance whose ``time`` / ``gf_time`` are trimmed to the
+        requested window. Signal reads honour ``_window_mask`` lazily.
+
+    Notes
+    -----
+    The new instance also keeps a ``window_label`` like ``"5.0-15.0s"``
+    that the viewer header and ``write_h5drm`` use.
+    """
     new = model.__class__.__new__(model.__class__)
     for a, v in model.__dict__.items():
         setattr(new, a, v)
@@ -62,7 +103,27 @@ def get_window(model, t_start, t_end):
 
 
 def resample(model, dt):
-    """Return a lazily resampled copy of the model."""
+    """Return a lazily resampled copy of ``model`` at a new ``dt``.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+    dt : float
+        Target time step in seconds.
+
+    Returns
+    -------
+    ShakerMakerData
+        New instance with ``time`` and ``gf_time`` rebuilt at the target
+        ``dt``. Subsequent reads use ``scipy.interpolate.interp1d`` over
+        the original time grid (cached as ``_resample_cache``).
+
+    Notes
+    -----
+    No signal data is read or interpolated up front. The first call to
+    :meth:`get_node_data` / :meth:`get_qa_data` / GF queries on the
+    returned object pays the interpolation cost.
+    """
     new = model.__class__.__new__(model.__class__)
     for a, v in model.__dict__.items():
         setattr(new, a, v)

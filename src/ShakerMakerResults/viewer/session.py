@@ -1,4 +1,30 @@
-"""Main orchestration object for an interactive viewer session."""
+"""
+session.py
+==========
+Main orchestration object for an interactive viewer session.
+
+A ``ViewerSession`` owns three things:
+
+* A :class:`ViewerDataAdapter` -- the data + cache layer that talks to
+  the underlying HDF5 reader.
+* A :class:`ViewerState` -- the per-session display knobs (demand,
+  component, colormap, warp, playback ...).
+* Optionally a Qt main window (``ViewerMainWindow``). Notebook callers
+  who only need data access (e.g. for scripted screenshots) keep
+  ``show=False`` and never instantiate the window.
+
+The session's public methods come in four flavours:
+
+* ``set_*``       -- mutate one knob on the state and notify the window.
+* ``apply_*``     -- bulk updates that often rebuild caches or geometry.
+* ``current_*``   -- read the data the scene needs *right now* (scalars,
+  points, traces, spectra, color limits, ...).
+* ``select_*`` / ``add_*`` / ``toggle_*`` -- selection management.
+
+Everything in here is plain Python -- no Qt event handling. The window
+listens on ``on_session_updated`` callbacks that we fire through
+``_notify_window``.
+"""
 
 from __future__ import annotations
 
@@ -12,11 +38,18 @@ from .colors import (
 )
 from .state import ViewerState
 
+#: Static "color by" modes that overlay a scalar field unrelated to the
+#: active demand (used by the ``StaticColorSection`` panel).
 VALID_STATIC_COLOR_BY = ("elevation_z", "newmark_sa", "arias")
 
 
 class ViewerSession:
-    """Coordinate adapter, state, and optional GUI window."""
+    """Coordinate the adapter, state and (optionally) the Qt window.
+
+    Most notebook users build a session via ``model.viewer()`` and never
+    instantiate this class directly. The arguments below describe what
+    the factory passes through.
+    """
 
     def __init__(
         self,
@@ -33,6 +66,38 @@ class ViewerSession:
         max_cache_bytes: int | None = None,
         max_cache_entries: int = 8,
     ) -> None:
+        """Build a session bound to a model (or a pre-built adapter).
+
+        Parameters
+        ----------
+        model_or_adapter : ShakerMakerData or ViewerDataAdapter
+            When a raw reader is passed we wrap it in a fresh adapter;
+            when an adapter is passed we reuse it as-is (useful for
+            sharing caches between sessions in tests).
+        show : bool, default ``False``
+            When ``True`` :meth:`show` is called at the end of
+            ``__init__`` so the Qt window appears immediately.
+        field : str, optional
+            Shorthand for ``demand=<field>, component='resultant'`` that
+            also flags the pre-warm to skip the bonus ``disp`` triplet
+            normally loaded for instant Warp.
+        demand : {'accel', 'vel', 'disp', 'gf'}, default ``'accel'``
+        component : str, default ``'resultant'``
+            One of ``'z' / 'e' / 'n' / 'resultant'`` (or a GF component
+            label for ``demand='gf'``).
+        time_index : int, default ``0``
+        selected_node : int or {'QA'}, optional
+            Initial single-node selection.
+        title : str, optional
+            Window title (defaults to the model name).
+        cache_time_series : bool, default ``True``
+            Forwarded to the adapter; disabling it makes plays slow but
+            useful for memory-tight machines.
+        max_cache_bytes : int, optional
+            LRU byte budget. ``None`` uses the adapter default.
+        max_cache_entries : int, default ``8``
+            Kept for API compatibility -- the adapter uses byte budget.
+        """
         # ── field= shorthand ──────────────────────────────────────────────────
         # ``field='vel'`` is sugar for ``demand='vel', component='resultant'``
         # and tells the pre-warm to load ONLY that demand (skipping the bonus
@@ -198,12 +263,14 @@ class ViewerSession:
         self._closed = True
 
     def set_time_index(self, time_index: int):
+        """Set the active playback frame and notify the window with reason ``'time'``."""
         self.state.set_time_index(time_index, max(len(self.adapter.time) - 1, 0))
         self._invalidate_frame_cache()
         self._notify_window("time")
         return self.state.time_index
 
     def set_demand(self, demand: str):
+        """Switch demand (accel/vel/disp/gf), auto-fixing the component if it became invalid."""
         self.state.set_demand(demand)
         # Auto-correct the component when crossing between regular and GF demand.
         # e.g. "resultant" is invalid for GF;  "g11" is invalid for accel/vel/disp.
@@ -215,12 +282,14 @@ class ViewerSession:
         return self.state.demand
 
     def set_component(self, component: str):
+        """Switch the displayed component and refresh the user color range."""
         self.state.set_component(component)
         self.state.set_user_color_range(*self.default_color_limits())
         self._notify_window("component")
         return self.state.component
 
     def select_node(self, node_id):
+        """Activate single-node selection, clearing any active multi-selection."""
         self.state.set_selected_node(node_id)
         self.state.multi_selection = frozenset()
         self.state.set_selection_visibility("all")
@@ -229,11 +298,13 @@ class ViewerSession:
         return self.state.selected_node
 
     def select_nearest_coordinate_m(self, x_m: float, y_m: float, z_m: float):
+        """Select the node closest to ``[x_m, y_m, z_m]`` in **model** (km*1000) frame."""
         node_id, distance_m = self.adapter.nearest_node_from_model_xyz_m([x_m, y_m, z_m])
         self.select_node(node_id)
         return node_id, distance_m
 
     def select_nearest_display_coordinate_m(self, x_m: float, y_m: float, z_m: float):
+        """Select the node closest to ``[x_m, y_m, z_m]`` in **display** (rotated) frame."""
         import numpy as np
 
         point = [x_m, y_m, z_m]
@@ -244,6 +315,7 @@ class ViewerSession:
         return node_id, distance_m
 
     def clear_selection(self):
+        """Drop both single- and multi-selection and reset visibility to ``'all'``."""
         self.state.set_selected_node(None)
         self.state.multi_selection = frozenset()
         self.state.set_selection_visibility("all")
@@ -253,11 +325,13 @@ class ViewerSession:
     # ── Multi-node selection (visualization only) ─────────────────────────────
 
     def set_selection_visibility(self, mode: str):
+        """Forward the visibility mode (``'all'``/``'only'``/``'hide'``) to ``state`` and the window."""
         self.state.set_selection_visibility(mode)
         self._notify_window("multi_selection")
         return self.state.selection_visibility
 
     def set_node_opacity(self, opacity: float):
+        """Set the main-actor alpha and broadcast the change to the scene."""
         self.state.set_node_opacity(opacity)
         self._notify_window("node_opacity")
         return self.state.node_opacity
@@ -326,6 +400,11 @@ class ViewerSession:
         return self.state.multi_selection
 
     def selected_response_node_ids(self) -> tuple:
+        """Return the ordered tuple of node ids analysis panels should plot.
+
+        The active node (if any) goes first, then the rest of the
+        multi-selection sorted by id. Empty when nothing is selected.
+        """
         selected = set(self.state.multi_selection)
         active = self.state.selected_node
         if active is not None:
@@ -339,27 +418,33 @@ class ViewerSession:
         return tuple(ordered)
 
     def has_multi_selection(self) -> bool:
+        """Return ``True`` when the comparison set has at least one entry."""
         return bool(self.state.multi_selection)
 
     def current_visible_node_ids(self) -> list:
+        """Return the list of node ids currently rendered by the main actor."""
         return self.adapter.visible_node_ids
 
     def set_background(self, background: str):
+        """Set the 3-D background preset and notify the window."""
         self.state.set_background(background)
         self._notify_window("appearance")
         return self.state.background
 
     def set_colormap(self, colormap: str):
+        """Set the named colormap and notify the window."""
         self.state.set_colormap(colormap)
         self._notify_window("appearance")
         return self.state.colormap
 
     def set_point_size(self, point_size: float | None):
+        """Set the scatter point size and notify the window."""
         self.state.set_point_size(point_size)
         self._notify_window("point_size")
         return self.state.point_size
 
     def set_show_scalar_bar(self, show_scalar_bar: bool):
+        """Toggle the scalar bar and notify the window."""
         self.state.set_show_scalar_bar(show_scalar_bar)
         self._notify_window("appearance")
         return self.state.show_scalar_bar
@@ -436,21 +521,25 @@ class ViewerSession:
         return self.state.show_scalar_bar
 
     def set_axes_grid_visible(self, visible: bool):
+        """Toggle the axes / grid overlay and notify the window."""
         self.state.set_axes_grid_visible(visible)
         self._notify_window("appearance")
         return self.state.show_axes_grid
 
     def set_selection_labels_enabled(self, enabled: bool):
+        """Toggle per-node text labels on the selection overlay."""
         self.state.set_selection_labels_enabled(enabled)
         self._notify_window("multi_selection")
         return self.state.selection_labels_enabled
 
     def set_ghost_warp_reference(self, enabled: bool):
+        """Toggle the faint undeformed-cloud overlay while warp is enabled."""
         self.state.set_ghost_warp_reference(enabled)
         self._notify_window("warp")
         return self.state.ghost_warp_reference
 
     def set_color_range(self, vmin: float | None, vmax: float | None, *, clamp: bool | None = None):
+        """Set the manual color range, optionally toggling clamping in the same call."""
         self.state.set_user_color_range(vmin, vmax)
         if clamp is not None:
             self.state.set_clamp_enabled(clamp)
@@ -458,6 +547,7 @@ class ViewerSession:
         return self.state.user_vmin, self.state.user_vmax
 
     def set_clamp_enabled(self, enabled: bool):
+        """Toggle whether user-set vmin/vmax override the automatic limits."""
         self.state.set_clamp_enabled(enabled)
         self._notify_window("color_range")
         return self.state.clamp_enabled
@@ -469,6 +559,7 @@ class ViewerSession:
         show_external: bool | None = None,
         show_qa: bool | None = None,
     ):
+        """Update geometry-visibility toggles; ``None`` keeps the current value for that axis."""
         self.state.set_node_visibility(
             show_internal=show_internal,
             show_external=show_external,
@@ -582,6 +673,7 @@ class ViewerSession:
         return self._static_color_by, self._static_color_map
 
     def apply_static_color_by(self, color_by: str | None) -> str | None:
+        """Switch the "static color by" overlay (``None`` returns to demand-driven coloring)."""
         self._static_color_by = self._validate_static_color_by(color_by)
         self._static_color_map = self.state.colormap
         self._blend_base_rgb_key = None
@@ -590,17 +682,21 @@ class ViewerSession:
         return self._static_color_by
 
     def current_color_by(self) -> str:
+        """Return the active coloring mode (``'field'`` or one of ``VALID_STATIC_COLOR_BY``)."""
         return self._static_color_by if self._static_color_by is not None else "field"
 
     # ── Wave-blend getters ────────────────────────────────────────────────────
 
     def current_wave_blend_enabled(self) -> bool:
+        """Return ``True`` when the elevation/wave RGB blend is enabled by the user."""
         return self._wave_blend_enabled
 
     def current_wave_blend_strength(self) -> float:
+        """Return the wave-blend strength (0 = pure elevation, 1 = pure wave)."""
         return self._wave_blend_strength
 
     def current_wave_blend_active(self) -> bool:
+        """Return ``True`` when the wave blend is *currently* rendered (playing + elevation overlay)."""
         return bool(
             self._static_color_by == "elevation_z"
             and self._wave_blend_enabled
@@ -608,9 +704,11 @@ class ViewerSession:
         )
 
     def current_display_gf_subfault(self) -> int:
+        """Return the subfault id used for GF display (defaults to 0)."""
         return int(self._display_gf_subfault)
 
     def current_static_auto_limits(self) -> tuple[float, float]:
+        """Return the auto color range for the active "static color by" overlay."""
         if self._static_color_by == "elevation_z":
             return self.adapter.elevation_limits()
         if self._static_color_by == "newmark_sa":
@@ -620,6 +718,7 @@ class ViewerSession:
         return self.adapter.elevation_limits()
 
     def current_static_color_limits(self, scalars=None) -> tuple[float, float]:
+        """Return ``(vmin, vmax)`` for the static overlay, honouring user clamp + scalars."""
         if self._static_clamp_enabled and self._static_user_vmin is not None and self._static_user_vmax is not None:
             vmin = float(self._static_user_vmin)
             vmax = float(self._static_user_vmax)
@@ -635,6 +734,7 @@ class ViewerSession:
         return self.current_static_auto_limits()
 
     def apply_data_settings(self, *, demand: str, component: str):
+        """Bulk-update demand + component in one atomic notification."""
         self.state.set_demand(demand)
         self.state.set_component(component)
         self.state.set_user_color_range(*self.default_color_limits())
@@ -649,6 +749,7 @@ class ViewerSession:
         vmax: float | None,
         clamp_enabled: bool,
     ):
+        """Bulk-update colormap + user range + clamp in one atomic notification."""
         self.state.set_colormap(colormap)
         self.state.set_user_color_range(vmin, vmax)
         self.state.set_clamp_enabled(clamp_enabled)
@@ -662,6 +763,7 @@ class ViewerSession:
         show_external: bool,
         show_qa: bool,
     ):
+        """Bulk-update geometry visibility (internal / external / QA) and notify the window."""
         self.state.set_node_visibility(
             show_internal=show_internal,
             show_external=show_external,
@@ -677,6 +779,12 @@ class ViewerSession:
         warp_axes: tuple[bool, bool, bool],
         warp_scale: float | None,
     ):
+        """Bulk-update warp toggle / axes / scale and manage the playback handle.
+
+        Opens the persistent HDF5 handle if warp turns on while the disp
+        triplet is not cached yet; closes it when warp turns off and the
+        viewer is not playing.
+        """
         was_warp_enabled = bool(self.state.disp_warp_enabled)
         self.state.set_warp_enabled(warp_enabled)
         self.state.set_warp_axes(tuple(bool(v) for v in warp_axes))
@@ -800,6 +908,18 @@ class ViewerSession:
         return self.adapter.suggested_warp_scale()
 
     def set_playing(self, is_playing: bool):
+        """Toggle playback, warming the right series + handle for fast frame ticks.
+
+        When starting playback we:
+
+        * warm GF scalars on the fly for ``demand='gf'`` (cheap), or
+        * trust the window's pre-warm to have loaded the triplet for
+          regular demands, and open the persistent HDF5 handle as a
+          safety net when the triplet does not fit the cache budget.
+
+        When stopping we close the persistent handle, unless warp is
+        still active and would re-open it for every frame anyway.
+        """
         had_static_color_override = bool(self._static_color_by)
         persistent_static_color = self._static_color_by in ("elevation_z", "newmark_sa", "arias")
         # Elevation is the playback base: keep it alive and let current_scalars()
@@ -851,20 +971,31 @@ class ViewerSession:
         return self.state.is_playing
 
     def set_playback_speed(self, playback_speed: float):
+        """Set the playback speed multiplier (forwarded to ``state`` then notified)."""
         self.state.set_playback_speed(playback_speed)
         self._notify_window("playback")
         return self.state.playback_speed
 
     def toggle_playing(self):
+        """Flip the playback flag (``set_playing(not is_playing)``)."""
         return self.set_playing(not self.state.is_playing)
 
     def step_time(self, delta: int = 1):
+        """Shift the time index by ``delta`` (default +1)."""
         return self.set_time_index(self.state.time_index + int(delta))
 
     def jump_time(self, delta: int = 10):
+        """Jump the time index by ``delta`` (default +10) -- thin alias of :meth:`step_time`."""
         return self.step_time(delta)
 
     def current_scalars(self, *, state=None):
+        """Return the scalar array the scene should render right now.
+
+        Honours the active "static color by" overlay (elevation / Newmark
+        Sa / Arias) and the GF subfault selection. ``state`` accepts a
+        :class:`PaneDisplayState` so individual panes can pull scalars
+        with different demand / component values from the same session.
+        """
         st = state if state is not None else self.state
         if self._static_color_by == "elevation_z":
             if self.current_wave_blend_active():
@@ -886,6 +1017,7 @@ class ViewerSession:
         )
 
     def current_wave_scalars(self):
+        """Return the raw wave scalars (no static overlay, no per-pane override)."""
         gf_subfault = self._display_gf_subfault if self.state.demand == GF_DEMAND else 0
         return self.adapter.scalar_snapshot(
             self.state.time_index,
@@ -964,9 +1096,11 @@ class ViewerSession:
         return w_abs
 
     def current_visible_points(self, *, state=None):
-        # Visibility filters are global (whitelist in pane_state.py),
-        # so we read from self.state directly; ``state`` is accepted
-        # for signature symmetry but ignored here.
+        """Return the (N_visible, 3) array of points the main actor should draw.
+
+        Visibility filters are global (whitelist in pane_state.py), so
+        ``state`` is accepted for signature symmetry but ignored here.
+        """
         return self.adapter.visible_points(
             show_internal=self.state.show_internal,
             show_external=self.state.show_external,
@@ -1052,6 +1186,7 @@ class ViewerSession:
         )
 
     def default_color_limits(self, *, state=None) -> tuple[float, float]:
+        """Return the auto color range for the active demand / component (no user clamp)."""
         st = state if state is not None else self.state
         if self._static_color_by == "elevation_z":
             return self.adapter.elevation_limits()
@@ -1067,6 +1202,7 @@ class ViewerSession:
         )
 
     def _current_wave_color_limits(self, scalars=None) -> tuple[float, float]:
+        """Compute the color range used for the wave layer underneath the blend."""
         if self.state.clamp_enabled and self.state.user_vmin is not None and self.state.user_vmax is not None:
             vmin = float(self.state.user_vmin)
             vmax = float(self.state.user_vmax)
@@ -1086,6 +1222,7 @@ class ViewerSession:
             return scalar_limits(scalars, self.state.component)
 
     def _current_wave_colormap(self) -> str:
+        """Return the colormap name (after honouring the ``_r`` inversion flag)."""
         return effective_colormap_name(
             self.state.colormap or colormap_for_component(self.state.component),
             inverted=self.state.colormap_inverted,
@@ -1139,6 +1276,7 @@ class ViewerSession:
         return lo, hi
 
     def current_trace(self):
+        """Return the trace dict for the selected node + active demand, or ``None``."""
         node_id = self.state.selected_node
         if node_id is None:
             return None
@@ -1146,30 +1284,41 @@ class ViewerSession:
         return self.adapter.trace(node_id, demand)
 
     def current_accel_trace(self):
+        """Return the acceleration trace for the selected node (forces ``demand='accel'``)."""
         node_id = self.state.selected_node
         if node_id is None:
             return None
         return self.adapter.trace(node_id, "accel")
 
     def current_spectrum(self):
+        """Return the Newmark spectrum dict for the selected node, or ``None``."""
         node_id = self.state.selected_node
         if node_id is None:
             return None
         return self.adapter.spectrum(node_id)
 
     def current_arias(self):
+        """Return the Arias intensity dict for the selected node, or ``None``."""
         node_id = self.state.selected_node
         if node_id is None:
             return None
         return self.adapter.arias(node_id)
 
     def current_node_info(self):
+        """Return adapter metadata for the selected node (coordinates, internal flag, ...)."""
         node_id = self.state.selected_node
         if node_id is None:
             return None
         return self.adapter.node_info(node_id)
 
     def set_station_tags(self, stations: list[dict[str, object]]):
+        """Replace the user-defined station labels drawn on the scene.
+
+        Each entry needs a ``"name"`` plus either ``"xyz_model_m"`` (model
+        coords) or ``"xyz_display_m"`` (already-rotated display coords).
+        Display coords are filled from model coords when missing so the
+        scene only ever has to read one field.
+        """
         cleaned: list[dict[str, object]] = []
         for entry in stations:
             name = str(entry.get("name", "")).strip()
@@ -1199,6 +1348,7 @@ class ViewerSession:
         return list(self._station_tags)
 
     def current_display_transform(self):
+        """Return the 3x3 matrix used to map model XYZ into the display frame."""
         return self.adapter.display_transform
 
     def apply_display_transform(self, matrix):
@@ -1210,17 +1360,21 @@ class ViewerSession:
         return self.adapter.display_transform
 
     def current_station_tags(self) -> list[dict[str, object]]:
+        """Return a defensive copy of the current station tags list."""
         return list(self._station_tags)
 
     def set_show_station_tags(self, visible: bool):
+        """Toggle the visibility of station labels across every pane."""
         self._show_station_tags = bool(visible)
         self._notify_window("stations_visibility")
         return self._show_station_tags
 
     def show_station_tags(self) -> bool:
+        """Return ``True`` when station tags are currently rendered."""
         return bool(self._show_station_tags)
 
     def _refresh_station_display_points(self) -> None:
+        """Recompute the display coordinates of every station tag after a transform change."""
         if not self._station_tags:
             return
         for entry in self._station_tags:
@@ -1251,11 +1405,13 @@ class ViewerSession:
             return None
 
     def current_time(self) -> float:
+        """Return the wall-time of the active frame in seconds (0.0 when no data)."""
         if len(self.adapter.time) == 0:
             return 0.0
         return float(self.adapter.time[self.state.time_index])
 
     def current_background_color(self, *, state=None) -> str:
+        """Resolve the active background preset to its hex / named color string."""
         st = state if state is not None else self.state
         return BACKGROUND_PRESETS[st.background]
 
@@ -1286,18 +1442,23 @@ class ViewerSession:
         )
 
     def current_static_color_by(self) -> str | None:
+        """Return the active static overlay name (``elevation_z``/``newmark_sa``/``arias``) or ``None``."""
         return self._static_color_by
 
     def current_static_colormap(self) -> str:
+        """Return the colormap remembered for the static overlay."""
         return self._static_color_map
 
     def current_static_clamp_enabled(self) -> bool:
+        """Return ``True`` when the static overlay should use a user-clamped range."""
         return self._static_clamp_enabled
 
     def current_static_user_range(self) -> tuple[float | None, float | None]:
+        """Return the user-clamped ``(vmin, vmax)`` for the static overlay."""
         return self._static_user_vmin, self._static_user_vmax
 
     def current_newmark_static_settings(self) -> dict[str, object]:
+        """Return the cached Newmark-overlay parameters (T_target, component, ...)."""
         return {
             "T_target": self._newmark_static_T_target,
             "component": self._newmark_static_component,
@@ -1308,6 +1469,7 @@ class ViewerSession:
         }
 
     def current_scalar_bar_title(self, *, state=None) -> str:
+        """Build the scalar-bar title for the active demand / overlay combo."""
         st = state if state is not None else self.state
         if st.legend_title_override:
             return st.legend_title_override
@@ -1326,6 +1488,11 @@ class ViewerSession:
         return f"{st.demand}/{st.component}"
 
     def suggested_point_size(self) -> float:
+        """Return a sensible default scatter point size based on visible-node count.
+
+        Falls back to the user-locked ``state.point_size`` when set. Otherwise
+        scales the size down for dense clouds so the viewport stays readable.
+        """
         if self.state.point_size is not None:
             return float(self.state.point_size)
         npts = len(self.current_visible_points())
@@ -1336,11 +1503,13 @@ class ViewerSession:
         return 5.0
 
     def _notify_window(self, reason: str) -> None:
+        """Broadcast a state-change reason to the Qt window (no-op when headless)."""
         if self.window is not None:
             self.window.on_session_updated(reason)
 
     @staticmethod
     def _validate_static_color_by(color_by: str | None) -> str | None:
+        """Validate the ``color_by`` keyword for :meth:`apply_static_color_by`."""
         if color_by is None:
             return None
         color_by = str(color_by).strip().lower()
@@ -1354,10 +1523,17 @@ class ViewerSession:
         return color_by
 
     def _invalidate_frame_cache(self) -> None:
+        """Clear the cached warped-points array so the next frame recomputes it."""
         self._warped_points_cache_key = None
         self._warped_points_cache = None
 
     def _prepare_component_triplet(self, demand: str) -> None:
+        """Load the (E, N, Z) triplet for ``demand`` into the adapter cache.
+
+        Used before warp toggles and playback starts so per-frame reads
+        never hit disk. Falls back to opening a persistent HDF5 handle
+        when the triplet does not fit the byte budget.
+        """
         try:
             keys = tuple((demand, comp) for comp in ("e", "n", "z"))
             if all(key in self.adapter._series_cache for key in keys):
@@ -1374,6 +1550,7 @@ class ViewerSession:
                 pass
 
     def _newmark_surface_scalars(self):
+        """Return the cached Newmark-Sa surface scalars (computes on first call)."""
         return self.adapter.newmark_surface_snapshot(
             T_target=self._newmark_static_T_target,
             component=self._newmark_static_component,
@@ -1384,6 +1561,7 @@ class ViewerSession:
         )
 
     def _arias_surface_scalars(self):
+        """Return the cached Arias-intensity surface scalars (computes on first call)."""
         return self.adapter.arias_surface_snapshot(
             component=self._newmark_static_component,
             data_type=self._newmark_static_data_type,

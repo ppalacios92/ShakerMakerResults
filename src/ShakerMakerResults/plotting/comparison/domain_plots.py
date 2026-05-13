@@ -23,7 +23,32 @@ def plot_models_domain(
     axis_equal=True,
     figsize=(10, 8),
 ):
-    """Plot multiple ShakerMakerData domains in one 3-D figure."""
+    """Overlay several ShakerMakerData domains in a single 3-D figure.
+
+    Parameters
+    ----------
+    models : list of ShakerMakerData
+    xlim, ylim, zlim : tuple of float, optional
+        Axis bounds in metres (display frame).
+    label_nodes : bool, default ``False``
+        Currently unused but kept for API symmetry with
+        :func:`plotting.single_model.domain_plots.plot_domain`.
+    show : {'all', 'internal', 'boundary'}, default ``'all'``
+        Which DRM node category to render. ``'all'`` falls back to the
+        union when a model has no internal nodes (SurfaceGrid layouts).
+    show_nodes : bool, default ``True``
+        Whether the per-node scatter is drawn. Disable to keep only the
+        bounding cubes.
+    show_cubes : bool, default ``True``
+        Whether the bounding cube is drawn for each model.
+    axis_equal : bool, default ``True``
+    figsize : tuple, default ``(10, 8)``
+
+    Returns
+    -------
+    None
+        Calls ``plt.show()`` directly.
+    """
     colors = plt.cm.tab10(np.linspace(0, 1, len(models)))
 
     fig = plt.figure(figsize=figsize)

@@ -79,6 +79,7 @@ class StationData:
     # ------------------------------------------------------------------
 
     def _load_data(self):
+        """Dispatch to the right loader based on the file extension."""
         if self.filepath.endswith('.npz'):
             self._load_npz()
         elif self.filepath.endswith(('.h5', '.hdf5')):
@@ -142,6 +143,7 @@ class StationData:
     # ------------------------------------------------------------------
 
     def _init_cache(self):
+        """Reset all lazily-computed derived caches (filtered + unfiltered)."""
         # Unfiltered derived quantities
         self._z_a = self._e_a = self._n_a = None
         self._z_d = self._e_d = self._n_d = None
@@ -212,6 +214,7 @@ class StationData:
     # ------------------------------------------------------------------
 
     def _compute_acceleration(self):
+        """Fill the acceleration cache by forward-differencing the raw velocity."""
         if self._z_a is None:
             n          = len(self.t)
             self._z_a  = np.zeros(n)
@@ -222,6 +225,7 @@ class StationData:
             self._n_a[1:] = (self.n_v[1:] - self.n_v[:-1]) / self.dt
 
     def _compute_displacement(self):
+        """Fill the displacement cache by trapezoidal integration of velocity."""
         if self._z_d is None:
             self._z_d = cumulative_trapezoid(self.z_v, self.t, initial=0.)
             self._e_d = cumulative_trapezoid(self.e_v, self.t, initial=0.)
@@ -295,6 +299,7 @@ class StationData:
         self._newmark_filt       = None
 
     def _compute_acceleration_filtered(self):
+        """Forward-difference the filtered velocity into the filtered accel cache."""
         if self._z_a_filt is None:
             n              = len(self.t)
             self._z_a_filt = np.zeros(n)
@@ -305,6 +310,7 @@ class StationData:
             self._n_a_filt[1:] = (self._n_v_filt[1:] - self._n_v_filt[:-1]) / self.dt
 
     def _compute_displacement_filtered(self):
+        """Trapezoidal-integrate the filtered velocity into the filtered displ cache."""
         if self._z_d_filt is None:
             self._z_d_filt = cumulative_trapezoid(self._z_v_filt, self.t, initial=0.)
             self._e_d_filt = cumulative_trapezoid(self._e_v_filt, self.t, initial=0.)
@@ -410,9 +416,24 @@ class StationData:
     # ------------------------------------------------------------------
 
     def _label(self):
+        """Return ``self.name`` or the placeholder ``"Station"`` for plot legends."""
         return self.name if self.name else "Station"
 
     def _plot_3comp(self, z, e, n, ylabel, title, xlim, figsize=(10, 8)):
+        """Stacked 3-row plot (Z / E / N) of a single quantity.
+
+        Parameters
+        ----------
+        z, e, n : np.ndarray
+            Component traces sharing ``self.t``.
+        ylabel : str
+            Y axis label template (LaTeX is fine).
+        title : str
+            Figure title.
+        xlim : tuple of float or None
+            Time bounds, ``None`` keeps autoscaling.
+        figsize : tuple, default ``(10, 8)``
+        """
         lbl = self._label()
         fig, axes = plt.subplots(3, 1, figsize=figsize)
         for ax, data, comp in zip(axes, (z, e, n), ('Z', 'E', 'N')):
@@ -428,43 +449,69 @@ class StationData:
         plt.show()
 
     def plot_velocity(self, xlim=None, factor=1.0, figsize=(10, 8)):
-        """Plot raw velocity time series."""
+        """Plot raw velocity time series.
+
+        Parameters
+        ----------
+        xlim : tuple of float, optional
+            Time bounds in seconds.
+        factor : float, default ``1.0``
+            Divides the signal before plotting (use 100.0 to plot in cm/s).
+        figsize : tuple, default ``(10, 8)``
+        """
         z, e, n = self.velocity
         self._plot_3comp(z/factor, e/factor, n/factor,
                          r"$\dot{u}$", "Velocity", xlim, figsize)
 
     def plot_acceleration(self, xlim=None, factor=9.81, figsize=(10, 8)):
-        """Plot acceleration time series."""
+        """Plot acceleration time series.
+
+        Parameters
+        ----------
+        xlim : tuple of float, optional
+        factor : float, default ``9.81``
+            Divisor applied before plotting. Default ``9.81`` converts m/s^2
+            to g; pass ``1.0`` to keep m/s^2.
+        figsize : tuple, default ``(10, 8)``
+        """
         z, e, n = self.acceleration
         ylabel = r"$\ddot{u}$ (g)" if factor == 9.81 else r"$\ddot{u}$"
         self._plot_3comp(z/factor, e/factor, n/factor, ylabel, "Acceleration", xlim, figsize)
 
     def plot_displacement(self, xlim=None, factor=1.0, figsize=(10, 8)):
-        """Plot displacement time series."""
+        """Plot displacement time series.
+
+        Parameters
+        ----------
+        xlim : tuple of float, optional
+        factor : float, default ``1.0``
+        figsize : tuple, default ``(10, 8)``
+        """
         z, e, n = self.displacement
         self._plot_3comp(z/factor, e/factor, n/factor,
                          r"$u$", "Displacement", xlim, figsize)
 
     def plot_velocity_filtered(self, xlim=None, factor=1.0, figsize=(10, 8)):
-        """Plot filtered velocity time series."""
+        """Plot the filtered velocity. Falls back to raw if no filter is set."""
         z, e, n = self.velocity_filtered
         self._plot_3comp(z/factor, e/factor, n/factor,
                          r"$\dot{u}$", "Velocity (Filtered)", xlim, figsize)
 
     def plot_acceleration_filtered(self, xlim=None, factor=9.81, figsize=(10, 8)):
-        """Plot filtered acceleration time series."""
+        """Plot the filtered acceleration. Falls back to raw if no filter is set."""
         z, e, n = self.acceleration_filtered
         ylabel = r"$\ddot{u}$ (g)" if factor == 9.81 else r"$\ddot{u}$"
         self._plot_3comp(z/factor, e/factor, n/factor,
                          ylabel, "Acceleration (Filtered)", xlim, figsize)
 
     def plot_displacement_filtered(self, xlim=None, factor=1.0, figsize=(10, 8)):
-        """Plot filtered displacement time series."""
+        """Plot the filtered displacement. Falls back to raw if no filter is set."""
         z, e, n = self.displacement_filtered
         self._plot_3comp(z/factor, e/factor, n/factor,
                          r"$u$", "Displacement (Filtered)", xlim, figsize)
 
     def _plot_fourier_internal(self, freqs, z_amp, e_amp, n_amp, title, xlim, figsize=(12, 4)):
+        """Render a 1x3 Fourier amplitude plot. Helper for ``plot_fourier*``."""
         lbl = self._label()
         fig, axes = plt.subplots(1, 3, figsize=figsize)
         for ax, amp, comp in zip(axes, (z_amp, e_amp, n_amp), ('Z', 'E', 'N')):
@@ -482,18 +529,29 @@ class StationData:
         plt.show()
 
     def plot_fourier(self, component='acceleration', xlim=None, factor=9.81, figsize=(12, 4)):
-        """Plot Fourier amplitude spectrum."""
+        """Plot the raw-signal Fourier amplitude spectrum.
+
+        Parameters
+        ----------
+        component : {'velocity', 'acceleration', 'displacement'}, default ``'acceleration'``
+        xlim : tuple of float, optional
+            Frequency bounds in Hz.
+        factor : float, default ``9.81``
+            Divides the amplitude before plotting. The default (g) is
+            consistent with the default of :meth:`plot_acceleration`.
+        figsize : tuple, default ``(12, 4)``
+        """
         freqs, z_amp, e_amp, n_amp = self.get_fourier(component, filtered=False)
         self._plot_fourier_internal(
             freqs, z_amp/factor, e_amp/factor, n_amp/factor,
-            f"Fourier — {component.capitalize()}", xlim, figsize)
+            f"Fourier - {component.capitalize()}", xlim, figsize)
 
     def plot_fourier_filtered(self, component='acceleration', xlim=None, factor=9.81, figsize=(12, 4)):
-        """Plot Fourier amplitude spectrum of filtered data."""
+        """Plot the filtered-signal Fourier amplitude spectrum. Same parameters as :meth:`plot_fourier`."""
         freqs, z_amp, e_amp, n_amp = self.get_fourier(component, filtered=True)
         self._plot_fourier_internal(
             freqs, z_amp/factor, e_amp/factor, n_amp/factor,
-            f"Fourier — {component.capitalize()} (Filtered)", xlim, figsize)
+            f"Fourier - {component.capitalize()} (Filtered)", xlim, figsize)
 
     def plot_fourier_comparison(self, component='acceleration',
                                 xlim=None, factor=9.81, figsize=(12, 4)):
@@ -532,16 +590,29 @@ class StationData:
 
     def plot_newmark(self, xlim=None, filtered=False, figsize=(12, 4),
                      factor=1.0, spectral_type='PSa'):
-        """Plot Newmark response spectra.
+        """Plot Newmark response spectra (1x3, Z / E / N).
 
         Parameters
         ----------
-        xlim : list, optional
+        xlim : tuple of float, optional
+            Period bounds in seconds.
         filtered : bool, default ``False``
+            Use filtered acceleration as input (requires ``apply_filter()``).
         figsize : tuple, default ``(12, 4)``
         factor : float, default ``1.0``
-            Scale factor applied to the spectrum values before plotting.
+            Divides the spectrum values before plotting.
         spectral_type : {'PSa', 'Sa', 'PSv', 'Sv', 'Sd'}, default ``'PSa'``
+            Currently only PSa is cached by :meth:`get_newmark`; the other
+            spectral types fall back to the PSa data with their own y-axis
+            label, kept for API compatibility with the multi-model plots.
+
+        Notes
+        -----
+        The y-axis label uses pretty units (``"PSa (g)"`` etc.) but the
+        actual data plotted is always the PSa series cached on this
+        instance. If you need true Sa/PSv/Sv/Sd you have to compute them
+        from acceleration via
+        :func:`ShakerMakerResults.analysis.newmark.NewmarkSpectrumAnalyzer.compute`.
         """
         spec  = self.get_newmark(filtered)
         lbl   = self._label()
@@ -549,7 +620,9 @@ class StationData:
         ylabel = {'PSa': 'PSa (g)', 'Sa': 'Sa (g)', 'PSv': 'PSv (m/s)',
                   'Sv': 'Sv (m/s)', 'Sd': 'Sd (m)'}.get(spectral_type, spectral_type)
 
-        # Map spectral_type to the correct key in the spectrum dict
+        # get_newmark() only caches PSa today, so any spectral_type request
+        # falls back to PSa data. The legend / axis label still respects the
+        # user's choice so multi-model overlays line up.
         key_map = {'PSa': ('PSa_z', 'PSa_e', 'PSa_n'),
                    'Sa':  ('PSa_z', 'PSa_e', 'PSa_n')}
         keys = key_map.get(spectral_type, ('PSa_z', 'PSa_e', 'PSa_n'))

@@ -1,4 +1,25 @@
-"""Color and scalar helpers for the interactive viewer."""
+"""
+colors.py
+=========
+Color / scalar helpers shared across the viewer.
+
+Exports
+
+* :data:`BACKGROUND_PRESETS` -- friendly preset name -> hex (used by
+  ``ViewerState.background``).
+* :data:`COLORMAP_OPTIONS`   -- ordered tuple of matplotlib colormap
+  names exposed to the user (the combos in the side panel pick from
+  this list).
+* :func:`effective_colormap_name`  -- honours the ``_r`` inversion flag.
+* :func:`colormap_for_component`   -- default colormap per component
+  (resultant gets a sequential ramp, signed components get diverging).
+* :func:`scalar_limits`            -- automatic ``(vmin, vmax)`` from a
+  scalar array, symmetric for signed components.
+* :func:`scalars_to_rgb`           -- map scalars to ``uint8`` RGB
+  using a matplotlib colormap (used by the wave / elevation blend).
+* :func:`colormap_strip_bytes`     -- generate a horizontal preview
+  strip as bytes (used by the side-panel previews); LRU-cached.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,26 @@
-"""Standalone surface plotting helpers."""
+"""
+surface_plots.py
+================
+Standalone surface plotting helpers (PGA / spectral / Arias maps).
+
+These functions are heavy:
+
+* :func:`plot_surface_newmark` computes a full SDOF Newmark spectrum per
+  node (joblib-parallel) and caches the result on ``self._newmark_cache``.
+  The cache key is the ``data_type`` -- changing ``T_target``,
+  ``spectral_type`` or ``factor`` reuses the same cached spectra.
+* :func:`plot_surface_arias` mirrors the same caching strategy for Arias
+  intensity.
+
+Both helpers pick a *safe* mode (chunked HDF5 reads inside each worker)
+when the data does not fit comfortably in RAM, and a *fast* mode
+(everything preloaded) otherwise.
+
+Note: the module-level ``time`` import is shadowed inside ``plot_surface``
+by the ``time`` parameter; we leave it as-is for backward compatibility
+with existing notebooks. Use ``import time as _time`` upstream if you
+need the module from inside a ``plot_surface`` call.
+"""
 
 from __future__ import annotations
 
@@ -11,15 +33,33 @@ from ...utils import _rotate
 
 
 def _format_parallel_elapsed(seconds: float) -> str:
+    """Format a seconds count as ``"  5.4s"`` or ``"  3.2min"`` (right-padded)."""
     if seconds >= 60.0:
         return f"{seconds / 60.0:5.1f}min"
     return f"{seconds:6.1f}s"
 
 
 def _parallel_with_total(*, n_jobs: int, total_tasks: int, verbose: int = 5):
+    """Build a joblib ``Parallel`` that prints "Done N/total" every 500 tasks.
+
+    Parameters
+    ----------
+    n_jobs : int
+        Forwarded to ``Parallel`` (``-1`` for all CPUs).
+    total_tasks : int
+        Used to print a ratio in the progress line.
+    verbose : int, default ``5``
+
+    Returns
+    -------
+    Parallel
+        A subclass of ``joblib.Parallel`` with a custom ``print_progress``
+        that limits the report frequency.
+    """
     from joblib import Parallel
 
     class _ParallelWithTotal(Parallel):
+        """Joblib pool that throttles progress prints to every 500 tasks."""
         def __init__(self, *args, total_tasks: int, **kwargs):
             super().__init__(*args, **kwargs)
             self._total_tasks = int(total_tasks)
@@ -51,14 +91,46 @@ def plot_surface(self,
                 time=0.0,
                 component='z',
                 data_type='vel',
-                cmap='RdBu_r', 
+                cmap='RdBu_r',
                 figsize=(12,8),
                 elev=30, azim=-60, s=20, alpha=0.85,
                 axis_equal=False,
                 interpolate=False,
                 interp_method='linear',
                 interp_resolution=300):
-    """Plot a 3-D scatter snapshot of the domain at a given time."""
+    """3-D scatter snapshot of the domain at a single simulation time.
+
+    Parameters
+    ----------
+    self : ShakerMakerData
+    time : float, default ``0.0``
+        Simulation time in seconds. The closest available step is used.
+    component : {'z', 'e', 'n', 'resultant'}, default ``'z'``
+        ``'resultant'`` plots the magnitude of the (E, N, Z) vector.
+    data_type : {'vel', 'accel', 'disp'}, default ``'vel'``
+    cmap : str, default ``'RdBu_r'``
+    figsize : tuple, default ``(12, 8)``
+    elev, azim : float
+        3-D view angles in degrees.
+    s : float, default ``20``
+        Scatter marker size.
+    alpha : float, default ``0.85``
+    axis_equal : bool, default ``False``
+        Force matplotlib's "equal" aspect ratio (slower for huge clouds).
+    interpolate : bool, default ``False``
+        When ``True`` the scattered nodes are interpolated onto a regular
+        2-D grid (using :meth:`ShakerMakerData._interpolate_to_grid`) and
+        rendered as a dense scatter on the active plane. Useful for thin
+        slabs or surface grids.
+    interp_method : {'linear', 'cubic', 'nearest'}, default ``'linear'``
+    interp_resolution : int, default ``300``
+        Grid resolution along each axis.
+
+    Returns
+    -------
+    None
+        Calls ``plt.show()`` directly.
+    """
     # Ensure vmax is computed
     if self._vmax is None:
         self._compute_vmax()
@@ -379,23 +451,31 @@ def plot_surface_arias(self,
 
         if use_safe_mode:
             def _compute_arias(i):
-                from ...analysis.arias_intensity import \
-                    AriasIntensityAnalyzer as _AIA
-                with h5py.File(_filename, 'r') as _f:
+                # Loky spawns fresh worker processes, so every symbol we touch
+                # has to be importable from inside the function -- relying on
+                # module-level globals breaks the pickled closure.
+                from scipy.interpolate import interp1d as _interp1d
+                from ShakerMakerResults.analysis.arias_intensity import (
+                    AriasIntensityAnalyzer as _AIA,
+                )
+                import h5py as _h5py
+                import numpy as _np
+
+                with _h5py.File(_filename, 'r') as _f:
                     _d = _f[_hdf5_path][3*i : 3*i+3, :]
                 _d = _d[[2, 0, 1], :]
                 if _window_mask is not None:
                     _d = _d[:, _window_mask]
                 elif _resample_cache is not None:
                     _t_orig = _resample_cache['time_orig']
-                    _rs = np.zeros((3, _time_len))
+                    _rs = _np.zeros((3, _time_len))
                     for _k in range(3):
-                        _rs[_k] = interp1d(_t_orig, _d[_k],
-                                           kind='linear',
-                                           fill_value='extrapolate')(
-                            np.linspace(_t_orig[0], _t_orig[-1], _time_len))
+                        _rs[_k] = _interp1d(_t_orig, _d[_k],
+                                            kind='linear',
+                                            fill_value='extrapolate')(
+                            _np.linspace(_t_orig[0], _t_orig[-1], _time_len))
                     _d = _rs
-                ia = np.zeros(3)
+                ia = _np.zeros(3)
                 for k in range(3):
                     _, _, _, ia_total, _ = _AIA.compute(_d[k] / 9.81, dt)
                     ia[k] = ia_total
@@ -408,11 +488,16 @@ def plot_surface_arias(self,
             print("  Data loaded. Computing Arias intensity...")
 
             def _compute_arias(i):
+                # Fast path: loky workers still need a self-contained closure.
+                from ShakerMakerResults.analysis.arias_intensity import (
+                    AriasIntensityAnalyzer as _AIA,
+                )
+                import numpy as _np
+
                 data = all_data[i]
-                ia   = np.zeros(3)
+                ia   = _np.zeros(3)
                 for k in range(3):
-                    _, _, _, ia_total, _ = AriasIntensityAnalyzer.compute(
-                        data[k] / 9.81, dt)
+                    _, _, _, ia_total, _ = _AIA.compute(data[k] / 9.81, dt)
                     ia[k] = ia_total
                 return ia
 

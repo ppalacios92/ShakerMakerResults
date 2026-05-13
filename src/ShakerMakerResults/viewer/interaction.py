@@ -1,4 +1,23 @@
-"""Custom VTK interaction styles for the viewer."""
+"""
+interaction.py
+==============
+Custom VTK interactor style used by every viewer pane.
+
+The class :class:`RevitInteractorStyle` subclasses VTK's trackball
+interactor and adds:
+
+* Click-to-pick a single node (with Ctrl-modifier for multi-selection).
+* Rubber-band area selection on left-drag.
+* Middle-drag pan, Shift+middle-drag orbit.
+* Mouse-wheel zoom toward the cursor (matches CAD-style navigation).
+* Esc to clear the current selection.
+
+It is intentionally stateless about geometry / scalars -- it only
+translates raw VTK events into high-level callbacks (``on_point_picked``,
+``on_area_selected``, ``on_clear_selection``) which the owning
+:class:`ViewerScene` handles. That keeps the picker decoupled from the
+selection rendering.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +50,26 @@ class RevitInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
         on_area_selected=None,
         on_clear_selection=None,
     ):
+        """Wire the VTK observers and stash the picker + selection callbacks.
+
+        Parameters
+        ----------
+        plotter : pyvistaqt.QtInteractor
+            The plotter we are installed on; we use it to access the Qt
+            widget for rubber-band rendering.
+        picker : vtk.vtkPointPicker
+            Picker shared with the scene -- we don't own it.
+        on_point_picked : callable, optional
+            ``(point_id, pick_pos, additive) -> None`` invoked on a click
+            that did not turn into a drag.
+        on_point_double_clicked : callable, optional
+            ``(point_id, pick_pos) -> None`` invoked on a double click.
+        on_area_selected : callable, optional
+            ``(start_xy, end_xy) -> None`` invoked when a rubber-band
+            drag is released.
+        on_clear_selection : callable, optional
+            ``() -> None`` invoked on Esc.
+        """
         super().__init__()
         self._plotter = plotter
         self._picker = picker

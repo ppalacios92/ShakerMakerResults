@@ -1,4 +1,23 @@
-"""Matplotlib-based analysis panels used by the interactive viewer."""
+"""
+trace_panel.py
+==============
+Matplotlib analysis panels embedded in the viewer right pane.
+
+Four panels live here, all backed by a Qt-friendly matplotlib canvas
+plus a small background worker that runs the heavy numpy / Newmark /
+Arias call off the GUI thread:
+
+* :class:`SpectrumPanel`        -- Newmark response spectra (PSa).
+* :class:`AriasIntensityPanel`  -- Arias intensity curves.
+* :class:`ResponsesPanel`       -- multi-line time-history overlay with
+  per-component checkboxes.
+* :class:`GFPanel`              -- 9-row Green-Function tensor view.
+
+Every panel reacts to ``session.on_session_updated(reason)`` and only
+recomputes when the relevant ``reason`` arrives. Panels created via
+``_LazyPage`` (in ``side_panel.py``) are not built until the user
+actually opens them, so notebook startup stays fast.
+"""
 
 from __future__ import annotations
 

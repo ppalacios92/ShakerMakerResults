@@ -285,7 +285,7 @@ def plot_gf_connections(self,
         print("No GFs. Call load_gf_database() first.")
         return
 
-    # Convertir 'QA' al índice numérico
+    # Translate 'QA' / 'qa' into the numeric index it occupies.
     if node_id in ('QA', 'qa'):
         node_id_num = self._n_nodes
         node_id_label = 'QA'
@@ -296,7 +296,7 @@ def plot_gf_connections(self,
     # Classification
     comp_donors = set(np.unique(self._pairs_to_compute[:, 0]))
     super_donors = set()
-    # Incluir QA en el análisis
+    # Include QA in the analysis when present.
     total_nodes = self._n_nodes + (1 if self.xyz_qa is not None else 0)
     for node in range(total_nodes):
         donor = self._donor_of_op(node, 0)
@@ -333,11 +333,12 @@ def plot_gf_connections(self,
         print(f"  Node {node_id_label}  →  RECEIVER  ←  donor {dtp}")
     print(sep + '\n')
 
-    # Geometry - incluir QA en xyz_t
+    # Geometry -- include the QA point at the end so indexing matches
+    # the donor / receiver ids we collected above.
     xyz_t = _rotate(self.xyz)
     xyz_qa_t = _rotate(self.xyz_qa) if self.xyz_qa is not None else None
-    
-    # Crear array completo incluyendo QA
+
+    # Full xyz array (regular nodes + QA) used by the donor / receiver lookup.
     if xyz_qa_t is not None:
         xyz_all_t = np.vstack([xyz_t, xyz_qa_t])
     else:
@@ -359,7 +360,7 @@ def plot_gf_connections(self,
     ax.scatter(xyz_t[:, 0], xyz_t[:, 1], xyz_t[:, 2], marker='s',
                c='blue', s=30, alpha=0.1)
 
-    # Donor point - usar xyz_all_t para incluir QA
+    # Donor point -- read from xyz_all_t so QA (last row) is reachable.
     dp = xyz_all_t[dtp]
     ax.scatter(*dp, c='red', marker='s', s=100,
                edgecolors='darkred', linewidths=2, zorder=10, alpha=0.5)

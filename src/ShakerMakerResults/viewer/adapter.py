@@ -1,4 +1,36 @@
-"""Adapter between :class:`ShakerMakerData` and the interactive viewer."""
+"""
+adapter.py
+==========
+Bridge between :class:`ShakerMakerData` and the interactive viewer.
+
+The adapter is the **only** piece of the viewer that knows about HDF5.
+Everything above it (session, scene, panels) goes through this class to
+ask for scalars, traces, GF tensors, spectra and so on. That separation
+keeps the GUI testable in isolation and lets us put the I/O hot paths
+behind a single, well-documented surface.
+
+Caching
+-------
+Two layers of caching are in play:
+
+* **Single-frame snapshots** are produced ad hoc and not memoised --
+  callers either iterate over time (so caching is pointless) or grab
+  one frame for export.
+* **Per-(demand, component) full series** are memoised in an LRU
+  ``_series_cache`` keyed by ``(demand, component)`` and capped by
+  a configurable byte budget (``max_cache_bytes``). When the budget
+  is too small to hold the active triplet we fall back to opening a
+  persistent HDF5 file handle so per-frame reads still skip the
+  ~1-5 ms file-open overhead.
+
+The adapter also owns the **display geometry** (a ``(n, 3)`` array of
+visible-pane coordinates obtained by applying ``DEFAULT_DISPLAY_TRANSFORM``
+to the model XYZ in metres) and the KDTree used by "select nearest".
+
+GF helpers (:meth:`gf_tensor`, :meth:`gf_trace`, ...) delegate to
+:mod:`ShakerMakerResults.core.gf_service` and reuse the same slot /
+``t0`` caches, so a node's GF history is read at most once per session.
+"""
 
 from __future__ import annotations
 

@@ -1,19 +1,58 @@
 """
-Description:
-    This module defines the NewmarkSpectrumAnalyzer class, which implements the linear acceleration
-    method (β-Newmark) to compute the response spectrum of a single-degree-of-freedom (SDOF) system
-    subject to a ground acceleration record. The output includes spectral quantities and time histories.
+newmark.py
+==========
+SDOF Newmark beta solver and response-spectrum analyzer.
+
+The solver (:func:`solve_newmark`) uses the classical linear-acceleration
+formulation (``gamma = 1/2``, ``beta = 1/4``) -- unconditionally stable
+for the periods we care about.
+
+The analyzer (:class:`NewmarkSpectrumAnalyzer`) wraps the solver in a
+period sweep and returns a dict with all spectral quantities plus the
+time histories at ``T = 1.0 s`` (handy for sanity-checks against the
+literature).
+
+History note: we used to import ``cumtrapz`` from ``scipy.integrate``;
+SciPy renamed it to ``cumulative_trapezoid`` in 1.6+. The historical
+import is left commented in the import block for traceability.
 """
 
 import numpy as np
-# from scipy.integrate import cumtrapz
-from scipy.integrate import cumulative_trapezoid
+# from scipy.integrate import cumtrapz  # kept as history -- renamed in SciPy 1.6+
+from scipy.integrate import cumulative_trapezoid  # noqa: F401  (kept for downstream re-imports)
 
 from numba import njit
 
 
 @njit
 def solve_newmark(ag, dt, zeta, Tj):
+    """Run one Newmark beta SDOF response computation.
+
+    Parameters
+    ----------
+    ag : np.ndarray
+        Ground acceleration time series in **m/s^2**.
+    dt : float
+        Time step in seconds.
+    zeta : float
+        Damping ratio (0.05 = 5%).
+    Tj : float
+        SDOF period in seconds.
+
+    Returns
+    -------
+    tuple
+        ``(Sd, Sv, Sa, PSv, PSa, u, v, a, at)`` where the first five are
+        scalars (the spectral peak values) and the last four are the
+        relative-displacement, relative-velocity, relative-acceleration
+        and total-acceleration time histories.
+
+    Notes
+    -----
+    Compiled with ``numba.njit``. The function is called inside a Python
+    loop in :meth:`NewmarkSpectrumAnalyzer.compute`, so all numerics live
+    here.
+    """
     gama = 1/2
     beta = 1/4
     w = 2 * np.pi / Tj
@@ -47,39 +86,50 @@ def solve_newmark(ag, dt, zeta, Tj):
 
 
 class NewmarkSpectrumAnalyzer:
-    """
-    Static class to compute PSa, PSv, Sd, Sv, Sa, and the time histories u, v, a, at
-    using the β-Newmark linear acceleration method.
+    """SDOF Newmark beta response-spectrum analyzer (static API).
+
+    The class has no state -- it groups :meth:`compute` and any future
+    spectrum helpers under a single namespace so callers can write
+    ``NewmarkSpectrumAnalyzer.compute(ag, dt)`` without instantiating.
     """
 
     @staticmethod
     def compute(ag, dt, zeta=0.05 , max_period=5.01 , intervals=0.01):
-        """
-        Compute the response spectrum using the β-Newmark method.
+        """Compute the full SDOF response spectrum for a ground motion.
 
         Parameters
         ----------
         ag : np.ndarray
-            Ground acceleration array [g].
+            Ground acceleration time series in **g** (the function
+            converts to m/s^2 internally).
         dt : float
-            Time step [s].
-        zeta : float
-            Damping ratio (default is 5%).
+            Time step in seconds.
+        zeta : float, default ``0.05``
+            Damping ratio (0.05 = 5%).
+        max_period : float, default ``5.01``
+            Upper bound of the period sweep in seconds.
+        intervals : float, default ``0.01``
+            Period spacing in seconds.
 
         Returns
         -------
         dict
-            Dictionary with:
-                'T'   : np.ndarray, Periods [s]
-                'PSa' : np.ndarray, Pseudo-acceleration spectrum [g]
-                'PSv' : np.ndarray, Pseudo-velocity spectrum [m/s]
-                'Sd'  : np.ndarray, Displacement spectrum [m]
-                'Sv'  : np.ndarray, Velocity spectrum [m/s]
-                'Sa'  : np.ndarray, Acceleration spectrum [g]
-                'u'   : np.ndarray, Displacement time history [m]
-                'v'   : np.ndarray, Velocity time history [m/s]
-                'a'   : np.ndarray, Relative acceleration time history [m/s²]
-                'at'  : np.ndarray, Absolute acceleration time history [m/s²]
+            ``'T'``   : np.ndarray, period sweep [s].
+            ``'PSa'`` : np.ndarray, pseudo-acceleration spectrum [g].
+            ``'PSv'`` : np.ndarray, pseudo-velocity spectrum [m/s].
+            ``'Sd'``  : np.ndarray, displacement spectrum [m].
+            ``'Sv'``  : np.ndarray, velocity spectrum [m/s].
+            ``'Sa'``  : np.ndarray, acceleration spectrum [g].
+            ``'u'``   : np.ndarray, displacement history at T~=1.0 s [m].
+            ``'v'``   : np.ndarray, velocity history at T~=1.0 s [m/s].
+            ``'a'``   : np.ndarray, relative-accel history at T~=1.0 s [g].
+            ``'at'``  : np.ndarray, total-accel history at T~=1.0 s [g].
+
+        Notes
+        -----
+        Periods that fail the stability check ``Tj > dt * pi * sqrt(2)``
+        get PGA-floored values (``Sa = PSa = PGA``, the rest set to 0).
+        Time histories are only populated for the period closest to 1.0 s.
         """
         T = np.arange(0.0, max_period, intervals)
         ag = np.asarray(ag) * 9.81  # convert from g to m/s²
@@ -87,7 +137,7 @@ class NewmarkSpectrumAnalyzer:
         Sd, Sv, Sa, PSv, PSa = [], [], [], [], []
         u_hist, v_hist, a_hist, at_hist = [], [], [], []
 
-        # Estabilidad mínima
+        # Minimum stability check for the Newmark beta scheme
         gama = 1/2
         beta = 1/4
         q = dt * np.pi * np.sqrt(2) * np.sqrt(gama - 2 * beta)
@@ -114,7 +164,7 @@ class NewmarkSpectrumAnalyzer:
                 PSv.append(0)
                 PSa.append(PGA)
 
-        # Convertir a arrays
+        # Convert the per-period accumulators to NumPy arrays
         Sd = np.array(Sd)
         Sv = np.array(Sv)
         Sa = np.array(Sa) / 9.81

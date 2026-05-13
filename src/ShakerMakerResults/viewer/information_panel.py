@@ -16,13 +16,10 @@ from .theme import active_palette
 _, _, _, QtCore, QtGui, QtWidgets = require_viewer_dependencies()
 
 
-# Field key → (label shown in the table, resolver(session) -> str).
-# Keeping the resolvers in one ordered tuple makes it trivial to add or
-# reorder rows without touching the widget construction code.
-_FIELD_KEYS: tuple[str, ...] = (
-    "type", "source", "time", "nodes", "active_field", "gf", "map",
-    "selection", "stations", "cache",
-)
+# NOTE: an earlier draft kept the field keys in a tuple at module level so
+# the widget construction could iterate over them. The current layout uses
+# the ``rows`` tuple inline in ``InformationPanel.__init__`` instead, which
+# also carries the human label, so the standalone tuple was removed.
 
 
 def _bytes_to_gib(value: float) -> float:

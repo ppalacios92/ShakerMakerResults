@@ -1,12 +1,21 @@
 """
 comparison.py
 =============
-Quantitative comparison functions for ShakerMakerData and StationRead objects.
+Quantitative similarity metrics for ``ShakerMakerData`` and ``StationData``.
 
-Functions compute standard signal-similarity metrics (GoF, Peak Error,
-Pearson correlation, RMSE) and spectral metrics, printing a structured
-summary to stdout.
+The two public functions, :func:`compare_node_response` and
+:func:`compare_spectra`, both:
 
+1. Resolve a node id per model (scalar / per-model list / list of lists).
+2. Linearly interpolate signals onto a common time / period grid.
+3. Print a per-component table of GoF, peak error, correlation and RMSE.
+4. Return the same numbers as a nested dict ``{name: {comp: {metric:
+   value}}}`` so they can be inspected programmatically.
+
+The side-effect (stdout print) is intentional -- the functions are
+designed to be run from a notebook where the printed summary is the
+primary output. The returned dict is there for users who want to keep
+the numbers for downstream analysis.
 """
 
 import numpy as np
@@ -19,7 +28,24 @@ from .utils import _is_station, _resolve_node, _get_signals, _get_time, _get_nam
 
 
 def _metrics(sig_ref, sig_test):
-    """Return (GoF, peak_error_pct, pearson_corr, rmse)."""
+    """Compute four similarity metrics between two equal-length traces.
+
+    Parameters
+    ----------
+    sig_ref, sig_test : np.ndarray
+        Reference and test signals (already resampled onto a common grid).
+
+    Returns
+    -------
+    tuple of float
+        ``(gof, peak_err_pct, pearson_corr, rmse)`` where:
+
+        * ``gof``      -- Anderson-style Goodness-of-Fit (1.0 is perfect).
+        * ``peak_err`` -- Peak-amplitude error as a percentage of
+          ``max(|sig_ref|)``.
+        * ``corr``     -- Pearson correlation coefficient.
+        * ``rmse``     -- Root-mean-square error in the input units.
+    """
     diff    = sig_ref - sig_test
     num     = np.sum(diff ** 2)
     den     = np.sum(sig_ref ** 2 + sig_test ** 2)

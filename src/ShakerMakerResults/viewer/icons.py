@@ -1,4 +1,20 @@
-"""Inline SVG icons for the Qt viewer."""
+"""
+icons.py
+========
+Inline SVG icon library for the Qt viewer.
+
+We embed every icon as a path string here rather than shipping a
+``resources/`` directory so:
+
+* the package is one ``pip install`` away with no extra data files,
+* themed re-tinting is trivial (we just inject the colour into the SVG
+  body before rendering),
+* the icons render at any DPI without a separate ``@2x`` asset.
+
+The single public entry point is :func:`icon`, which is LRU-cached on
+``(name, color, size)`` so toolbars / docks that rebuild themselves do
+not hit the SVG renderer twice for the same glyph.
+"""
 
 from __future__ import annotations
 

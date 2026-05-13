@@ -346,6 +346,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         return dock
 
     def _on_dock_visibility(self, key: str, visible: bool) -> None:
+        """Materialise a lazy dock page on first show, then refresh it once."""
         if not visible:
             return
         page = self._side_pages.get(key)
@@ -475,6 +476,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Menu bar ────────────────────────────────────────────────────────────
 
     def _build_menu_bar(self) -> None:
+        """Populate the top menu bar (File / View / Theme / Reset)."""
         menubar = self.menuBar()
 
         # ── File menu ──────────────────────────────────────────────────────
@@ -680,6 +682,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Save / restore window state ─────────────────────────────────────────
 
     def _restore_window_state(self) -> None:
+        """Restore window geometry + dock layout from QSettings (best effort)."""
         s = _settings()
         geom = s.value(_SETTINGS_GEOMETRY)
         state = s.value(_SETTINGS_STATE)
@@ -695,6 +698,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                 pass
 
     def _save_window_state(self) -> None:
+        """Persist window geometry + dock layout to QSettings (best effort)."""
         s = _settings()
         try:
             s.setValue(_SETTINGS_GEOMETRY, self.saveGeometry())
@@ -703,6 +707,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             pass
 
     def _reset_window_layout(self) -> None:
+        """Clear stored geometry and re-apply the factory dock layout."""
         s = _settings()
         s.remove(_SETTINGS_GEOMETRY)
         s.remove(_SETTINGS_STATE)
@@ -831,12 +836,15 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Playback ────────────────────────────────────────────────────────────
 
     def _toggle_play_shortcut(self):
+        """Spacebar shortcut handler: flip the playback flag."""
         self.session.toggle_playing()
 
     def _on_play_toggled(self, _is_playing: bool):
+        """Play-button signal handler -- forward to ``_sync_play_state``."""
         self._sync_play_state()
 
     def _sync_play_state(self):
+        """Start or stop the playback QTimer based on ``state.is_playing``."""
         if self.session.state.is_playing:
             self._playback_last_tick = time.perf_counter()
             self._playback_frame_accumulator = 0.0
@@ -850,6 +858,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._update_status()
 
     def _advance_playback(self):
+        """Re-entrancy guard around :meth:`_advance_playback_once`."""
         if self._advancing_playback:
             return
         self._advancing_playback = True
@@ -859,6 +868,13 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             self._advancing_playback = False
 
     def _advance_playback_once(self):
+        """Advance the time index by the right number of frames for this tick.
+
+        Uses a wall-clock accumulator so the playback speed is honoured
+        even when the render loop is slower than the requested fps. The
+        QTimer interval is adapted from a running average of the actual
+        per-frame render cost.
+        """
         max_index = max(len(self.session.adapter.time) - 1, 0)
         if self.session.state.time_index >= max_index:
             self.session.set_playing(False)
@@ -891,6 +907,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self._write_recording_frame()
 
     def _write_recording_frame(self) -> None:
+        """Ask the Capture toolbar to grab the current frame (no-op when idle)."""
         rec = self._recording_toolbar
         if rec is None:
             return
@@ -902,6 +919,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Status bar ──────────────────────────────────────────────────────────
 
     def _update_status(self):
+        """Refresh every status chip from the current session state."""
         selected = self.session.state.selected_node
         selected_label = "Node -" if selected is None else f"Node {selected}"
         mode = "clamp" if self.session.state.clamp_enabled else "auto"
@@ -917,12 +935,14 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self.status_chip_bar.update_values(chips)
 
     def _cache_summary(self) -> str:
+        """Format the "cache <used>/<budget> MB" chip from the adapter stats."""
         info = self.session.adapter.cache_info
         mb = info["bytes"] / (1024 * 1024)
         budget_mb = info["budget"] / (1024 * 1024)
         return f"cache {mb:.1f}/{budget_mb:.0f} MB"
 
     def _cache_contents_summary(self) -> str:
+        """Return the "loaded ... | warp ..." chip describing what's in cache."""
         adapter = self.session.adapter
         cache = getattr(adapter, "_series_cache", {})
         component_labels = (("e", "e"), ("n", "n"), ("z", "z"), ("resultant", "r"))
@@ -946,10 +966,12 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         return f"loaded {loaded} | {warp}"
 
     def _play_interval_ms(self) -> int:
+        """Adaptive playback timer interval based on the running-average render cost."""
         return max(16, int(self._last_render_ms * 1.1))
 
     @staticmethod
     def _base_frame_duration_s() -> float:
+        """Reference frame duration in seconds at 1.0x speed (80 ms ≈ 12.5 fps)."""
         return 0.08
 
     # ── Shared prewarm helpers ──────────────────────────────────────────────
@@ -1155,6 +1177,12 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Startup pre-warm ────────────────────────────────────────────────────
 
     def _prewarm_on_show(self):
+        """First-paint pre-warm: load the initial scalar series + open HDF5 handle.
+
+        Triggered via ``QTimer.singleShot(0, ...)`` right after the
+        window becomes visible. Skipped when the active demand is GF
+        (those series are small and warmed on demand).
+        """
         if self._closing:
             return
 
@@ -1175,6 +1203,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     # ── Window close / cleanup ──────────────────────────────────────────────
 
     def closeEvent(self, event):  # noqa: N802
+        """Persist window state, dispose toolbars + multi-view, then accept the event."""
         if self._closing:
             event.accept()
             return

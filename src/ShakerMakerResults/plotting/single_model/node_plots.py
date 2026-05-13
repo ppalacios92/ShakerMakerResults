@@ -1,4 +1,17 @@
-"""Standalone node-level plotting helpers."""
+"""
+node_plots.py
+=============
+Standalone node-level plotting helpers.
+
+Every public function in this module:
+
+* Resolves the target nodes through :meth:`ShakerMakerData._collect_node_ids`
+  (so callers can pass ``node_id``, ``target_pos`` or a list of either).
+* Produces a 3x1 matplotlib figure (Z / E / N rows) and calls
+  ``plt.show()`` directly.
+* Accepts a ``factor`` divisor so notebooks can switch units without
+  recomputing.
+"""
 
 from __future__ import annotations
 
@@ -195,8 +208,15 @@ def plot_node_gf(self,
                 components = (z_gf, e_gf, n_gf)
 
             else:
-                # Raw FK kernels (debug)
-                components = (tdata[:, 0], tdata[:, 1], tdata[:, 2])
+                # Raw FK kernels (debug). We still bind z_gf/e_gf/n_gf so the
+                # closing return doesn't blow up with NameError when no
+                # mechanism is supplied -- callers in the raw branch only get
+                # the first three FK columns back, which is what they see in
+                # the plot anyway.
+                z_gf = tdata[:, 0]
+                e_gf = tdata[:, 1]
+                n_gf = tdata[:, 2]
+                components = (z_gf, e_gf, n_gf)
 
             for k, sig in enumerate(components, 1):
                 plt.subplot(3, 1, k)
@@ -215,7 +235,12 @@ def plot_node_gf(self,
 
     plt.tight_layout()
     plt.show()
-    return {'time': time, 'z': z_gf, 'e': e_gf, 'n': n_gf} 
+    # ``time`` / ``z_gf`` / ``e_gf`` / ``n_gf`` only exist when the loop ran
+    # at least once -- when the caller passed an empty node / subfault list
+    # there is nothing meaningful to return and we hand back ``None``.
+    if 'time' not in locals():
+        return None
+    return {'time': time, 'z': z_gf, 'e': e_gf, 'n': n_gf}
 
 
 def plot_node_tensor_gf(self,
@@ -224,7 +249,34 @@ def plot_node_tensor_gf(self,
                         xlim=None,
                         subfault=0,
                         figsize=(10, 8)):
-    """Plot the 9-component tensor Green's functions."""
+    """Plot the 9-component tensor Green's functions for a node.
+
+    Parameters
+    ----------
+    self : ShakerMakerData
+    node_id : int, str, or list, optional
+        Single node id (or ``'QA'``), or a list of either.
+    target_pos : array-like, optional
+        ``(3,)`` for a single position in km, or ``(N, 3)`` for multiple.
+        Resolved to the nearest node automatically.
+    xlim : tuple of float, optional
+        Time bounds in seconds.
+    subfault : int or list, default ``0``
+        One or several subfault ids to overlay.
+    figsize : tuple, default ``(10, 8)``
+
+    Returns
+    -------
+    dict
+        ``{label: {'tdata': ndarray, 'time': ndarray, 't0': float,
+        'node_id': int}}`` -- the raw GF tensors for the resolved
+        ``(node, subfault)`` pairs.
+
+    Raises
+    ------
+    ValueError
+        If neither ``node_id`` nor ``target_pos`` are provided.
+    """
     if not self._gf_loaded:
         print("No GFs. Call load_gf_database() first.")
         return
