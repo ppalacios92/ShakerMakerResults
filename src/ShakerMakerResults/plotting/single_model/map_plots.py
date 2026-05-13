@@ -240,13 +240,16 @@ def create_animation_map(self,
     if time_end is None:
         time_end = self.time[-1]
 
+    # Apply ``factor`` exactly once to the cached vmax. Historical note:
+    # the previous version multiplied by ``factor`` here and then again on
+    # the next line, which silently squared the user's scale. ``vmin``
+    # stays asymmetric for resultant (always 0) and signed otherwise.
     if component.lower() == 'resultant':
         vmax = self._vmax[data_type]['resultant'] * factor
         vmin = 0.0
     else:
         vmax = self._vmax[data_type][component.lower()] * factor
         vmin = -vmax
-    vmax=vmax*factor
     norm   = mcolors.Normalize(vmin=vmin, vmax=vmax)
     thresh = vmax * thresh_pct
 

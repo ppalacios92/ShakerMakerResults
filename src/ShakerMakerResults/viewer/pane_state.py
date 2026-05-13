@@ -87,6 +87,7 @@ class PaneDisplayState:
     __slots__ = ("_session", "_overrides")
 
     def __init__(self, session):
+        """Bind the override layer to a ``ViewerSession`` whose state we proxy."""
         # ``object.__setattr__`` because we use a custom ``__setattr__``.
         object.__setattr__(self, "_session", session)
         object.__setattr__(self, "_overrides", {})
@@ -94,6 +95,7 @@ class PaneDisplayState:
     # ── Attribute protocol ──────────────────────────────────────────────────
 
     def __getattr__(self, name: str) -> Any:
+        """Read an override if present, else fall through to ``session.state``."""
         # __getattr__ only fires for attributes Python could not resolve
         # the usual way, so this catches every "visual" read.
         if name.startswith("_"):
@@ -105,6 +107,7 @@ class PaneDisplayState:
         return getattr(session.state, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
+        """Store ``value`` as an override unless ``name`` is global-only (then drop)."""
         if name in ("_session", "_overrides"):
             object.__setattr__(self, name, value)
             return
@@ -117,9 +120,11 @@ class PaneDisplayState:
     # ── Inspection ──────────────────────────────────────────────────────────
 
     def has_override(self, name: str) -> bool:
+        """Return ``True`` when ``name`` has a per-pane override set."""
         return name in object.__getattribute__(self, "_overrides")
 
     def overridden_names(self) -> tuple[str, ...]:
+        """Return the sorted tuple of attribute names currently overridden."""
         return tuple(sorted(object.__getattribute__(self, "_overrides").keys()))
 
     def snapshot_overrides(self) -> dict[str, Any]:
@@ -151,6 +156,7 @@ class PaneDisplayState:
             target.pop(name, None)
 
     def clear_overrides(self, names: Iterable[str]) -> None:
+        """Drop every override listed in ``names`` (no error on missing keys)."""
         target = object.__getattribute__(self, "_overrides")
         for name in names:
             target.pop(name, None)

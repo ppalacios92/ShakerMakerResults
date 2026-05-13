@@ -7,6 +7,20 @@ recordings. File format is detected automatically for HDF5 outputs.
 
 The public API is loaded lazily so the package can be imported even when
 optional viewer dependencies are not installed yet.
+
+Public surface (lazy):
+
+* Readers   -- ``ShakerMakerData``, ``DRMData``, ``SurfaceData``, ``StationData``
+* Analysis  -- ``NewmarkSpectrumAnalyzer``, ``compute_vmax``
+* Plotting  -- ``plot_node_*``, ``plot_domain*``, ``plot_surface*``,
+  ``create_animation*``, ``plot_models_*``, ``compare_*``
+* Viewer    -- ``ViewerSession``, ``ViewerState``, ``ViewerDataAdapter``
+
+Every name in :data:`__all__` is registered in :data:`_EXPORTS` and only
+imported on first access via the module-level :func:`__getattr__` hook.
+That way ``import ShakerMakerResults`` stays cheap even if the user has not
+installed PyVista/Qt -- the viewer dependencies are only pulled in when
+``ViewerSession`` (or another viewer name) is touched.
 """
 
 from importlib import import_module
@@ -85,6 +99,23 @@ _EXPORTS = {
 
 
 def __getattr__(name):
+    """Lazy attribute hook -- imports the right submodule on first access.
+
+    Parameters
+    ----------
+    name : str
+        Attribute requested by the caller (e.g. ``"ShakerMakerData"``).
+
+    Returns
+    -------
+    object
+        The resolved class or function from the underlying submodule.
+
+    Raises
+    ------
+    AttributeError
+        If ``name`` is not registered in :data:`_EXPORTS`.
+    """
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -96,9 +127,62 @@ def __getattr__(name):
 
 
 def __dir__():
+    """Expose lazy names to ``dir(ShakerMakerResults)`` and tab-completion."""
     return sorted(set(globals()) | set(__all__))
 
-print("""
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+# We used to print the banner unconditionally, which meant every MPI rank
+# spammed it -- a 64-process run gave 64 copies of the same block. The hook
+# below keeps the banner intact for interactive work and notebooks but
+# silences it on non-zero ranks, on plain CI (``CI=1``) and when the user
+# sets ``SHAKERMAKER_NO_BANNER=1``. Detection covers mpi4py and the common
+# launcher env vars (OpenMPI / MPICH / Slurm) without forcing mpi4py as a
+# hard dependency.
+
+def _process_rank() -> int:
+    """Best-effort rank lookup. Returns 0 when not running under MPI.
+
+    Returns
+    -------
+    int
+        MPI rank if detectable, else ``0``.
+    """
+    import os as _os
+
+    for var in ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID"):
+        val = _os.environ.get(var)
+        if val is not None:
+            try:
+                return int(val)
+            except ValueError:
+                pass
+
+    # mpi4py only as a last resort: importing it has side effects.
+    try:
+        from mpi4py import MPI  # type: ignore
+        return int(MPI.COMM_WORLD.Get_rank())
+    except Exception:
+        return 0
+
+
+def _should_show_banner() -> bool:
+    """Return ``True`` if this process is the one allowed to print the banner."""
+    import os as _os
+
+    if _os.environ.get("SHAKERMAKER_NO_BANNER"):
+        return False
+    if _os.environ.get("CI"):
+        return False
+    return _process_rank() == 0
+
+
+def _print_banner() -> None:
+    """Print the welcome block once, on the leader process only."""
+    print(
+        """
   ShakerMakerResults -- Visualization and Analysis Toolkit
   Built on top of Shakermaker Tool
 
@@ -107,7 +191,12 @@ print("""
   Repository  :  https://github.com/ppalacios92/ShakerMakerResults
   ShakerMaker :  https://github.com/ppalacios92/ShakerMaker
 
-  Patricio Palacios B. | Nicolás Mora Bowen | José Abell | Ladruno Team
-  
+  Patricio Palacios B. | Nicolas Mora Bowen | Jose Abell | Ladruno Team
+
   ********* (>'-')> Ladruno4ever  *********
-""")
+"""
+    )
+
+
+if _should_show_banner():
+    _print_banner()

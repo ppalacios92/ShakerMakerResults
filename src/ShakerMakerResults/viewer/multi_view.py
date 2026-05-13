@@ -261,6 +261,7 @@ class ViewPane(QtWidgets.QWidget):
     # ── Active-pane highlight ─────────────────────────────────────────────────
 
     def _fire_activated(self):
+        """Invoke the "I just became active" callback if the parent set one."""
         if self._on_activated is not None:
             self._on_activated(self)
 
@@ -275,13 +276,16 @@ class ViewPane(QtWidgets.QWidget):
 
     @property
     def label(self) -> str:
+        """Pane label shown in the frame title bar (e.g. ``"3D NE"``)."""
         return self._label
 
     def set_station_tags_visible(self, visible: bool, render: bool = True):
+        """Toggle the per-pane station-tags visibility and re-render."""
         self._show_station_tags = bool(visible)
         self.scene.set_station_tags_visible(self._show_station_tags, render=render)
 
     def station_tags_visible(self) -> bool:
+        """Return ``True`` when station tags are currently rendered in this pane."""
         return bool(self._show_station_tags)
 
     # ── Rupture overlay (FFSP) ────────────────────────────────────────────────
@@ -332,6 +336,7 @@ class ViewPane(QtWidgets.QWidget):
         return self._rupture_overlay
 
     def detach_rupture_overlay(self) -> None:
+        """Remove the rupture overlay from this pane (no-op when none attached)."""
         overlay = getattr(self, "_rupture_overlay", None)
         if overlay is None:
             return
@@ -342,6 +347,7 @@ class ViewPane(QtWidgets.QWidget):
         self._rupture_overlay = None
 
     def rupture_overlay(self):
+        """Return the attached :class:`RuptureOverlay` instance, or ``None``."""
         return getattr(self, "_rupture_overlay", None)
 
     # ── Scene refresh ─────────────────────────────────────────────────────────
@@ -458,6 +464,13 @@ class MultiViewArea(QtWidgets.QWidget):
     """
 
     def __init__(self, session, parent=None):
+        """Build the multi-view area with exactly one initial pane.
+
+        The user adds / removes panes through the per-frame split-H /
+        split-V / close buttons; layout presets disappeared with the
+        tree-based refactor but a few legacy attributes are kept around
+        so the older toolbar reads still resolve to sensible defaults.
+        """
         super().__init__(parent)
         self.session = session
         self._panes: list[ViewPane] = []
@@ -598,6 +611,7 @@ class MultiViewArea(QtWidgets.QWidget):
         self._apply_camera_to_all_panes = bool(enabled)
 
     def _camera_target_panes(self) -> list[ViewPane]:
+        """Return the list of panes a camera preset should apply to."""
         if self._apply_camera_to_all_panes:
             return self.visible_panes()
         return [self._active_pane] if self._active_pane is not None else []
@@ -608,6 +622,7 @@ class MultiViewArea(QtWidgets.QWidget):
         return list(self._panes)
 
     def apply_selection_filter(self, mode: str, *, apply_to_all: bool = False):
+        """Route the selection filter to the active pane (or every pane when ``apply_to_all``)."""
         panes = self.visible_panes() if apply_to_all else [self._active_pane]
         for pane in panes:
             if pane is None or pane.scene is None:
@@ -620,6 +635,12 @@ class MultiViewArea(QtWidgets.QWidget):
 
     @staticmethod
     def _apply_camera_preset_to_plotter(plotter, key: str) -> None:
+        """Apply one of the named camera presets to a PyVista plotter.
+
+        Accepted keys: ``iso_ne / iso_nw / iso_sw / iso_se`` (isometric
+        view + azimuth offset), ``top / bottom / front / back / left /
+        right``. Unknown keys are silent no-ops.
+        """
         try:
             if key.startswith("iso_"):
                 plotter.view_isometric()
@@ -727,6 +748,7 @@ class MultiViewArea(QtWidgets.QWidget):
         self._refresh_close_visibility()
 
     def _on_frame_maximize_toggle(self, frame: ViewFrame, wants_maximized: bool):
+        """Maximise or restore a frame, swapping the central stack accordingly."""
         if wants_maximized:
             if self._maximized_frame is not None and self._maximized_frame is not frame:
                 self._maximized_frame.set_maximized_state(False)
@@ -736,6 +758,7 @@ class MultiViewArea(QtWidgets.QWidget):
             self._restore_maximised_frame()
 
     def _on_frame_popout_toggle(self, frame: ViewFrame, wants_popout: bool):
+        """Float the frame in its own window, or dock it back into the splitter."""
         pane = frame.pane
         if not isinstance(pane, ViewPane):
             return
@@ -840,6 +863,12 @@ class MultiViewArea(QtWidgets.QWidget):
     # ── Maximise / restore ───────────────────────────────────────────────────
 
     def _maximise_frame(self, frame: ViewFrame) -> None:
+        """Reparent ``frame`` into the maximise host and switch the stacked widget.
+
+        The original splitter parent and index are remembered so
+        :meth:`_restore_maximised_frame` can put the frame back where it
+        came from.
+        """
         # Remember its splitter slot so we can put it back later.
         parent = frame.parentWidget()
         index = None
@@ -857,6 +886,7 @@ class MultiViewArea(QtWidgets.QWidget):
         self._content_stack.setCurrentIndex(1)
 
     def _restore_maximised_frame(self) -> None:
+        """Put the maximised frame back into its original splitter slot."""
         frame = self._maximized_frame
         if frame is None:
             return
@@ -877,6 +907,7 @@ class MultiViewArea(QtWidgets.QWidget):
     # ── Pop-out / re-dock ────────────────────────────────────────────────────
 
     def _popout_frame(self, frame: ViewFrame) -> None:
+        """Detach ``frame`` into a free-standing QMainWindow (floating window)."""
         pane = frame.pane
         if pane in self._popout_windows:
             return
@@ -907,6 +938,7 @@ class MultiViewArea(QtWidgets.QWidget):
         # missing children by giving them zero size.  Re-docking restores it.
 
     def _dock_frame(self, frame: ViewFrame) -> None:
+        """Reinsert a previously popped-out frame back into the splitter tree."""
         pane = frame.pane
         win = self._popout_windows.pop(pane, None)
         if win is None:
@@ -1146,9 +1178,11 @@ class MultiViewArea(QtWidgets.QWidget):
     # ── Active pane ───────────────────────────────────────────────────────────
 
     def _on_pane_activated(self, pane: ViewPane):
+        """Slot wired to ``ViewPane._on_activated`` -- promote that pane to active."""
         self._set_active_pane(pane)
 
     def _set_active_pane(self, pane: ViewPane | None):
+        """Update every pane's active flag and notify the registered observer."""
         for p in self._panes:
             frame = self._frames.get(p)
             is_active = p is pane
@@ -1165,10 +1199,12 @@ class MultiViewArea(QtWidgets.QWidget):
 
     @property
     def active_pane(self) -> ViewPane | None:
+        """Pane that received the last click, or ``None`` if none yet."""
         return self._active_pane
 
     @property
     def active_plotter(self):
+        """Plotter of the active pane, falling back to the first one when nothing is active."""
         if self._active_pane is not None:
             return self._active_pane.plotter
         return self._panes[0].plotter if self._panes else None
@@ -1233,6 +1269,7 @@ class MultiViewArea(QtWidgets.QWidget):
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def close_all_panes(self):
+        """Call ``plotter.close()`` on every pane (best effort, errors are swallowed)."""
         for pane in self._panes:
             try:
                 pane.plotter.close()
@@ -1252,6 +1289,7 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
     """
 
     def __init__(self, session, parent=None):
+        """Build the tab strip and bootstrap the first ``MultiViewArea`` tab."""
         super().__init__(parent)
         self.session = session
         self._on_active_pane_changed_external = None
@@ -1315,6 +1353,7 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
         return idx
 
     def _fire_structure_changed(self) -> None:
+        """Notify the registered observer that the tab/pane tree changed."""
         cb = self.on_structure_changed
         if callable(cb):
             try:
@@ -1323,6 +1362,7 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
                 pass
 
     def _on_tab_close_requested(self, index: int) -> None:
+        """Close the requested tab, dispose its content and refresh the toolbar."""
         if self._tabs.count() <= 1:
             return
         area = self._tabs.widget(index)
@@ -1365,6 +1405,7 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
         self._proxy_active_pane_changed(self.active_pane)
 
     def _proxy_active_pane_changed(self, pane) -> None:
+        """Forward the per-tab active-pane signal to the externally-registered observer."""
         cb = self._on_active_pane_changed_external
         if callable(cb):
             try:
@@ -1376,52 +1417,63 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
 
     @property
     def current(self) -> MultiViewArea | None:
+        """Return the active tab's ``MultiViewArea``, or ``None`` for external tabs."""
         widget = self._tabs.currentWidget()
         return widget if isinstance(widget, MultiViewArea) else None
 
     @property
     def on_active_pane_changed(self):
+        """Read the currently-registered "active pane changed" callback."""
         return self._on_active_pane_changed_external
 
     @on_active_pane_changed.setter
     def on_active_pane_changed(self, callback):
+        """Register a callback fired when the active pane (or tab) changes."""
         self._on_active_pane_changed_external = callback
 
     @property
     def active_pane(self):
+        """Proxy to the active tab's ``active_pane``."""
         c = self.current
         return c.active_pane if c is not None else None
 
     @property
     def active_plotter(self):
+        """Proxy to the active tab's ``active_plotter``."""
         c = self.current
         return c.active_plotter if c is not None else None
 
     @property
     def _panes(self):
+        """Proxy to the active tab's pane list (empty for external tabs)."""
         c = self.current
         return c._panes if c is not None else []
 
     @property
     def _current_layout(self):
+        """Backward-compat shim: returns the active tab's layout key or ``"1x1"``."""
         c = self.current
         return c._current_layout if c is not None else "1×1"
 
     @property
     def _layout_n(self):
+        """Backward-compat shim: returns the legacy preset count map."""
         c = self.current
         return c._layout_n if c is not None else dict(LAYOUT_PRESETS)
 
     def visible_panes(self):
+        """Proxy to the active tab's ``visible_panes`` (empty for external tabs)."""
         c = self.current
         return c.visible_panes() if c is not None else []
 
     def apply_selection_filter(self, mode: str, *, apply_to_all: bool = False):
+        """Forward the selection filter call to the active tab."""
         c = self.current
         if c is not None:
             c.apply_selection_filter(mode, apply_to_all=apply_to_all)
 
     def set_camera_apply_to_all(self, enabled: bool):
+        """Forward the "Apply to all" camera flag to the active tab."""
         c = self.current
         if c is not None:
             c.set_camera_apply_to_all(enabled)
@@ -1462,6 +1514,7 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
                 pending.add(reason)
 
     def dispose(self) -> None:
+        """Dispose every tab in turn (each one releases its panes + frames)."""
         while self._tabs.count() > 0:
             area = self._tabs.widget(0)
             self._tabs.removeTab(0)
@@ -1476,6 +1529,7 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
                 pass
 
     def refresh_theme(self) -> None:
+        """Propagate a theme refresh to every tab that exposes ``refresh_theme``."""
         for i in range(self._tabs.count()):
             area = self._tabs.widget(i)
             if hasattr(area, "refresh_theme"):

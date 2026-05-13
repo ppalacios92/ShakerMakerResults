@@ -17,7 +17,40 @@ def plot_models_arias(
     figsize=(10, 8),
     factor=1.0,
 ):
-    """Plot Arias intensity curves for multiple models, overlaid in one figure."""
+    """Overlay Arias intensity curves from multiple models on one 3x1 figure.
+
+    Parameters
+    ----------
+    models : list of ShakerMakerData or StationData
+        One entry per model. Mixing reader types is fine -- the helpers
+        in :mod:`utils` duck-type the access.
+    node_ids : list, optional
+        One node id (or list of ids) per model. Mutually exclusive with
+        ``target_pos``.
+    target_pos : list, optional
+        One ``[x, y, z]`` position (in km) per model. Mutually exclusive
+        with ``node_ids``.
+    data_type : {'accel', 'vel', 'disp'}, default ``'accel'``
+        Source signal used to derive Arias intensity. The non-default
+        choices feed the integrand as-is (no kinematic conversion).
+    xlim : tuple of float, optional
+        Time bounds for all three subplots.
+    figsize : tuple, default ``(10, 8)``
+    factor : float, default ``1.0``
+        Multiplier applied to the input acceleration before dividing by
+        ``9.81`` for the Arias integrand.
+
+    Returns
+    -------
+    None
+        Calls ``plt.show()`` directly.
+
+    Raises
+    ------
+    ValueError
+        If neither / both of ``node_ids`` / ``target_pos`` are given, or
+        if the lengths don't match ``len(models)``.
+    """
     from ...analysis.arias_intensity import AriasIntensityAnalyzer
 
     if node_ids is None and target_pos is None:

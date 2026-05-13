@@ -86,6 +86,13 @@ _TRACE_TIME_REFRESH_INTERVAL_S = 0.08
 # ── Lazy page wrapper ─────────────────────────────────────────────────────────
 
 class _LazyPage(QtWidgets.QWidget):
+    """Wrapper that delays the construction of a heavy side-panel page.
+
+    The widget is instantiated up-front (so the nav menu can dock it) but
+    the real content is only built the first time :meth:`ensure_created`
+    fires. Used for the Responses / GF / Information analysis pages.
+    """
+
     """Delays construction of a heavy widget until first navigation.
 
     ``ensure_created()`` triggers the factory and embeds the result.
@@ -93,6 +100,7 @@ class _LazyPage(QtWidgets.QWidget):
     """
 
     def __init__(self, factory, parent=None):
+        """Store the factory callable; do not run it yet."""
         super().__init__(parent)
         self._factory = factory
         self._widget: QtWidgets.QWidget | None = None
@@ -101,17 +109,20 @@ class _LazyPage(QtWidgets.QWidget):
         self._lay = lay
 
     def ensure_created(self) -> QtWidgets.QWidget:
+        """Build the real widget on first call and embed it into the layout."""
         if self._widget is None:
             self._widget = self._factory()
             self._lay.addWidget(self._widget, 1)
         return self._widget
 
     def refresh(self, reason: str):
+        """Forward ``refresh(reason)`` to the embedded widget when it exists."""
         if self._widget is not None:
             self._widget.refresh(reason)
 
     @property
     def is_created(self) -> bool:
+        """Return ``True`` once the factory has run at least once."""
         return self._widget is not None
 
 
@@ -119,6 +130,7 @@ class _PageScrollArea(QtWidgets.QScrollArea):
     """Per-page vertical scroll container that respects the active panel width."""
 
     def __init__(self, page: QtWidgets.QWidget, parent=None):
+        """Wrap ``page`` in a vertical scroll area without an outer frame."""
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -134,6 +146,7 @@ class _ResponsesAnalysisTabs(QtWidgets.QWidget):
     _TAB_KEYS = ("Time History", "Spectrum", "Arias")
 
     def __init__(self, session, parent=None):
+        """Build the three lazy analysis tabs (Time History / Spectrum / Arias)."""
         super().__init__(parent)
         self.session = session
         self._dirty_tabs: set[str] = set()
@@ -159,6 +172,7 @@ class _ResponsesAnalysisTabs(QtWidgets.QWidget):
         self._ensure_current_tab()
 
     def refresh(self, reason: str):
+        """Forward refresh to the active tab; queue the reason for the others."""
         active_key = self._active_key()
         if reason == "time":
             self._pages[active_key].refresh("time")
@@ -193,8 +207,26 @@ class _ResponsesAnalysisTabs(QtWidgets.QWidget):
 # ── Shared base for Apply-button sections ─────────────────────────────────────
 
 class _SectionBase(QtWidgets.QWidget):
+    """Shared plumbing for every side-panel section.
+
+    Each subclass:
+
+    * Owns a small form of widgets bound to a slice of the session state.
+    * Tracks a ``_dirty`` flag so the Apply button can show the user when
+      pending edits are not yet committed.
+    * Routes its ``_apply`` call through :meth:`_route_apply`, which honours
+      the toolbar's "Apply to" selector (global / active pane / all panes
+      in the active tab).
+    * Implements :meth:`refresh` so the section can re-sync from the
+      current state whenever the window broadcasts a relevant reason.
+
+    The ``_syncing`` flag is set while we push fresh values into the
+    widgets so the ``valueChanged`` / ``currentTextChanged`` signals
+    don't bounce back as "user edits".
+    """
 
     def __init__(self, session, parent=None):
+        """Wire the section to a session and reset the dirty / syncing flags."""
         super().__init__(parent)
         self.session = session
         self._syncing = False
@@ -410,6 +442,7 @@ class _StationTable(QtWidgets.QTableWidget):
     HEADERS = ("Station", "coord x", "coord y", "coord z")
 
     def __init__(self, parent=None):
+        """Build the empty 4-column table (Station / x / y / z) with paste support."""
         super().__init__(0, len(self.HEADERS), parent)
         self.setHorizontalHeaderLabels(list(self.HEADERS))
         self.verticalHeader().setVisible(False)
@@ -477,6 +510,7 @@ class NodeSearchSection(_SectionBase):
     """Selected-node info + coordinate search."""
 
     def __init__(self, session, parent=None):
+        """Build the selected-node form (id, coords, dist) and the station table."""
         super().__init__(session, parent)
 
         outer = QtWidgets.QVBoxLayout(self)
@@ -560,7 +594,8 @@ class NodeSearchSection(_SectionBase):
             self._add_station_row(mark_dirty=False)
         self.refresh("init")
 
-    def refresh(self, _reason: str = "full"):
+    def refresh(self, _reason: str = "full"):  # noqa: ARG002
+        """Re-sync the selected-node form and the station table from the session."""
         self._syncing = True
         try:
             if _reason == "init":
@@ -656,6 +691,7 @@ class VectorFieldSection(_SectionBase):
     ]
 
     def __init__(self, session, parent=None):
+        """Build the vector-field form (enable / field / colormap / scale / Apply)."""
         super().__init__(session, parent)
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
@@ -699,7 +735,7 @@ class VectorFieldSection(_SectionBase):
 
         outer.addWidget(box)
         outer.addWidget(
-            self._make_apply_button(self._apply, "Ladruno computing vectors…")
+            self._make_apply_button(self._apply, "Computing vectors…")
         )
         outer.addStretch(1)
         self.refresh("init")
@@ -707,6 +743,7 @@ class VectorFieldSection(_SectionBase):
     # ── Refresh ────────────────────────────────────────────────────────────
 
     def refresh(self, reason: str = "full") -> None:
+        """Re-sync the vector-field form from the session, unless edits are pending."""
         if reason not in self._REFRESH_REASONS and self._dirty:
             return
         self._syncing = True
@@ -729,6 +766,7 @@ class VectorFieldSection(_SectionBase):
     # ── Apply ──────────────────────────────────────────────────────────────
 
     def _apply(self):
+        """Commit the vector-field settings (enable / demand / scale / colormap)."""
         if self._syncing:
             return
         enabled = self.enabled_cb.isChecked()
@@ -801,6 +839,7 @@ class StaticColorSection(_SectionBase):
     }
 
     def __init__(self, session, parent=None):
+        """Build the Color-By form (source / colormap / range / Newmark / Arias / Apply)."""
         super().__init__(session, parent)
         # Same lock-on-edit semantics as DisplaySection for the
         # static color User min / User max spinboxes.
@@ -935,6 +974,7 @@ class StaticColorSection(_SectionBase):
     # ── Refresh ────────────────────────────────────────────────────────────
 
     def refresh(self, reason: str = "full") -> None:
+        """Pull Color-By state from the session and update every editor widget."""
         if reason not in self._REFRESH_REASONS and self._dirty:
             return
         self._syncing = True
@@ -1091,6 +1131,7 @@ class StaticColorSection(_SectionBase):
     # ── Apply ──────────────────────────────────────────────────────────────
 
     def _apply(self):
+        """Commit the Color-By selection (defers to ``_apply_with_busy`` for heavy work)."""
         if self._syncing:
             return
         self.session.apply_static_color_settings(
@@ -1161,6 +1202,7 @@ class DisplaySection(_SectionBase):
     })
 
     def __init__(self, session, parent=None):
+        """Build the Display form (Field + Color Map + range + Apply)."""
         super().__init__(session, parent)
         # When the user types a value into User min / User max we lock
         # the range — subsequent refreshes leave the spinboxes alone so
@@ -1270,6 +1312,12 @@ class DisplaySection(_SectionBase):
         return ps if ps is not None else self.session.state
 
     def refresh(self, reason: str = "full"):
+        """Re-sync demand / component / colormap / range from the active pane.
+
+        Honours the user-locked range: once the user types into the
+        vmin / vmax spin boxes the auto-sync stops until the "reset"
+        button clears the lock.
+        """
         # Vector field and static color have moved to their own docks
         # (VectorFieldSection / StaticColorSection); ignore those reasons here.
         if reason in ("vector_field", "static_color"):
@@ -1405,6 +1453,7 @@ class DisplaySection(_SectionBase):
     # ── Single atomic apply ───────────────────────────────────────────────
 
     def _apply(self):
+        """Commit demand / component / colormap / range / GF subfault in one batch."""
         if self._syncing:
             return
         cmap_value = self.cmap_combo.currentText()
@@ -1480,7 +1529,10 @@ class DisplaySection(_SectionBase):
 
 
 class VisualizationSection(_SectionBase):
+    """Side-panel section with the geometry-visibility toggles (internal / external / QA / labels)."""
+
     def __init__(self, session, parent=None):
+        """Build the visibility checkboxes and the Apply button."""
         super().__init__(session, parent)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(6, 6, 6, 6)
@@ -1500,6 +1552,7 @@ class VisualizationSection(_SectionBase):
         self.refresh("init")
 
     def refresh(self, reason: str = "full"):
+        """Pull current visibility flags from the session. Skips when the user has unsaved edits."""
         if reason not in {"init", "full", "visibility"} and self._dirty:
             return
         self._syncing = True
@@ -1515,6 +1568,7 @@ class VisualizationSection(_SectionBase):
             self._syncing = False
 
     def _apply(self):
+        """Commit the three visibility flags and the Apply-to scope."""
         if self._syncing:
             return
         self.session.apply_visibility_settings(
@@ -1526,7 +1580,10 @@ class VisualizationSection(_SectionBase):
 
 
 class WarpSection(_SectionBase):
+    """Section that controls the displacement warp (toggle, axes, scale, ghost ref)."""
+
     def __init__(self, session, parent=None):
+        """Build the warp form: enable / ghost / per-axis / scale spin + presets / Apply."""
         super().__init__(session, parent)
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
@@ -1583,6 +1640,7 @@ class WarpSection(_SectionBase):
         self.refresh("init")
 
     def refresh(self, reason: str = "full"):
+        """Pull warp toggle / axes / scale from the session. Skips when edits are pending."""
         if reason not in {"init", "full", "warp"} and self._dirty:
             return
         self._syncing = True
@@ -1604,6 +1662,7 @@ class WarpSection(_SectionBase):
             self._syncing = False
 
     def _preset(self, val: float):
+        """Snap the scale spin to a power-of-ten preset (x10 / x100 / x1k / x10k)."""
         if self._syncing:
             return
         b = self.scale_spin.blockSignals(True)
@@ -1612,12 +1671,14 @@ class WarpSection(_SectionBase):
         self._set_dirty(True)
 
     def _auto(self):
+        """Fill the scale spin with the adapter's auto-suggested value."""
         b = self.scale_spin.blockSignals(True)
         self.scale_spin.setValue(float(self.session.suggested_warp_scale()))
         self.scale_spin.blockSignals(b)
         self._set_dirty(True)
 
     def _apply(self):
+        """Commit warp settings and re-prewarm the disp triplet if needed."""
         if self._syncing:
             return
         warp_enabled = self.warp_cb.isChecked()
@@ -1658,6 +1719,7 @@ class GeographicSection(_SectionBase):
     """UTM coordinate reference + display transform matrix panel."""
 
     def __init__(self, session, parent=None):
+        """Build the UTM form (surface + translate coords) and the 3x3 transform editor."""
         super().__init__(session, parent)
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
@@ -1780,6 +1842,7 @@ class GeographicSection(_SectionBase):
             pass
 
     def refresh(self, reason: str = "full"):
+        """Re-read the active display transform from the session into the 3x3 editor."""
         if reason in {"init", "full", "geometry_transform"}:
             self._load_transform()
 
@@ -1793,6 +1856,7 @@ class ViewerSidePanel(QtWidgets.QWidget):
     """
 
     def __init__(self, session, parent=None):
+        """Build the nav menu + stacked pages (lightweight first, lazy heavy ones)."""
         super().__init__(parent)
         self.session = session
         self._active_key: str = "Node"

@@ -1,4 +1,22 @@
-"""GF and mapping helpers for :class:`ShakerMakerData`."""
+"""
+gf_service.py
+=============
+Green-Function read / mapping helpers for :class:`ShakerMakerData`.
+
+These functions live outside the reader class on purpose -- the reader
+keeps the trampoline methods (``model.load_gf_database(...)``) and we
+keep the HDF5 logic here so the class stays focused on metadata and
+display geometry.
+
+Two GF layouts are recognised:
+
+* **OP pipeline** -- ``tdata`` dataset (``(slot, time, 9)``), optional
+  ``t0``, plus a mapping file with ``pair_to_slot`` for O(1) lookup.
+* **Legacy** -- ``GF/sta_N/sub_M/{z,e,n,t,tdata,t0}`` + ``Node_Mapping``.
+
+All public helpers honour :meth:`get_window` (``_window_mask``) and
+:meth:`resample` (``_resample_cache``) when attached to ``model``.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +26,29 @@ from scipy.interpolate import interp1d
 
 
 def load_gf_database(model, h5_path):
-    """Load GF file in OP format."""
+    """Attach an OP-format GF HDF5 database to ``model``.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+        Target reader. Mutated in-place: gains ``_gf_h5_path``,
+        ``_tdata_shape``, ``_nt_gf``, ``_t0_available``, ``_has_gf=True``
+        and a rebuilt ``gf_time``.
+    h5_path : str
+        Path to the GF file. The dataset ``tdata`` is required; ``t0`` is
+        optional (per-slot time offset).
+
+    Returns
+    -------
+    None
+        The function only mutates ``model`` and prints a one-page summary.
+
+    Raises
+    ------
+    ValueError
+        If the file does not contain a ``tdata`` dataset (unsupported
+        GF format).
+    """
     # sep = "--" * 50
     model._gf_h5_path = h5_path
 
@@ -58,7 +98,24 @@ def load_gf_database(model, h5_path):
 
 
 def load_map(model, h5_path):
-    """Load mapping file in OP format."""
+    """Attach the OP-format GF mapping file to ``model``.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+        Target reader. Mutated in-place: gains ``pairs_to_compute``,
+        ``pair_to_slot``, the three ``(dh|zsrc|zrec)_of_pairs`` arrays,
+        the ``delta_*`` tolerances, ``_nsources(_db)`` and
+        ``_has_map=True``.
+    h5_path : str
+        Path to the mapping HDF5 file.
+
+    Returns
+    -------
+    None
+        Mutates ``model`` and prints a one-page summary including the
+        GF-evaluation reduction percentage (``1 - n_slots / n_pairs``).
+    """
     # sep = "--" * 50
     model._gf_map_h5_path = h5_path
 
@@ -92,11 +149,29 @@ def load_map(model, h5_path):
 
 
 def _resolve_gf_slot(model, node_id, subfault_id):
+    """Translate ``(node_id, subfault_id)`` into ``(numeric_node_id, slot_index)``.
+
+    Used by every public GF query so QA-handling lives in one place.
+    """
     node_id_num = model._n_nodes if node_id in ("QA", "qa") else node_id
     return node_id_num, model._get_slot(node_id_num, subfault_id)
 
 
 def _read_raw_gf_slot(model, slot):
+    """Read a single GF slot from disk, returning ``(tdata, t0)``.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+    slot : int
+        Row index in the ``tdata`` dataset.
+
+    Returns
+    -------
+    tuple
+        ``(np.ndarray shape (Nt, 9), float)``. ``t0`` is 0 when the file
+        has no ``t0`` dataset.
+    """
     with h5py.File(model._gf_h5_path, "r") as f:
         tdata = np.asarray(f["tdata"][slot])
         t0 = float(f["t0"][slot]) if getattr(model, "_t0_available", False) else 0.0
@@ -104,6 +179,18 @@ def _read_raw_gf_slot(model, slot):
 
 
 def _apply_gf_time_transform(model, tdata, t0=0.0):
+    """Apply window mask and/or resampling to a raw GF slot.
+
+    The transform mirrors what ``query_service`` does for node data so
+    that GF time and signal time stay aligned after windowing or
+    resampling.
+
+    Returns
+    -------
+    tuple
+        ``(np.ndarray, float)`` -- the transformed tensor and the input
+        ``t0`` unchanged (returned for caller convenience).
+    """
     if hasattr(model, "_window_mask"):
         t_start   = float(model.time[0])
         t_end     = float(model.time[-1])
@@ -129,7 +216,24 @@ def _apply_gf_time_transform(model, tdata, t0=0.0):
 
 
 def get_gf_time(model, slot):
-    """Return the GF time vector for a given slot, respecting window/resample."""
+    """Return the GF time vector for a given slot, respecting window/resample.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+    slot : int
+
+    Returns
+    -------
+    np.ndarray, shape (Nt,)
+        Time in seconds, including the slot's ``t0`` offset when the file
+        provides it.
+
+    Raises
+    ------
+    RuntimeError
+        If no GF database has been attached (``model._has_gf`` is False).
+    """
     if not getattr(model, "_has_gf", False):
         raise RuntimeError("GF not loaded. Call load_gf_database() first.")
 
@@ -159,7 +263,30 @@ def get_gf_time(model, slot):
 
 
 def get_gf_tensor(model, node_id, subfault_id):
-    """Return full ``(nt, 9)`` GF tensor plus time metadata for one pair."""
+    """Return the full ``(nt, 9)`` GF tensor plus time metadata for one pair.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+    node_id : int or {'QA', 'qa'}
+    subfault_id : int
+
+    Returns
+    -------
+    dict
+        Keys:
+
+        * ``'node_id_num'`` -- ``int`` resolved node index.
+        * ``'slot'``        -- ``int`` row index in ``tdata``.
+        * ``'t0'``          -- ``float`` per-slot time offset.
+        * ``'time'``        -- ``np.ndarray`` time vector after window/resample.
+        * ``'tdata'``       -- ``np.ndarray`` shape ``(nt, 9)``, post-transform.
+
+    Raises
+    ------
+    RuntimeError
+        If GF database and/or mapping are not loaded.
+    """
     if not model._has_gf:
         raise RuntimeError("GF not loaded. Call load_gf_database() first.")
     if not model._has_map:
@@ -179,7 +306,27 @@ def get_gf_tensor(model, node_id, subfault_id):
 
 
 def get_gf(model, node_id, subfault_id, component="z"):
-    """Return Green's-function time series for a node/subfault pair."""
+    """Return a single-component GF time series for a node/subfault pair.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+    node_id : int or {'QA', 'qa'}
+    subfault_id : int
+    component : {'z', 'e', 'n', 'tdata'}, default ``'z'``
+        ``'tdata'`` returns the full ``(nt, 9)`` tensor (same as
+        ``get_gf_tensor(...)['tdata']``).
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(nt,)`` for a single component, ``(nt, 9)`` for ``'tdata'``.
+
+    Notes
+    -----
+    Results are memoised on ``model._gf_cache`` keyed by
+    ``(node_id, subfault_id, component)``.
+    """
     if not model._has_gf:
         raise RuntimeError("GF not loaded. Call load_gf_database() first.")
     if not model._has_map:

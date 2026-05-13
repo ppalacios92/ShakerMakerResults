@@ -43,15 +43,62 @@ from ..utils import _rotate
 class ShakerMakerData:
     """Unified reader for ShakerMaker HDF5 output files.
 
-    Automatically detects DRM layout (/DRM_Data) or station layout (/Data).
-    Supports both the OP pipeline GF format (GF_tdata + pair_to_slot) and
-    the legacy format (GF/sta_N/sub_M + Node_Mapping).
+    Detects the layout from the HDF5 root group:
+
+    * ``/DRM_Data``  -- DRM box / SurfaceGrid / PointCloud output
+    * ``/Data``      -- plain station-list output
+
+    Also auto-loads Green-Function metadata when present, in either the
+    OP-pipeline format (``GF_Database_Info`` + ``GF_tdata`` + optional
+    ``pair_to_slot`` for O(1) lookup) or the legacy ``Node_Mapping`` layout.
 
     Parameters
     ----------
     filename : str
+        Path to a ShakerMaker HDF5 file.
     dt : float, optional
-        Resample to this time step. Defaults to original dt in file.
+        Target time step. When given, the time vector is rebuilt at this
+        resolution and per-node reads are resampled on demand using a linear
+        interpolator. ``None`` keeps the native ``dt`` stored in the file.
+
+    Attributes
+    ----------
+    filename : str
+    name : str
+        Stem of ``filename`` (no path, no extension). Used as the display
+        label in plots and the viewer.
+    is_drm : bool
+        ``True`` when the file uses the DRM layout, ``False`` for the
+        station-only layout.
+    xyz : np.ndarray, shape (n_nodes, 3)
+        Node positions in **kilometres**, in ShakerMaker's native frame.
+    xyz_qa : np.ndarray or None
+        Optional QA / control-station position. ``None`` for non-DRM files
+        and DRM files without QA.
+    xyz_all : np.ndarray
+        ``xyz`` stacked with ``xyz_qa`` when QA exists; otherwise just
+        ``xyz``. Convenient for nearest-neighbour searches.
+    internal : np.ndarray of bool, shape (n_nodes,)
+        ``True`` for internal DRM nodes, ``False`` for boundary nodes.
+    spacing : tuple of float
+        Grid spacing along ``(x', y', z')`` in **metres**, computed from
+        the rotated coordinates.
+    time : np.ndarray
+        Data time vector in seconds, after optional resampling.
+    gf_time : np.ndarray
+        Green-Function time vector in seconds (empty if no GF loaded).
+    dt : float
+        Active data time step in seconds.
+
+    Notes
+    -----
+    The constructor only reads metadata + the (small) coordinate arrays, so
+    instantiation is cheap even on very large files. Heavy reads are done
+    on demand through the delegated methods (``get_node_data``,
+    ``get_surface_snapshot``, etc.) and cached in ``_node_cache`` /
+    ``_gf_cache``. A ``_vmax`` sidecar (``<filename>.vmax.json``) is loaded
+    when present so surface-colour limits are available without scanning
+    the whole file.
     """
 
     def __init__(self, filename, dt=None):
@@ -99,7 +146,9 @@ class ShakerMakerData:
 
         xyz_t = _rotate(self.xyz)
 
-        # determinate spacing of the grid
+        # Estimate the regular grid spacing along each rotated axis. Two
+        # near-coincident nodes are treated as one (rounded to 1 µm); the
+        # smallest gap that remains is taken as the spacing.
         def _spacing(arr): 
             d = np.diff(np.sort(np.unique(np.round(arr, 6))))
             if len(d) > 0:
@@ -321,6 +370,7 @@ class ShakerMakerData:
 
 
     def _compute_vmax(self):
+        """Compute (and cache to a sidecar JSON) the per-component vmax map."""
         from ..analysis.vmax_service import compute_vmax
 
         return compute_vmax(self)
@@ -328,17 +378,37 @@ class ShakerMakerData:
 
 
     def _get_slot(self, node_id, subfault_id):
-        """Return GF slot index for (node_id, subfault_id).
+        """Return GF slot index for a ``(node_id, subfault_id)`` pair.
 
-        Primary: O(1) flat array via pair_to_slot[node * nsources + subfault].
-        Fallback: KDTree lookup for legacy databases.
+        Parameters
+        ----------
+        node_id : int or {'QA', 'qa'}
+            Node index. ``'QA'`` maps to the index that lives one past the
+            last regular node so the same flat lookup table covers it.
+        subfault_id : int
+            Subfault index inside the source.
+
+        Returns
+        -------
+        int
+            Slot index in the GF ``tdata`` dataset.
+
+        Notes
+        -----
+        Primary path: O(1) flat lookup via
+        ``pair_to_slot[node * nsources + subfault]``.
+
+        Fallback: KDTree query against the ``(dh, zsrc, zrec)`` cloud --
+        used only for legacy databases that don't ship a ``pair_to_slot``
+        array.
         """
         if not self._has_map:
             raise RuntimeError("Map not loaded. Call load_map('file_map.h5') first.")
         
-        # Convertir 'QA' al índice real
+        # Translate 'QA' / 'qa' to its numeric index, which lives one
+        # past the last regular node (so QA shares the same flat array).
         if node_id in ('QA', 'qa'):
-            node_id = self._n_nodes  # QA está en índice nstations
+            node_id = self._n_nodes
         
         if self._use_pair_to_slot:
             if subfault_id >= self._nsources_db:
@@ -397,12 +467,44 @@ class ShakerMakerData:
     # ------------------------------------------------------------------
 
     def _resolve_node(self, node_id, data_type):
+        """Return ``(data, label)`` for a node id, treating QA-like ids transparently.
+
+        Parameters
+        ----------
+        node_id : int or {'QA', 'qa'}
+            Node index. Anything ``>= len(self.xyz)`` is treated as QA.
+        data_type : {'accel', 'vel', 'disp'}
+
+        Returns
+        -------
+        tuple
+            ``(np.ndarray shape (3, Nt), str)`` -- the signal triplet and a
+            short label suitable for plot legends ("Node 12" / "QA").
+        """
         if node_id in ('QA','qa') or (isinstance(node_id,int) and node_id>=len(self.xyz)):
             return self.get_qa_data(data_type), 'QA'
         return self.get_node_data(node_id, data_type), f'Node {node_id}'
 
     @staticmethod
     def _build_cube_faces(xyz_nodes):
+        """Return cube vertices + polygon faces enclosing a 3-D point set.
+
+        Parameters
+        ----------
+        xyz_nodes : np.ndarray, shape (N, 3)
+            Points whose axis-aligned bounding box defines the cube.
+
+        Returns
+        -------
+        tuple
+            ``(corners, faces, bounds)`` where:
+
+            * ``corners`` is a ``(8, 3)`` array of the eight cube vertices.
+            * ``faces`` is a list of 5 polygons (top + 4 lateral). The
+              bottom face is intentionally omitted to keep the 3-D scatter
+              readable from below.
+            * ``bounds`` is ``(x0, x1, y0, y1, z0, z1)``.
+        """
         x0,x1 = xyz_nodes[:,0].min(), xyz_nodes[:,0].max()
         y0,y1 = xyz_nodes[:,1].min(), xyz_nodes[:,1].max()
         z0,z1 = xyz_nodes[:,2].min(), xyz_nodes[:,2].max()
@@ -414,6 +516,26 @@ class ShakerMakerData:
         return c, faces, (x0,x1,y0,y1,z0,z1)
 
     def _label_nodes_on_ax(self, ax, xyz_t, bounds, label_nodes, comp_donors=None):
+        """Draw per-node text labels on a matplotlib 3-D axes object.
+
+        Parameters
+        ----------
+        ax : mpl_toolkits.mplot3d.Axes3D
+        xyz_t : np.ndarray, shape (n_nodes, 3)
+            Rotated node coordinates in metres.
+        bounds : tuple
+            ``(x0, x1, y0, y1, z0, z1)`` from :meth:`_build_cube_faces` --
+            used to detect "corner / edge / mid" classes.
+        label_nodes : bool or str
+            * ``False``           : nothing drawn (caller usually skips us).
+            * ``True``            : label every node.
+            * ``'corners'``       : only true cube corners.
+            * ``'corners_edges'`` : corners and edge nodes.
+            * ``'corners_half'``  : corners and edge midpoints.
+            * ``'calculated'``    : only nodes in ``comp_donors``.
+        comp_donors : set of int, optional
+            Donor node ids; required when ``label_nodes='calculated'``.
+        """
         x0,x1,y0,y1,z0,z1 = bounds
         xe0,xe1 = xyz_t[:,0].min(), xyz_t[:,0].max()
         ye0,ye1 = xyz_t[:,1].min(), xyz_t[:,1].max()
@@ -478,7 +600,8 @@ class ShakerMakerData:
             target = np.asarray(target_pos)
             dist = np.linalg.norm(self.xyz_all - target, axis=1)
             idx = int(np.argmin(dist))
-            # Verificar si es el QA
+            # ``xyz_all`` has QA appended at the end, so an index past the
+            # last regular row means the nearest point IS the QA station.
             if self.xyz_qa is not None and idx == len(self.xyz):
                 nids = ['QA']
             else:
@@ -501,15 +624,18 @@ class ShakerMakerData:
                     pos = self.xyz[nid]
                     is_internal = self.internal[nid]
                     node_type = "internal" if is_internal else "external"
-                    # Verificar si coincide con QA
+                    # Flag the rare case where a regular node sits on top
+                    # of the QA station (mostly useful while debugging FFSP
+                    # alignment).
                     qa_match = ""
                     if self.xyz_qa is not None:
                         dist_to_qa = np.linalg.norm(pos - self.xyz_qa[0])
                         if dist_to_qa < 1e-6:
                             qa_match = "  ★ COINCIDES WITH QA"
                     print(f"  N{nid:<6} │ pos = [{pos[0]*1000:>10.2f}, {pos[1]*1000:>10.2f}, {pos[2]*1000:>10.2f}] m │ {node_type}{qa_match}")
-            
-            # Si se dio target_pos, mostrar distancia
+
+            # When the caller supplied a target_pos, print the distance to
+            # the resolved node so they can sanity-check the snap.
             if target_pos is not None:
                 target = np.asarray(target_pos)
                 for nid in nids:
@@ -525,8 +651,20 @@ class ShakerMakerData:
 
 
     def _donor_of_op(self, node_id, subfault_id):
-        """Return donor node for OP pipeline."""
-        # Convertir 'QA' al índice numérico
+        """Return the donor node id that owns the GF for one (node, subfault) pair.
+
+        Parameters
+        ----------
+        node_id : int or {'QA', 'qa'}
+        subfault_id : int
+
+        Returns
+        -------
+        int
+            Index in ``self.xyz`` of the node whose GF this pair reuses
+            (equal to ``node_id`` when the pair is its own donor).
+        """
+        # Map 'QA' / 'qa' to the numeric index that lives at len(xyz).
         if node_id in ('QA', 'qa'):
             node_id = self._n_nodes
         slot = self._get_slot(node_id, subfault_id)
@@ -586,137 +724,332 @@ class ShakerMakerData:
     # ------------------------------------------------------------------
     # Delegated public API
     # ------------------------------------------------------------------
+    # Each method here is a one-line passthrough to a helper in
+    # ``core.*_service``, ``plotting.*`` or ``io.export_service``. We keep
+    # the trampolines (rather than attaching the helpers as bound methods)
+    # so the heavy submodules stay import-deferred -- nothing in the
+    # plotting stack is loaded until the user actually calls a plot method.
 
     def load_gf_database(self, h5_path):
+        """Attach an external Green-Function HDF5 database to this model.
+
+        Parameters
+        ----------
+        h5_path : str
+            Path to a GF file in OP format (``tdata`` dataset + optional
+            ``t0``). The handle path is stored; data is read lazily by
+            :meth:`get_gf` / :meth:`get_gf_tensor`.
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.core.gf_service.load_gf_database`.
+        """
         from .gf_service import load_gf_database
 
         return load_gf_database(self, h5_path)
 
     def load_map(self, h5_path):
+        """Attach the GF subfault-to-slot mapping HDF5 file.
+
+        Parameters
+        ----------
+        h5_path : str
+            Path to a mapping file with ``pairs_to_compute``, ``pair_to_slot``,
+            ``dh/zsrc/zrec_of_pairs``, ``delta_h/v_src/v_rec`` and ``nsources``.
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.core.gf_service.load_map`.
+        Required before any GF query when the GF file does not embed its
+        own mapping.
+        """
         from .gf_service import load_map
 
         return load_map(self, h5_path)
 
     def get_node_data(self, node_id, data_type='accel'):
+        """Return ``(3, Nt)`` array for one node, ordered as ``[Z, E, N]``.
+
+        Parameters
+        ----------
+        node_id : int
+            Node index in ``self.xyz``.
+        data_type : {'accel', 'vel', 'disp'}, default ``'accel'``
+
+        Returns
+        -------
+        np.ndarray, shape (3, Nt)
+            Three component traces. Results are cached in ``self._node_cache``
+            keyed by ``(node_id, data_type)``.
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.core.query_service.get_node_data`.
+        Honours :meth:`get_window` masks and :meth:`resample` interpolation.
+        """
         from .query_service import get_node_data
 
         return get_node_data(self, node_id, data_type)
 
     def get_qa_data(self, data_type='accel'):
+        """Return ``(3, Nt)`` array for the QA station ordered as ``[Z, E, N]``.
+
+        Parameters
+        ----------
+        data_type : {'accel', 'vel', 'disp'}, default ``'accel'``
+
+        Returns
+        -------
+        np.ndarray, shape (3, Nt)
+
+        Raises
+        ------
+        AttributeError
+            If the file is a station-only output (no QA group).
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.core.query_service.get_qa_data`.
+        """
         from .query_service import get_qa_data
 
         return get_qa_data(self, data_type)
 
     def get_gf(self, node_id, subfault_id, component='z'):
+        """Return the Green-Function trace for a single (node, subfault) pair.
+
+        Parameters
+        ----------
+        node_id : int or {'QA', 'qa'}
+        subfault_id : int
+        component : {'z', 'e', 'n', 'tdata'}, default ``'z'``
+            ``'tdata'`` returns the full ``(Nt, 9)`` tensor; the others slice
+            a single column.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(Nt,)`` for a single component, ``(Nt, 9)`` for ``'tdata'``.
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.core.gf_service.get_gf`. Results
+        are cached in ``self._gf_cache`` keyed by ``(node, subfault, comp)``.
+        """
         from .gf_service import get_gf
 
         return get_gf(self, node_id, subfault_id, component)
 
     def get_surface_snapshot(self, time_idx, component='z', data_type='vel'):
+        """Return one signal component for every node at a single time step.
+
+        Parameters
+        ----------
+        time_idx : int
+            Index into ``self.time``.
+        component : {'z', 'e', 'n'}, default ``'z'``
+        data_type : {'accel', 'vel', 'disp'}, default ``'vel'``
+
+        Returns
+        -------
+        np.ndarray, shape (n_nodes,)
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.core.query_service.get_surface_snapshot`.
+        Reads directly from disk -- no caching, since callers typically iterate
+        across time.
+        """
         from .query_service import get_surface_snapshot
 
         return get_surface_snapshot(self, time_idx, component, data_type)
 
     def clear_cache(self):
+        """Drop all in-memory caches (node, GF, spectrum) and run ``gc.collect()``.
+
+        Returns
+        -------
+        None
+        """
         from .query_service import clear_cache
 
         return clear_cache(self)
 
     def get_window(self, t_start, t_end):
+        """Return a *lazy* time-windowed copy of this model.
+
+        Parameters
+        ----------
+        t_start, t_end : float
+            Window bounds in seconds.
+
+        Returns
+        -------
+        ShakerMakerData
+            New instance sharing the original ``xyz`` / ``internal`` arrays
+            but with a ``_window_mask`` that future reads honour. No signal
+            data is read at this point.
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.core.window_service.get_window`.
+        The cache attributes (``_node_cache``, ``_gf_cache``, etc.) are
+        reset on the returned object.
+        """
         from .window_service import get_window
 
         return get_window(self, t_start, t_end)
 
     def resample(self, dt):
+        """Return a copy of this model with a different effective ``dt``.
+
+        Parameters
+        ----------
+        dt : float
+            Target time step in seconds.
+
+        Returns
+        -------
+        ShakerMakerData
+            New instance whose ``time`` / ``gf_time`` are rebuilt at the
+            target ``dt``. Subsequent per-node reads are linearly
+            interpolated on demand.
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.core.window_service.resample`.
+        """
         from .window_service import resample
 
         return resample(self, dt)
 
+    # -- plotting trampolines ----------------------------------------
+    # All ``plot_*`` and ``create_animation*`` methods forward to the
+    # standalone helpers under ``plotting.single_model.*``. We import them
+    # inside the method so a user who never plots never pays the matplotlib
+    # import cost.
+
     def plot_domain(self, **kwargs):
+        """Plot the 3-D node domain. See :func:`plotting.single_model.domain_plots.plot_domain`."""
         from ..plotting.single_model.domain_plots import plot_domain
 
         return plot_domain(self, **kwargs)
 
     def plot_domain_calculated_t0(self, **kwargs):
+        """Plot domain nodes coloured by GF ``t0``. See :func:`plotting.single_model.domain_plots.plot_domain_calculated_t0`."""
         from ..plotting.single_model.domain_plots import plot_domain_calculated_t0
 
         return plot_domain_calculated_t0(self, **kwargs)
 
     def plot_node_response(self, node_id=None, **kwargs):
+        """Plot time histories for one or more nodes. See :func:`plotting.single_model.node_plots.plot_node_response`."""
         from ..plotting.single_model.node_plots import plot_node_response
 
         return plot_node_response(self, node_id=node_id, **kwargs)
 
     def plot_node_gf(self, node_id=None, **kwargs):
+        """Plot Green-Function traces for one or more nodes. See :func:`plotting.single_model.node_plots.plot_node_gf`."""
         from ..plotting.single_model.node_plots import plot_node_gf
 
         return plot_node_gf(self, node_id=node_id, **kwargs)
 
     def plot_node_tensor_gf(self, node_id=None, **kwargs):
+        """Plot the 9-component GF tensor. See :func:`plotting.single_model.node_plots.plot_node_tensor_gf`."""
         from ..plotting.single_model.node_plots import plot_node_tensor_gf
 
         return plot_node_tensor_gf(self, node_id=node_id, **kwargs)
 
     def plot_node_newmark(self, node_id=None, **kwargs):
+        """Plot Newmark response spectra for one or more nodes. See :func:`plotting.single_model.node_plots.plot_node_newmark`."""
         from ..plotting.single_model.node_plots import plot_node_newmark
 
         return plot_node_newmark(self, node_id=node_id, **kwargs)
 
     def plot_calculated_vs_reused(self, **kwargs):
+        """Show which nodes are computed donors vs reused receivers. See :func:`plotting.single_model.domain_plots.plot_calculated_vs_reused`."""
         from ..plotting.single_model.domain_plots import plot_calculated_vs_reused
 
         return plot_calculated_vs_reused(self, **kwargs)
 
     def plot_gf_connections(self, **kwargs):
+        """Visualise donor-receiver GF links for one node. See :func:`plotting.single_model.domain_plots.plot_gf_connections`."""
         from ..plotting.single_model.domain_plots import plot_gf_connections
 
         return plot_gf_connections(self, **kwargs)
 
     def plot_surface(self, **kwargs):
+        """3-D scatter snapshot at a given time. See :func:`plotting.single_model.surface_plots.plot_surface`."""
         from ..plotting.single_model.surface_plots import plot_surface
 
         return plot_surface(self, **kwargs)
 
     def create_animation(self, **kwargs):
+        """Render a full-domain 3-D scatter animation. See :func:`plotting.single_model.animation_plots.create_animation`."""
         from ..plotting.single_model.animation_plots import create_animation
 
         return create_animation(self, **kwargs)
 
     def create_animation_plane(self, **kwargs):
+        """Render an animation of a planar slice through the domain. See :func:`plotting.single_model.animation_plots.create_animation_plane`."""
         from ..plotting.single_model.animation_plots import create_animation_plane
 
         return create_animation_plane(self, **kwargs)
 
     def plot_node_arias(self, node_id=None, **kwargs):
+        """Plot Arias intensity curves per node. See :func:`plotting.single_model.node_plots.plot_node_arias`."""
         from ..plotting.single_model.node_plots import plot_node_arias
 
         return plot_node_arias(self, node_id=node_id, **kwargs)
 
     def plot_surface_newmark(self, **kwargs):
+        """Spectral map over the surface at a given period. See :func:`plotting.single_model.surface_plots.plot_surface_newmark`."""
         from ..plotting.single_model.surface_plots import plot_surface_newmark
 
         return plot_surface_newmark(self, **kwargs)
 
     def plot_surface_arias(self, **kwargs):
+        """Arias-intensity map over the surface. See :func:`plotting.single_model.surface_plots.plot_surface_arias`."""
         from ..plotting.single_model.surface_plots import plot_surface_arias
 
         return plot_surface_arias(self, **kwargs)
 
     def write_h5drm(self, name=None):
+        """Write the current time window back out to an HDF5 file.
+
+        Parameters
+        ----------
+        name : str, optional
+            Output filename. Defaults to ``<orig_stem>_t<start>_<end>.h5drm``
+            next to the original file.
+
+        Returns
+        -------
+        str
+            Absolute path to the written file.
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.io.export_service.write_h5drm`.
+        """
         from ..io.export_service import write_h5drm
 
         return write_h5drm(self, name=name)
 
     def plot_surface_on_map(self, mapa, **kwargs):
+        """Overlay a time snapshot on a folium map. See :func:`plotting.single_model.map_plots.plot_surface_on_map`."""
         from ..plotting.single_model.map_plots import plot_surface_on_map
 
         return plot_surface_on_map(self, mapa=mapa, **kwargs)
 
     def create_animation_map(self, **kwargs):
+        """Render an animation on a tile basemap. See :func:`plotting.single_model.map_plots.create_animation_map`."""
         from ..plotting.single_model.map_plots import create_animation_map
 
         return create_animation_map(self, **kwargs)
 
 
+# DRMData / SurfaceData are *not* subclasses -- they are aliases of the same
+# class. The runtime layout (DRM box vs SurfaceGrid) is detected inside the
+# constructor, so notebooks can pick whichever alias reads best.
 DRMData = ShakerMakerData
 SurfaceData = ShakerMakerData

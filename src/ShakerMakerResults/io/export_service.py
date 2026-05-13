@@ -1,4 +1,14 @@
-"""Export helpers."""
+"""
+export_service.py
+=================
+HDF5 writers that take a (possibly windowed) ``ShakerMakerData`` instance
+and produce a self-contained ``.h5drm`` file.
+
+The writer copies metadata + node geometry verbatim and only re-slices
+the time-series datasets along the column axis when a window mask is
+active. That way ``model.get_window(t0, t1).write_h5drm()`` produces a
+drop-in file usable by the downstream DRM pipeline.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +19,29 @@ import numpy as np
 
 
 def write_h5drm(model, name=None):
+    """Write the active time window of ``model`` to a new ``.h5drm`` file.
+
+    Parameters
+    ----------
+    model : ShakerMakerData
+        Source reader. If a window mask is attached (set by
+        :meth:`ShakerMakerData.get_window`), only the masked columns are
+        copied; otherwise the file is essentially a copy.
+    name : str, optional
+        Output filename. Defaults to ``<orig_stem>_t<start>_<end>.h5drm``
+        placed next to the original file.
+
+    Returns
+    -------
+    str
+        Absolute path of the written file.
+
+    Notes
+    -----
+    A ``tqdm`` progress bar is shown while copying the (potentially huge)
+    time-series datasets. ``tqdm`` is imported lazily so users who never
+    write files don't pay the import cost.
+    """
     from tqdm import tqdm
 
     orig_dir = os.path.dirname(model.filename)

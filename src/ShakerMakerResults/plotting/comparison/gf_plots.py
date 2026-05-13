@@ -28,7 +28,47 @@ def plot_models_gf(
     internal_ref=None,
     external_coord=None,
 ):
-    """Plot Green's-function time series for multiple models."""
+    """Overlay Green's-function time series for multiple models.
+
+    Two modes:
+
+    * **Physical** (when ``ffsp_source`` or ``strikes`` is given): rotate
+      the 9-component FK tensor into Z/E/N using fault mechanism + source
+      and receiver positions.
+    * **Raw** (default): plot the first three columns of ``tdata`` as-is.
+      Useful for debugging the GF database itself.
+
+    Parameters
+    ----------
+    models : list of ShakerMakerData
+    node_ids : list, optional
+    target_pos : list, optional
+        Same shape rules as ``plot_models_arias``.
+    subfault : int or list, default ``0``
+    xlim : tuple, optional
+    figsize : tuple, default ``(8, 10)``
+    factor : float, default ``1.0``
+    ffsp_source : FFSPSource, optional
+        Precomputed FFSP rupture metadata (per-subfault strike / dip /
+        rake / position). When given, ``strikes`` / ``dips`` / ``rakes``
+        / ``src_x`` / ``src_y`` are ignored.
+    strikes, dips, rakes : list of float, optional
+        Per-subfault mechanism angles in degrees. Required when
+        ``ffsp_source`` is not given and ``use_physical`` is desired.
+    src_x, src_y : list of float, optional
+        Per-subfault source positions in km (ShakerMaker frame).
+    internal_ref : tuple, optional
+        ``(x, y)`` in FFSP local frame (km) used to anchor the rotation.
+    external_coord : tuple, optional
+        Matching point in ShakerMaker coordinates (km). Pair this with
+        ``internal_ref`` to compute the FFSP -> ShakerMaker offset.
+
+    Returns
+    -------
+    None
+        Calls ``plt.show()`` directly. Models without a GF database / map
+        are silently skipped (one warning per skipped model).
+    """
     if node_ids is None and target_pos is None:
         raise ValueError("Provide node_ids or target_pos.")
 
@@ -92,7 +132,10 @@ def plot_models_gf(
                 offset_y = ext_y - ref_y_rot
 
         for nid in nids:
-            nid_num = obj._n_nodes if nid in ("QA", "qa") else nid
+            # ``nid_num`` used to be computed here as well but the loop body
+            # below works straight with ``nid`` (the GF helpers do the QA
+            # translation themselves), so dropping the dead assignment keeps
+            # the code honest.
             nid_label = "QA" if nid in ("QA", "qa") else f"N{nid}"
 
             if nid in ("QA", "qa"):
@@ -153,7 +196,20 @@ def plot_models_tensor_gf(
     figsize=(12, 10),
     factor=1.0,
 ):
-    """Plot the 9-component tensor Green's functions for multiple models."""
+    """Overlay the 9-component GF tensor for multiple models on a 3x3 figure.
+
+    Parameters
+    ----------
+    models : list of ShakerMakerData
+    node_ids, target_pos, subfault, xlim, figsize, factor :
+        Same as :func:`plot_models_gf`.
+
+    Returns
+    -------
+    None
+        Calls ``plt.show()`` directly. Models with no GF database loaded
+        are skipped with a warning.
+    """
     if node_ids is None and target_pos is None:
         raise ValueError("Provide node_ids or target_pos.")
     if len(models) != len(node_ids if node_ids else target_pos):

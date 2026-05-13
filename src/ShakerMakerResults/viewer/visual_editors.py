@@ -1,4 +1,21 @@
-"""Reusable visual editors for advanced viewer appearance controls."""
+"""
+visual_editors.py
+=================
+Modal dialogs and reusable widgets for advanced appearance controls.
+
+* :class:`TransferFunctionDialog` -- pick / invert / discretise the
+  colormap, edit per-stop colours, set NaN / below / above colours,
+  configure percentile clipping and the symmetric-range toggle.
+* :class:`LegendEditorDialog`     -- scalar-bar title, orientation,
+  position, font sizes, outline / background.
+* :class:`LegendEditorValues` /
+  :class:`TransferEditorValues`   -- frozen dataclasses returned by
+  the dialogs and applied via ``session.apply_*_preferences``.
+* :class:`_ColorButton`           -- compact colour-swatch button used
+  inside the dialogs.
+* :func:`icon_button`             -- helper to build a themed
+  ``QToolButton`` from one of the SVG icons in :mod:`.icons`.
+"""
 
 from __future__ import annotations
 

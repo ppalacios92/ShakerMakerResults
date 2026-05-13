@@ -1,4 +1,16 @@
-"""Standalone animation helpers."""
+"""
+animation_plots.py
+==================
+Standalone matplotlib animation helpers for ``ShakerMakerData``.
+
+Both helpers render PNG frames to disk and then call ``ffmpeg`` to stitch
+them into an MP4. ``ffmpeg`` is located via the ``ffmpeg_path`` parameter
+or, when not given, via ``shutil.which('ffmpeg')`` on ``$PATH``.
+
+Heavy by design: a single 200-frame animation can write 200 PNGs to
+``output_dir``. The directory is created if missing and existing frames
+are silently overwritten.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +31,45 @@ def create_animation(self, time_start=0.0, time_end=None, n_frames=50,
                      ffmpeg_path=None, output_dir='animation', output_video='animation.mp4',
                      axis_equal=True, vmax_from_range=False):
 
-    """Create a 3-D scatter animation of the full domain."""
+    """Render a 3-D scatter animation of the full domain to an MP4.
+
+    Parameters
+    ----------
+    self : ShakerMakerData
+        Bound when this function is exposed as a method.
+    time_start : float, default ``0.0``
+        First simulation time included in the animation.
+    time_end : float, optional
+        Last simulation time. Defaults to ``self.time[-1]``.
+    n_frames : int, default ``50``
+        Number of frames sampled uniformly between ``time_start`` and
+        ``time_end``.
+    component : {'z', 'e', 'n', 'resultant'}, default ``'z'``
+    data_type : {'vel', 'accel', 'disp'}, default ``'vel'``
+    cmap : str, default ``'RdBu_r'``
+    figsize, dpi, fps : matplotlib / ffmpeg settings.
+    elev, azim : float
+        Initial 3-D view angles.
+    s, alpha : float
+        Scatter marker size and opacity.
+    ffmpeg_path : str, optional
+        Full path to the ``ffmpeg`` binary. Defaults to the system one.
+    output_dir : str, default ``'animation'``
+        Directory where frame PNGs are written.
+    output_video : str, default ``'animation.mp4'``
+        Final video path.
+    axis_equal : bool, default ``True``
+    vmax_from_range : bool, default ``False``
+        When ``True`` the colour limits are computed over the requested
+        ``[time_start, time_end]`` window (chunked HDF5 scan); when
+        ``False`` they come from the cached global ``self._vmax``.
+
+    Returns
+    -------
+    None
+        The MP4 is written to ``output_video``. On ffmpeg failure the
+        PNG frames are left on disk and a message is printed.
+    """
     # Ensure vmax is computed
     if self._vmax is None:
         self._compute_vmax()
@@ -107,7 +157,32 @@ def create_animation_plane(self, plane='xy', plane_value=0.0,
                             vmax_from_range=False,
                             axis_equal=True):
 
-    """Create a 3-D animation of a planar slice through the domain."""
+    """Render an animation showing only nodes on a planar slice.
+
+    The plane is axis-aligned and selected by ``plane`` + ``plane_value``;
+    a per-node tolerance is derived from ``self.spacing`` so nodes
+    slightly off-plane (numerical noise) still show.
+
+    Parameters
+    ----------
+    self : ShakerMakerData
+    plane : {'xy', 'xz', 'yz'}, default ``'xy'``
+        Which axis is fixed. The plane value applies to the constrained
+        axis (e.g. ``plane='xy', plane_value=0`` means ``z=0``).
+    plane_value : float, default ``0.0``
+        Coordinate of the constrained axis **in display metres** (already
+        rotated -- same units the on-screen labels use).
+    time_start, time_end, n_frames, component, data_type, cmap,
+    figsize, dpi, fps, elev, azim, s, alpha, ffmpeg_path,
+    output_dir, output_video, axis_equal, vmax_from_range :
+        Same meaning as in :func:`create_animation`.
+
+    Returns
+    -------
+    None
+        Writes the MP4 + PNG frames. Prints a warning and returns early
+        if no node falls on the requested plane.
+    """
     # Ensure vmax is computed
     if self._vmax is None:
         self._compute_vmax()

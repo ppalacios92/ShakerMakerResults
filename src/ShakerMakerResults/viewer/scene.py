@@ -1,4 +1,30 @@
-"""PyVista scene management for the interactive viewer."""
+"""
+scene.py
+========
+PyVista scene management for one viewer pane.
+
+A :class:`ViewerScene` owns the PyVista actors for **one** pane:
+
+* the main point-cloud actor (driven by ``session.current_scalars`` and
+  ``session.current_color_limits``);
+* the selection overlays (yellow sphere for the active node, red spheres
+  for the multi-selection set, optional per-node text labels);
+* the vector-field overlay (shaft + V-tip glyphs with in-place updates
+  during playback so we never reallocate per frame);
+* the warp-reference "ghost" cloud rendered behind the warped points;
+* the world axes / grid / orientation marker;
+* the bounding box and the HUD branding strip.
+
+The scene listens to ``session.on_session_updated(reason)`` -- the
+session calls back into ``refresh_scalars`` / ``refresh_geometry`` /
+``refresh_selection`` / ... according to what changed. Picking events
+are routed through :class:`RevitInteractorStyle` (see ``interaction.py``).
+
+Every read of "what should I draw?" goes through ``self.state`` which is
+a :class:`PaneDisplayState`; that lets one window host two panes with
+different colormap / vmin / vmax / warp settings while sharing the same
+animation clock.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +50,18 @@ class ViewerScene:
     """
 
     def __init__(self, plotter, session, pane_state=None):
+        """Wire the scene to a PyVista plotter, a session and an optional pane overlay.
+
+        Parameters
+        ----------
+        plotter : pyvistaqt.QtInteractor
+            The plotter this scene owns; we add and remove actors on it.
+        session : ViewerSession
+            Shared session used for data access and selection mutation.
+        pane_state : PaneDisplayState, optional
+            Per-pane overrides. When ``None`` we read straight from
+            ``session.state`` so legacy single-pane callers keep working.
+        """
         self.plotter = plotter
         self.session = session
         # ``state`` is the per-pane overlay (with fall-through to
@@ -147,6 +185,11 @@ class ViewerScene:
     # Scene build.
 
     def build(self, *, lightweight: bool = False):
+        """Build the scene from scratch (point cloud, actors, picking, branding).
+
+        ``lightweight=True`` is used for GF 3x3 panes that don't need the
+        full overlays -- skipping cosmetic actors keeps the grid snappy.
+        """
         self._rebuild_point_cloud(lightweight=lightweight)
         self.plotter.set_background(self.session.current_background_color(state=self.state))
         self.point_actor = self._add_point_actor()
@@ -160,6 +203,7 @@ class ViewerScene:
         self._add_branding()
 
     def refresh_scalars(self, render: bool = True):
+        """Update the active scalar array on the main actor (hot path during playback)."""
         # Hot path: respect the per-pane GF component pin when active.
         if self._gf_pin_active():
             scalars = self._scalars_for_gf_pin()
@@ -216,6 +260,7 @@ class ViewerScene:
             self.plotter.render()
 
     def refresh_ghost_reference(self, render: bool = True):
+        """Toggle the faint undeformed reference cloud rendered behind the warped one."""
         if self.ghost_actor is not None:
             try:
                 self.plotter.remove_actor(self.ghost_actor, render=False)
@@ -255,6 +300,7 @@ class ViewerScene:
             self.plotter.render()
 
     def rebuild_for_visibility(self, render: bool = True):
+        """Drop and re-add the main actor after a visibility toggle (internal / external / QA)."""
         if self.point_actor is not None:
             self.plotter.remove_actor(self.point_actor, render=False)
             self.point_actor = None
@@ -265,6 +311,7 @@ class ViewerScene:
             self.plotter.render()
 
     def rebuild_scalar_actor(self, render: bool = True):
+        """Full main-actor rebuild (used when demand, component or colormap changes)."""
         self._rebuild_point_cloud()
         if self.point_actor is not None:
             self.plotter.remove_actor(self.point_actor, render=False)
@@ -287,6 +334,7 @@ class ViewerScene:
         self._add_branding()
 
     def refresh_selection(self, render: bool = True):
+        """Redraw the yellow "selected node" sphere (and its optional text label)."""
         if self.selection_actor is not None:
             self.plotter.remove_actor(self.selection_actor, render=False)
             self.selection_actor = None
@@ -616,6 +664,7 @@ class ViewerScene:
             self.plotter.render()
 
     def refresh_station_tags(self, render: bool = True):
+        """Redraw the red station markers + their text labels (or hide everything)."""
         if self.station_actor is not None:
             try:
                 self.plotter.remove_actor(self.station_actor, render=False)
@@ -668,6 +717,7 @@ class ViewerScene:
             self.plotter.render()
 
     def set_station_tags_visible(self, visible: bool, render: bool = True):
+        """Toggle the per-scene station-tags visibility flag and re-render."""
         self.show_station_tags = bool(visible)
         self.refresh_station_tags(render=render)
 
@@ -716,6 +766,17 @@ class ViewerScene:
             self.session.add_nodes_to_multi_selection(node_ids_in_rect)
 
     def apply_selection_filter(self, mode: str, render: bool = True):
+        """Restrict the main actor to nodes that match the current selection.
+
+        Parameters
+        ----------
+        mode : {'all', 'only', 'hide'}
+            * ``'all'``  -- render every visible node (reset filter).
+            * ``'only'`` -- render only the current selection.
+            * ``'hide'`` -- render every visible node *except* the selection.
+            Any other value falls back to ``'all'``.
+        render : bool, default ``True``
+        """
         if mode not in ("all", "only", "hide"):
             mode = "all"
         self._selection_visibility = mode
@@ -791,6 +852,12 @@ class ViewerScene:
         self.center_on_node(node_id)
 
     def apply_appearance(self, render: bool = True):
+        """Re-apply background colour, branding text and the GF component label.
+
+        VTK text actors bake their colour at creation, so a background
+        swap (light <-> dark) forces us to recreate the HUD text actors
+        to keep their foreground colour readable.
+        """
         self.plotter.set_background(self.session.current_background_color(state=self.state))
         # VTK text actors bake their colour at creation time — the branding
         # block and the GF component label keep their *original* foreground
@@ -823,6 +890,7 @@ class ViewerScene:
         self._sync_axes_grid()
 
     def apply_color_range(self, render: bool = True):
+        """Re-apply the active color range to the main actor without rebuilding it."""
         if self.point_cloud is not None and "active_scalars" in self.point_cloud.point_data:
             scalars = self.point_cloud.point_data["active_scalars"]
         else:
@@ -833,6 +901,7 @@ class ViewerScene:
             self.plotter.render()
 
     def center_on_node(self, node_id, render: bool = True):
+        """Pan the camera so ``node_id`` is at the focal point (keeps zoom + direction)."""
         point = self.session.adapter.point_for_node(node_id)
         camera = getattr(self.plotter, "camera", None)
         if camera is None:

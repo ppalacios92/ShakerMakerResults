@@ -1,4 +1,20 @@
-"""Qt controls used by the viewer window."""
+"""
+controls.py
+===========
+Small Qt widgets that live in the viewer header and footer:
+
+* :class:`HeaderBar`        -- top strip with the dataset title and
+  the appearance popover.
+* :class:`AppearanceButton` -- popover menu that opens the transfer
+  function and legend editors.
+* :class:`TimeControls`     -- bottom transport bar with the time
+  slider, playback buttons and the speed combo.
+* :class:`StatusChipBar`    -- pill-style status labels (memory,
+  cache contents, current frame, ...).
+
+These widgets are deliberately thin: they only emit Qt signals or call
+straight into ``session.set_*``; no business logic lives here.
+"""
 
 from __future__ import annotations
 
