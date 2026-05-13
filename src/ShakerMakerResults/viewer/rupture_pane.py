@@ -71,8 +71,11 @@ class _FFSPControlPanel(QtWidgets.QWidget):
         field_form.setContentsMargins(6, 4, 6, 6)
         self.field_combo = QtWidgets.QComboBox()
         for key, label, unit, animated in _FIELD_OPTIONS:
-            suffix = "  ⏱" if animated else ""
-            self.field_combo.addItem(f"{label}{suffix}", key)
+            # ``animated`` is still part of _FIELD_OPTIONS for documentation
+            # purposes, but we no longer decorate the label — the "Animate
+            # with global time" checkbox below the combo conveys the same
+            # information without informal glyphs.
+            self.field_combo.addItem(label, key)
         idx = self.field_combo.findData(_DEFAULT_FIELD)
         if idx >= 0:
             self.field_combo.setCurrentIndex(idx)
@@ -919,11 +922,16 @@ class RuptureOverlay:
         # value only matters for the first frame.
         vmin0, vmax0 = self._snapshot_clim_default()
 
-        cmap_name = effective_colormap_name(self.colormap, inverted=False)
+        # Pass the snapshot's colormap name verbatim — the FFSP panel
+        # already exposes ``_r``-suffixed entries directly, so feeding it
+        # through ``effective_colormap_name`` would strip the suffix and
+        # silently flip "hot_r" into "hot", "magma_r" into "magma", etc.
+        # That helper is meant for panels that have a separate "invert"
+        # checkbox, which the rupture importer does not.
         self._actor = plotter.add_mesh(
             self._cloud,
             scalars="active",
-            cmap=cmap_name,
+            cmap=self.colormap,
             clim=(vmin0, vmax0),
             point_size=max(_POINT_SIZE - 1, 4),
             render_points_as_spheres=True,
