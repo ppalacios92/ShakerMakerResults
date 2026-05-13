@@ -184,8 +184,8 @@ class _FFSPControlPanel(QtWidgets.QWidget):
         proj_layout.addWidget(self.apply_btn)
 
         proj_layout.addWidget(QtWidgets.QLabel(
-            "Tip: el botón abre un selector de vistas y panes para "
-            "elegir cuáles reciben la falla."
+            "Tip: the button opens a picker so you can choose which "
+            "views and panes receive the fault."
         ))
         outer.addWidget(proj_box)
 
@@ -652,8 +652,8 @@ class RuptureTab(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.information(
                     self,
                     "No seismic view found",
-                    "Abre la pestaña Main view (o cualquier tab sísmica) "
-                    "antes de proyectar la falla.",
+                    "Open the Main view tab (or any seismic tab) before "
+                    "projecting the fault.",
                 )
                 self._reset_project_button()
                 return
@@ -670,8 +670,8 @@ class RuptureTab(QtWidgets.QWidget):
             if not targets:
                 QtWidgets.QMessageBox.information(
                     self,
-                    "Sin selección",
-                    "No marcaste ninguna vista — la falla no se proyectó.",
+                    "No selection",
+                    "No view was checked — the fault was not projected.",
                 )
                 self._reset_project_button()
                 return
@@ -707,7 +707,7 @@ class RuptureTab(QtWidgets.QWidget):
                     QtWidgets.QMessageBox.warning(
                         self,
                         "Overlay failed",
-                        f"No pude proyectar la falla:\n\n{exc}",
+                        f"Failed to project the fault:\n\n{exc}",
                     )
                     continue
                 self._overlay_panes.append(pane)
@@ -757,8 +757,8 @@ class RuptureTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Apply partially failed",
-                f"No pude actualizar {failed} overlay(s).  El resto sí "
-                "tomó los nuevos colores.",
+                f"Failed to update {failed} overlay(s).  The remaining "
+                "ones picked up the new colors.",
             )
 
     # ── Tab-system contract ──────────────────────────────────────────────
@@ -813,8 +813,8 @@ class _PaneTargetDialog(QtWidgets.QDialog):
         layout.setSpacing(8)
 
         intro = QtWidgets.QLabel(
-            "Elegí en qué vistas y panes querés que aparezca esta falla.<br>"
-            "Tildá uno o varios; el siguiente paso te pide la ubicación UTM."
+            "Choose which views and panes should display this fault.<br>"
+            "Check one or more; the next step asks for the UTM location."
         )
         intro.setTextFormat(QtCore.Qt.RichText)
         intro.setWordWrap(True)
@@ -925,11 +925,11 @@ class _RuptureProjectionDialog(QtWidgets.QDialog):
 
         strike = float(source.params.get("strike", 0.0))
         intro = QtWidgets.QLabel(
-            "Pegá los dos vectores tal cual los usás en <code>plot_spacial_distribution</code>,<br>"
-            "pero en <b>metros</b> (sin dividir por 1000 — así no se pierden decimales).<br>"
-            "<code>internal_ref</code> sigue la convención de los ejes del plot 2-D:<br>"
-            "<b>primer valor = Along Dip</b>, <b>segundo valor = Along Strike</b>.<br>"
-            f"Strike del HDF5: <b>{strike:.3f}°</b> — se aplica automáticamente."
+            "Paste the two vectors as you use them in <code>plot_spacial_distribution</code>,<br>"
+            "but in <b>metres</b> (no division by 1000 — keeps full precision).<br>"
+            "<code>internal_ref</code> follows the 2-D plot axes convention:<br>"
+            "<b>first value = Along Dip</b>, <b>second value = Along Strike</b>.<br>"
+            f"Strike from HDF5: <b>{strike:.3f}°</b> — applied automatically."
         )
         intro.setWordWrap(True)
         intro.setTextFormat(QtCore.Qt.RichText)
@@ -941,16 +941,16 @@ class _RuptureProjectionDialog(QtWidgets.QDialog):
         self.internal_edit = QtWidgets.QLineEdit()
         self.internal_edit.setPlaceholderText("-8000, 0   (Along Dip, Along Strike)")
         self.internal_edit.setToolTip(
-            "internal_ref [m]: punto en el frame fault-local en convención "
-            "del plot 2-D — (Along Dip, Along Strike).  (0, 0) = hipocentro."
+            "internal_ref [m]: a point in the fault-local frame in 2-D "
+            "plot convention — (Along Dip, Along Strike).  (0, 0) = hypocentre."
         )
         form.addRow("internal_ref [m]", self.internal_edit)
 
         self.external_edit = QtWidgets.QLineEdit()
         self.external_edit.setPlaceholderText("utmx, utmy   (e.g. 359958.176, 6294124.525)")
         self.external_edit.setToolTip(
-            "external_coord [m]: UTM (Easting, Northing) en metros donde "
-            "debe quedar el internal_ref."
+            "external_coord [m]: UTM (Easting, Northing) in metres where "
+            "the internal_ref should land."
         )
         form.addRow("external_coord [m]", self.external_edit)
 
@@ -1015,7 +1015,7 @@ class _RuptureProjectionDialog(QtWidgets.QDialog):
             parts = s.split()
         if len(parts) != 2:
             raise ValueError(
-                f"Esperaba dos números separados por coma; recibí: {text!r}"
+                f"Expected two comma-separated numbers; got: {text!r}"
             )
         return float(parts[0].strip()), float(parts[1].strip())
 
@@ -1023,12 +1023,12 @@ class _RuptureProjectionDialog(QtWidgets.QDialog):
         try:
             internal_m = self._parse_vec(self.internal_edit.text())
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "internal_ref inválido", str(exc))
+            QtWidgets.QMessageBox.warning(self, "Invalid internal_ref", str(exc))
             return
         try:
             external_m = self._parse_vec(self.external_edit.text())
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "external_coord inválido", str(exc))
+            QtWidgets.QMessageBox.warning(self, "Invalid external_coord", str(exc))
             return
         # The dialog asks the user in metres so every UTM decimal survives
         # the round-trip.  The overlay's transform expects kilometres, so
