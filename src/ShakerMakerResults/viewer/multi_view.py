@@ -284,6 +284,66 @@ class ViewPane(QtWidgets.QWidget):
     def station_tags_visible(self) -> bool:
         return bool(self._show_station_tags)
 
+    # ── Rupture overlay (FFSP) ────────────────────────────────────────────────
+
+    def attach_rupture_overlay(
+        self,
+        source,
+        *,
+        external_coord_km: tuple[float, float] = (0.0, 0.0),
+        internal_ref_km: tuple[float, float] = (0.0, 0.0),
+        strike_deg: float | None = None,
+        unit_scale: float = 1e-3,
+        z_scale: float | None = None,
+    ) -> "RuptureOverlay":
+        """Render *source* as an extra actor inside this pane's plotter.
+
+        Adds a subfault point cloud and a hypocentre sphere to the host
+        pane's plotter; the overlay animates with the global timeline
+        through :meth:`on_session_updated`.
+
+        Coordinate transform follows ShakerMaker's
+        ``FFSPSource.plot_spacial_distribution`` convention:
+
+        * ``unit_scale`` scales fault metres into the seismic scene units
+          (default ``1e-3`` for kilometres).
+        * Subfault ``(x, y)`` rotate around the hypocentre by
+          ``strike_deg`` (defaults to the source's ``params['strike']``).
+        * ``internal_ref_km`` (fault-local km point) is translated to
+          ``external_coord_km`` (UTM km), so the user only needs to type
+          their UTM target.
+
+        Calling this while another overlay is already attached drops the
+        previous one first.
+        """
+        # Lazy import keeps :mod:`multi_view` decoupled from the FFSP module
+        # when no rupture is loaded.
+        from .rupture_pane import RuptureOverlay
+        self.detach_rupture_overlay()
+        self._rupture_overlay = RuptureOverlay(
+            self,
+            source,
+            external_coord_km=external_coord_km,
+            internal_ref_km=internal_ref_km,
+            strike_deg=strike_deg,
+            unit_scale=unit_scale,
+            z_scale=z_scale,
+        )
+        return self._rupture_overlay
+
+    def detach_rupture_overlay(self) -> None:
+        overlay = getattr(self, "_rupture_overlay", None)
+        if overlay is None:
+            return
+        try:
+            overlay.detach()
+        except Exception:
+            pass
+        self._rupture_overlay = None
+
+    def rupture_overlay(self):
+        return getattr(self, "_rupture_overlay", None)
+
     # ── Scene refresh ─────────────────────────────────────────────────────────
 
     def on_session_updated(self, reason: str):
@@ -326,6 +386,17 @@ class ViewPane(QtWidgets.QWidget):
         else:
             self.scene.rebuild_scalar_actor(render=False)
             self.scene.refresh_selection(render=False)
+
+        # Rupture overlay piggy-backs on the same broadcast — it only cares
+        # about ``time`` / ``playback`` / ``full`` / ``init`` updates and
+        # is a no-op when no overlay is attached.
+        overlay = getattr(self, "_rupture_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.on_session_updated(reason)
+            except Exception:
+                pass
+
         try:
             self.plotter.render()
         except Exception:
@@ -333,6 +404,10 @@ class ViewPane(QtWidgets.QWidget):
 
     def dispose(self) -> None:
         """Tear down this pane's scene and VTK/Qt interactor resources."""
+        try:
+            self.detach_rupture_overlay()
+        except Exception:
+            pass
         try:
             if self.scene is not None:
                 self.scene.dispose()
@@ -1223,6 +1298,22 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
         self._fire_structure_changed()
         return area
 
+    def add_external_tab(self, widget: QtWidgets.QWidget, label: str) -> int:
+        """Attach an arbitrary widget as a new tab.
+
+        Used for content that does NOT follow the :class:`ViewPane` /
+        :class:`MultiViewArea` contract — e.g. the FFSP rupture viewer.
+        The widget should expose ``on_session_updated(reason)`` and
+        ``dispose()`` so broadcasts and close-down work like for the
+        seismic tabs; both calls are wrapped in try/except so missing
+        hooks degrade gracefully.
+        """
+        idx = self._tabs.addTab(widget, label)
+        self._tabs.setCurrentIndex(idx)
+        self._tabs.setTabsClosable(self._tabs.count() > 1)
+        self._fire_structure_changed()
+        return idx
+
     def _fire_structure_changed(self) -> None:
         cb = self.on_structure_changed
         if callable(cb):
@@ -1241,10 +1332,17 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
                 area.dispose()
             except Exception:
                 pass
+        elif hasattr(area, "dispose"):
+            # External tabs (e.g. FFSP rupture) get the same dispose hook
+            # so their plotter / actors are released before deleteLater.
             try:
-                area.deleteLater()
+                area.dispose()
             except Exception:
                 pass
+        try:
+            area.deleteLater()
+        except Exception:
+            pass
         self._tabs.setTabsClosable(self._tabs.count() > 1)
         self._fire_structure_changed()
 
@@ -1253,14 +1351,15 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
         # reason (each of which can trigger a full ``rebuild_scalar_actor``
         # on 100k-point clouds) we coalesce the lot into a single ``full``
         # broadcast.  ``full`` already covers the union of every other
-        # reason's effects in ``ViewPane.on_session_updated``.
-        new_area = self.current
-        if isinstance(new_area, MultiViewArea):
-            pending = getattr(new_area, "_pending_reasons", None)
+        # reason's effects in ``ViewPane.on_session_updated`` and is the
+        # right "catch up" signal for external tabs (FFSP) as well.
+        new_widget = self._tabs.currentWidget()
+        if new_widget is not None and hasattr(new_widget, "on_session_updated"):
+            pending = getattr(new_widget, "_pending_reasons", None)
             if pending:
                 pending.clear()
                 try:
-                    new_area.on_session_updated("full")
+                    new_widget.on_session_updated("full")
                 except Exception:
                     pass
         self._proxy_active_pane_changed(self.active_pane)
@@ -1336,13 +1435,18 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
         catches up in a single rebuild.  This keeps a 3-tab session
         with 4 panes each from triggering 12 renders on every cmap
         change — only the 4 visible panes work.
+
+        External tabs (FFSP rupture, etc.) get the broadcast too when
+        active and accumulate ``_pending_reasons`` when hidden, exactly
+        like ``MultiViewArea`` tabs — the only requirement is that they
+        expose ``on_session_updated(reason)``.
         """
-        current = self.current
+        current_widget = self._tabs.currentWidget()
         for i in range(self._tabs.count()):
             area = self._tabs.widget(i)
-            if not isinstance(area, MultiViewArea):
+            if not hasattr(area, "on_session_updated"):
                 continue
-            if area is current:
+            if area is current_widget:
                 try:
                     area.on_session_updated(reason)
                 except Exception:
@@ -1351,22 +1455,25 @@ class TabbedMultiViewArea(QtWidgets.QWidget):
                 pending = getattr(area, "_pending_reasons", None)
                 if pending is None:
                     pending = set()
-                    area._pending_reasons = pending
+                    try:
+                        area._pending_reasons = pending
+                    except Exception:
+                        continue
                 pending.add(reason)
 
     def dispose(self) -> None:
         while self._tabs.count() > 0:
             area = self._tabs.widget(0)
             self._tabs.removeTab(0)
-            if isinstance(area, MultiViewArea):
+            if hasattr(area, "dispose"):
                 try:
                     area.dispose()
                 except Exception:
                     pass
-                try:
-                    area.deleteLater()
-                except Exception:
-                    pass
+            try:
+                area.deleteLater()
+            except Exception:
+                pass
 
     def refresh_theme(self) -> None:
         for i in range(self._tabs.count()):

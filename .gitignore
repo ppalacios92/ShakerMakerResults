@@ -25,6 +25,9 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Office lock / temp files (Excel, Word, …)
+~$*
+
 # folders
 tests/
 

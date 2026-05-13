@@ -477,6 +477,17 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
     def _build_menu_bar(self) -> None:
         menubar = self.menuBar()
 
+        # ── File menu ──────────────────────────────────────────────────────
+        file_menu = menubar.addMenu("&File")
+        import_menu = file_menu.addMenu("&Import")
+        rupture_act = QtGui.QAction("&Rupture (FFSP HDF5)…", self)
+        rupture_act.setStatusTip(
+            "Load a rupture realization exported by FFSPSource.write_hdf5 "
+            "into a new tab so the fault animates with the global timeline."
+        )
+        rupture_act.triggered.connect(self._on_import_rupture)
+        import_menu.addAction(rupture_act)
+
         view_menu = menubar.addMenu("&View")
 
         # Panels submenu — one entry per dock toggling visibility.
@@ -518,6 +529,66 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         reset_act = QtGui.QAction("Reset window layout", self)
         reset_act.triggered.connect(self._reset_window_layout)
         view_menu.addAction(reset_act)
+
+    # ── Rupture import ──────────────────────────────────────────────────────
+
+    def _on_import_rupture(self) -> None:
+        """File → Import → Rupture handler.
+
+        Pops a file dialog for an FFSPSource HDF5 export, loads it into a
+        :class:`RuptureSource`, and attaches a :class:`RuptureTab` as a
+        new tab in the multi-view.  The rupture is kept fully isolated
+        from the seismic flow: its own viewport, its own controls, its
+        own actors — only the global propagation time is shared so the
+        fault animates in sync with the wave field.
+        """
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Import rupture (FFSP HDF5)",
+            "",
+            "HDF5 (*.h5 *.hdf5);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            from .rupture_adapter import RuptureSource
+            from .rupture_pane import RuptureTab
+            source = RuptureSource.from_h5(path)
+        except Exception as exc:  # surface load errors to the user
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not load rupture",
+                f"Failed to read {path}:\n\n{exc}",
+            )
+            return
+
+        try:
+            tab = RuptureTab(self.session, source, parent=self.multi_view)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not build rupture viewer",
+                f"Rupture loaded but the viewer could not start:\n\n{exc}",
+            )
+            return
+
+        label = source.source_path.stem if source.source_path else "Rupture"
+        # Disambiguate when more than one rupture is loaded in the session.
+        existing = {self.multi_view._tabs.tabText(i) for i in range(self.multi_view._tabs.count())}
+        base = f"Rupture · {label}"
+        title = base
+        suffix = 2
+        while title in existing:
+            title = f"{base} ({suffix})"
+            suffix += 1
+        try:
+            self.multi_view.add_external_tab(tab, title)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not attach rupture tab",
+                f"{exc}",
+            )
 
     # ── Apply-to target (consumed by every editor dock) ─────────────────────
 
