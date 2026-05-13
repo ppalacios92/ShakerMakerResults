@@ -54,6 +54,7 @@ class _FFSPControlPanel(QtWidgets.QWidget):
 
     settingsChanged = QtCore.Signal()        # noqa: N815 (Qt-style)
     projectToMainView = QtCore.Signal(bool)  # noqa: N815 (True=attach, False=detach)
+    applyClicked = QtCore.Signal()           # noqa: N815 (push current settings to projected overlays)
 
     def __init__(self, source: RuptureSource, parent=None):
         super().__init__(parent)
@@ -161,15 +162,30 @@ class _FFSPControlPanel(QtWidgets.QWidget):
         self.project_btn = QtWidgets.QPushButton("Add to main 3-D view")
         self.project_btn.setCheckable(True)
         self.project_btn.setToolTip(
-            "Overlay this rupture on the active pane of the seismic Main "
-            "view so the fault animates together with the wave field.  The "
-            "rupture's metres are scaled to kilometres by default."
+            "Overlay this rupture on one or more panes of the seismic "
+            "views.  A picker dialog opens so you can choose which views "
+            "and panes receive the fault."
         )
         self.project_btn.toggled.connect(self.projectToMainView)
         proj_layout.addWidget(self.project_btn)
+
+        # Apply button: pushes the current colormap / field / range / mask /
+        # hypocenter / animate settings onto every overlay this rupture
+        # has already attached to.  Stays disabled when no overlays are
+        # active so the button reads "ready" vs "no-op" at a glance.
+        self.apply_btn = QtWidgets.QPushButton("Apply colors to projected views")
+        self.apply_btn.setToolTip(
+            "Push the current visual settings (field, colormap, range, "
+            "mask, hypocenter, animate) onto every pane this fault is "
+            "already projected on.  Placement is not touched."
+        )
+        self.apply_btn.setEnabled(False)
+        self.apply_btn.clicked.connect(self.applyClicked)
+        proj_layout.addWidget(self.apply_btn)
+
         proj_layout.addWidget(QtWidgets.QLabel(
-            "Tip: clic en un pane del Main view para fijarlo como activo "
-            "antes de presionar este botón."
+            "Tip: el botón abre un selector de vistas y panes para "
+            "elegir cuáles reciben la falla."
         ))
         outer.addWidget(proj_box)
 
@@ -313,6 +329,7 @@ class RuptureTab(QtWidgets.QWidget):
             lambda *_: self.controls.on_field_changed()
         )
         self.controls.projectToMainView.connect(self._on_project_clicked)
+        self.controls.applyClicked.connect(self._on_apply_clicked)
         # Tracks the pane(s) where this rupture has been overlaid so the
         # checkable button stays in sync if the user closes the target tab
         # or detaches via some other path.
@@ -320,6 +337,9 @@ class RuptureTab(QtWidgets.QWidget):
         # Remember the last UTM dialog choice so the user does not have to
         # retype it when re-projecting in the same session.
         self._last_projection: dict | None = None
+        # Remember the last pane-selection choice so re-projecting in the
+        # same session pre-checks the same panes the user picked before.
+        self._last_pane_selection: set | None = None
         root.addWidget(self.controls, 0)
 
         # ── Actors (lazy) ─────────────────────────────────────────────────
@@ -547,14 +567,13 @@ class RuptureTab(QtWidgets.QWidget):
 
     # ── Project onto main 3-D view ───────────────────────────────────────
 
-    def _find_target_panes(self) -> list:
-        """Return the panes that should receive (or release) the overlay.
+    def _enumerate_pane_candidates(self) -> list[tuple[str, object, str]]:
+        """Walk every seismic ``MultiViewArea`` and return ``(view_name, pane, pane_label)``.
 
-        Strategy: pick the active pane of the first ``MultiViewArea`` tab
-        in the multi-view (i.e. the seismic side), ignoring any rupture
-        tabs.  Falls back to every visible pane when no active pane is
-        flagged — that way the user does not have to remember to click on
-        the seismic pane first.
+        Rupture tabs are skipped so the user never sees the fault tab
+        itself as a target.  Pane labels come from :attr:`ViewPane.label`
+        ("3D NE", "Top", "Front", ...) so the dialog matches the chrome
+        the user sees in the main view.
         """
         window = getattr(self.session, "window", None)
         multi = getattr(window, "multi_view", None) if window is not None else None
@@ -566,17 +585,50 @@ class RuptureTab(QtWidgets.QWidget):
             return []
         # Lazy import avoids a circular path with multi_view at module load.
         from .multi_view import MultiViewArea
+        candidates: list[tuple[str, object, str]] = []
         for i in range(tabs.count()):
             area = tabs.widget(i)
             if not isinstance(area, MultiViewArea):
                 continue
-            active = getattr(area, "active_pane", None)
-            if active is not None:
-                return [active]
-            panes = getattr(area, "_panes", None) or []
-            if panes:
-                return list(panes)
-        return []
+            view_name = tabs.tabText(i) or f"View {i + 1}"
+            for j, pane in enumerate(getattr(area, "_panes", []) or []):
+                pane_label = getattr(pane, "label", None) or f"Pane {j + 1}"
+                candidates.append((view_name, pane, str(pane_label)))
+        return candidates
+
+    def _default_pane_selection(self, candidates: list[tuple[str, object, str]]) -> set:
+        """Compute the set of panes to pre-check in the selection dialog.
+
+        Preference order:
+
+        1. The panes from the last selection in this session (if those
+           panes still exist).
+        2. The currently-active pane of the first seismic view (so the
+           user's "click on a pane to make it active" intuition still
+           lights up the right checkbox).
+        3. Empty set (the user explicitly picks).
+        """
+        if self._last_pane_selection:
+            survivors = {p for _, p, _ in candidates} & self._last_pane_selection
+            if survivors:
+                return survivors
+        window = getattr(self.session, "window", None)
+        multi = getattr(window, "multi_view", None) if window is not None else None
+        if multi is not None:
+            try:
+                tabs = multi._tabs
+            except Exception:
+                tabs = None
+            if tabs is not None:
+                from .multi_view import MultiViewArea
+                for i in range(tabs.count()):
+                    area = tabs.widget(i)
+                    if not isinstance(area, MultiViewArea):
+                        continue
+                    active = getattr(area, "active_pane", None)
+                    if active is not None and any(p is active for _, p, _ in candidates):
+                        return {active}
+        return set()
 
     def _reset_project_button(self) -> None:
         """Uncheck the project button without re-triggering its slot."""
@@ -586,10 +638,17 @@ class RuptureTab(QtWidgets.QWidget):
         btn.blockSignals(False)
         btn.setText("Add to main 3-D view")
 
+    def _refresh_apply_button(self) -> None:
+        """Enable the Apply button only when there's at least one overlay to update."""
+        try:
+            self.controls.apply_btn.setEnabled(bool(self._overlay_panes))
+        except Exception:
+            pass
+
     def _on_project_clicked(self, attach: bool) -> None:
         if attach:
-            targets = self._find_target_panes()
-            if not targets:
+            candidates = self._enumerate_pane_candidates()
+            if not candidates:
                 QtWidgets.QMessageBox.information(
                     self,
                     "No seismic view found",
@@ -598,6 +657,25 @@ class RuptureTab(QtWidgets.QWidget):
                 )
                 self._reset_project_button()
                 return
+
+            picker = _PaneTargetDialog(
+                candidates,
+                preselected=self._default_pane_selection(candidates),
+                parent=self,
+            )
+            if picker.exec() != QtWidgets.QDialog.Accepted:
+                self._reset_project_button()
+                return
+            targets = picker.selected_panes()
+            if not targets:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Sin selección",
+                    "No marcaste ninguna vista — la falla no se proyectó.",
+                )
+                self._reset_project_button()
+                return
+            self._last_pane_selection = set(targets)
 
             dlg = _RuptureProjectionDialog(self.source, self,
                                            previous=self._last_projection)
@@ -611,7 +689,8 @@ class RuptureTab(QtWidgets.QWidget):
             # overlay rendered in the main view is born with the same field,
             # colormap and range the user picked here.  Re-projecting after
             # editing the controls takes a fresh snapshot — overlays already
-            # attached keep the snapshot they were created with.
+            # attached keep the snapshot they were created with (use the
+            # Apply button to push fresh settings to them).
             display_settings = self.controls.snapshot()
 
             for pane in targets:
@@ -634,8 +713,12 @@ class RuptureTab(QtWidgets.QWidget):
                 self._overlay_panes.append(pane)
             if not self._overlay_panes:
                 self._reset_project_button()
+                self._refresh_apply_button()
                 return
-            self.controls.project_btn.setText("Remove from main 3-D view")
+            self.controls.project_btn.setText(
+                f"Remove from main 3-D view ({len(self._overlay_panes)})"
+            )
+            self._refresh_apply_button()
         else:
             for pane in self._overlay_panes:
                 try:
@@ -644,6 +727,39 @@ class RuptureTab(QtWidgets.QWidget):
                     pass
             self._overlay_panes.clear()
             self.controls.project_btn.setText("Add to main 3-D view")
+            self._refresh_apply_button()
+
+    def _on_apply_clicked(self) -> None:
+        """Push the current FFSP-panel state onto every attached overlay.
+
+        Iterates panes still in :attr:`_overlay_panes`, fetches each
+        pane's :class:`RuptureOverlay`, and feeds it a fresh snapshot
+        via :meth:`RuptureOverlay.apply_display_settings`.  Stale panes
+        (overlay gone for some reason) are silently skipped.
+        """
+        if not self._overlay_panes:
+            return
+        display_settings = self.controls.snapshot()
+        failed = 0
+        for pane in list(self._overlay_panes):
+            overlay = None
+            try:
+                overlay = pane.rupture_overlay()
+            except Exception:
+                overlay = None
+            if overlay is None:
+                continue
+            try:
+                overlay.apply_display_settings(display_settings)
+            except Exception:
+                failed += 1
+        if failed:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Apply partially failed",
+                f"No pude actualizar {failed} overlay(s).  El resto sí "
+                "tomó los nuevos colores.",
+            )
 
     # ── Tab-system contract ──────────────────────────────────────────────
 
@@ -665,6 +781,115 @@ class RuptureTab(QtWidgets.QWidget):
             self.plotter.close()
         except Exception:
             pass
+
+
+# ── Pane-target selection dialog ─────────────────────────────────────────────
+
+
+class _PaneTargetDialog(QtWidgets.QDialog):
+    """Multi-view / multi-pane checklist shown before the UTM dialog.
+
+    Receives a list of ``(view_name, pane_object, pane_label)`` triples
+    produced by :meth:`RuptureTab._enumerate_pane_candidates`, groups
+    them per seismic view, and lets the user tick the panes that should
+    receive the rupture overlay.  The dialog is intentionally separate
+    from the UTM-placement step so each concern stays simple and the
+    user can hit Cancel at either stage without partial state.
+    """
+
+    def __init__(
+        self,
+        candidates: list[tuple[str, object, str]],
+        *,
+        preselected: set | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Project rupture onto…")
+        self.setModal(True)
+        pre = set(preselected or ())
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        intro = QtWidgets.QLabel(
+            "Elegí en qué vistas y panes querés que aparezca esta falla.<br>"
+            "Tildá uno o varios; el siguiente paso te pide la ubicación UTM."
+        )
+        intro.setTextFormat(QtCore.Qt.RichText)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # Scrollable list — defensive for sessions with many views/panes,
+        # otherwise the dialog can overflow vertically on small screens.
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_inner = QtWidgets.QWidget()
+        scroll_layout = QtWidgets.QVBoxLayout(scroll_inner)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(6)
+
+        self._checkbox_for_pane: list[tuple[QtWidgets.QCheckBox, object]] = []
+
+        # Group consecutive entries by ``view_name`` so the dialog reads
+        # "Main view → [3D NE] [Top] …"; the order in which views appear
+        # mirrors the multi-view tab order.
+        current_view: str | None = None
+        current_group: QtWidgets.QGroupBox | None = None
+        current_grid: QtWidgets.QGridLayout | None = None
+        row = col = 0
+        for view_name, pane, pane_label in candidates:
+            if view_name != current_view:
+                current_view = view_name
+                current_group = QtWidgets.QGroupBox(view_name)
+                current_grid = QtWidgets.QGridLayout(current_group)
+                current_grid.setContentsMargins(8, 6, 8, 6)
+                current_grid.setHorizontalSpacing(12)
+                current_grid.setVerticalSpacing(4)
+                scroll_layout.addWidget(current_group)
+                row = col = 0
+            cb = QtWidgets.QCheckBox(pane_label)
+            if pane in pre:
+                cb.setChecked(True)
+            self._checkbox_for_pane.append((cb, pane))
+            current_grid.addWidget(cb, row, col)
+            col += 1
+            if col >= 2:                   # 2-column grid keeps the dialog narrow
+                col = 0
+                row += 1
+
+        scroll_layout.addStretch(1)
+        scroll.setWidget(scroll_inner)
+        layout.addWidget(scroll, 1)
+
+        # Quick "select all / none" — handy when the user wants the fault
+        # on every pane of a view without ticking each box.
+        helpers = QtWidgets.QHBoxLayout()
+        all_btn = QtWidgets.QPushButton("Select all")
+        none_btn = QtWidgets.QPushButton("Select none")
+        all_btn.clicked.connect(lambda: self._set_all(True))
+        none_btn.clicked.connect(lambda: self._set_all(False))
+        helpers.addWidget(all_btn)
+        helpers.addWidget(none_btn)
+        helpers.addStretch(1)
+        layout.addLayout(helpers)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _set_all(self, checked: bool) -> None:
+        for cb, _ in self._checkbox_for_pane:
+            cb.setChecked(checked)
+
+    def selected_panes(self) -> list:
+        """Return the ``ViewPane`` objects whose checkboxes are ticked."""
+        return [pane for cb, pane in self._checkbox_for_pane if cb.isChecked()]
 
 
 # ── UTM placement dialog ─────────────────────────────────────────────────────
@@ -1021,6 +1246,53 @@ class RuptureOverlay:
             opacity=1.0,
             show_scalar_bar=False,
         )
+
+    def apply_display_settings(self, display_settings: dict | None) -> None:
+        """Replace the overlay's visual snapshot in place.
+
+        Used by the FFSP panel's "Apply" button so the user can retune
+        colormap / field / range / mask / hypocenter / animate on an
+        already-projected fault without removing and re-adding it.
+
+        Placement (UTM, strike, unit scale) is intentionally **not**
+        touched — Apply is purely cosmetic.  When the host pane is
+        currently in a static-colour mode (e.g. Elevation Z), the
+        snapshot is still updated so the new look takes effect the
+        moment the user switches back to default colouring.
+        """
+        prev_hypo = self.show_hypocenter
+        self._init_display_settings(display_settings)
+
+        # Hypocenter visibility may have toggled — add / remove the marker
+        # so the scene reflects the new state immediately.  Position is
+        # unchanged (same transform), so we just (de)allocate the actor.
+        if prev_hypo != self.show_hypocenter:
+            plotter = getattr(self.pane, "plotter", None)
+            if self._hypo_actor is not None and plotter is not None:
+                try:
+                    plotter.remove_actor(self._hypo_actor, render=False)
+                except Exception:
+                    pass
+                self._hypo_actor = None
+            if self.show_hypocenter:
+                try:
+                    pts = np.asarray(self._cloud.points, dtype=float) if self._cloud is not None else None
+                    if pts is not None:
+                        self._hypo_actor = self._build_hypocenter_actor(pts)
+                except Exception:
+                    self._hypo_actor = None
+
+        # _update_scalars resolves the current colour mode (snapshot vs
+        # elevation), rebuilds the actor when the cmap changed, and
+        # repaints — no need to render explicitly, the plotter renders
+        # on the next event loop tick.
+        self._update_scalars()
+        plotter = getattr(self.pane, "plotter", None)
+        if plotter is not None:
+            try:
+                plotter.render()
+            except Exception:
+                pass
 
     # ── Coordinate transform helpers ─────────────────────────────────────
 
