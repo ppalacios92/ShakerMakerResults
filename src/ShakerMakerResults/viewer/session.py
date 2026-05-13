@@ -895,6 +895,14 @@ class ViewerSession:
         )
 
     def _elevation_wave_rgb_blend(self):
+        """Return per-point RGB blending elevation colours with the current wave.
+
+        ``base_rgb`` carries the static elevation colormap; the wave frame is
+        normalised to ``[0, 1]`` by the dataset's global amplitude, gamma is
+        applied, and the resulting alpha mixes wave colours over the base.
+        With ``strength = 0`` the output equals the pure elevation map; with
+        ``strength = 1`` the wave dominates at peak frames.
+        """
         import numpy as np
 
         base_rgb = self._elevation_base_rgb()
@@ -907,56 +915,16 @@ class ViewerSession:
         blended = (1.0 - alpha) * base_rgb.astype(np.float32) + alpha * wave_rgb.astype(np.float32)
         return np.clip(blended, 0.0, 255.0).astype(np.uint8)
 
-        """Return scalars that blend elevation Z with the current wave frame.
-
-        The elevation values are kept in their original units (e.g. metres) and
-        the wave field is normalised to ``[-1, 1]`` using the dataset's global
-        amplitude.  The wave contribution shifts elevation values by at most
-        ``±strength × 0.5 × elevation_range``, so the overall visual range
-        stays close to the elevation limits and the terrain shape stays visible.
-
-        Blend formula::
-
-            blended = elevation + normalize(wave) × elev_range × strength × 0.5
-
-        With ``strength = 0.5`` (default) the wave can shift the colour by up
-        to ±25 % of the full elevation range — clearly visible without drowning
-        out the terrain detail.
-        """
-        import numpy as np
-
-        elev = self.adapter.elevation_snapshot()                    # (N,) float32
-        e_min, e_max = self.adapter.elevation_limits()
-        e_range = float(e_max - e_min) if e_max > e_min else 1.0
-
-        wave = self.adapter.scalar_snapshot(
-            self.state.time_index,
-            self.state.demand,
-            self.state.component,
-        )                                                            # (N,) float32
-
-        # Use the dataset's global amplitude for a stable [-1, 1] normalisation
-        # (per-frame normalisation would make weak early frames look the same
-        # as the main seismic arrival, which is visually confusing).
-        try:
-            w_min, w_max = self.adapter.default_scalar_limits(
-                self.state.demand, self.state.component
-            )
-            w_abs = max(abs(float(w_min)), abs(float(w_max)), 1e-12)
-        except Exception:
-            w_abs = float(np.max(np.abs(wave))) or 1e-12
-
-        w_norm = wave / w_abs                                        # [-1, 1]
-        strength = float(self._wave_blend_strength)
-        shift = w_norm * e_range * strength * 0.5
-        return (elev + shift).astype(np.float32)
-
     def _elevation_base_rgb(self):
         elev = self.adapter.elevation_snapshot()
         vmin, vmax = self.current_static_color_limits(elev)
+        # ``colormap_inverted`` flips the LUT direction at render time, so
+        # toggling it must invalidate the cached RGB — otherwise the user sees
+        # stale colours until some unrelated state change drops the cache.
         key = (
             "elevation_z",
             self._static_color_map,
+            bool(self.state.colormap_inverted),
             float(vmin),
             float(vmax),
             len(elev),

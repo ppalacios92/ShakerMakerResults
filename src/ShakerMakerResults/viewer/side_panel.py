@@ -38,7 +38,7 @@ from .cmap_preview import ColormapPreview
 from .colors import COLORMAP_OPTIONS, colormap_for_component
 from .icons import icon
 from .session import VALID_STATIC_COLOR_BY
-from .theme import LIGHT_PALETTE, active_palette  # LIGHT_PALETTE kept for legacy callers
+from .theme import LIGHT_PALETTE, active_palette
 from .trace_panel import AriasIntensityPanel, GFPanel, ResponsesPanel, SpectrumPanel
 from .visual_editors import LegendEditorDialog, TransferFunctionDialog
 
@@ -177,11 +177,8 @@ class _ResponsesAnalysisTabs(QtWidgets.QWidget):
     def _on_tab_changed(self, _index: int):
         key = self._active_key()
         page = self._pages[key]
-        already_existed = page.is_created
         page.ensure_created()
-        if already_existed and key in self._dirty_tabs:
-            page.refresh("full")
-        elif key in self._dirty_tabs:
+        if key in self._dirty_tabs:
             page.refresh("full")
         self._dirty_tabs.discard(key)
 
@@ -248,6 +245,28 @@ class _SectionBase(QtWidgets.QWidget):
     def _clear_dirty(self):
         self._dirty = False
         # Button stays clickable.
+
+    def resync_to_active_pane(self) -> None:
+        """Resync the section to whichever pane is now active.
+
+        Called when the user switches the active viewport.  Drops any
+        in-progress edits (they targeted the previous pane, so carrying
+        them over would silently apply the wrong settings) and any
+        local "user typed something" locks, then refreshes from the
+        new pane's effective state.  Sections that own their own locks
+        (e.g. ``_range_user_locked`` in DisplaySection /
+        StaticColorSection) get them reset here uniformly.
+        """
+        self._dirty = False
+        if hasattr(self, "_range_user_locked"):
+            try:
+                self._range_user_locked = False
+            except Exception:
+                pass
+        try:
+            self.refresh("full")
+        except Exception:
+            pass
 
     @staticmethod
     def _set_combo(combo, value):
@@ -1233,6 +1252,23 @@ class DisplaySection(_SectionBase):
 
     # ── Sync from session state ───────────────────────────────────────────
 
+    def _effective_state(self):
+        """Return the state we should display: the active pane's overrides
+        falling through to ``session.state``, or ``session.state`` directly
+        when no multi-view / active pane is available.
+
+        Reading from the pane proxy keeps the dock in sync with the pane
+        the user is actually editing — otherwise an Apply-to=Active pane
+        workflow commits to ``pane_state`` but the dock keeps showing
+        ``session.state`` (which the user never touched), so Play / any
+        refresh resets the combos back to the global demand.
+        """
+        w = self.window()
+        multi = getattr(w, "multi_view", None) if w is not None else None
+        pane = getattr(multi, "active_pane", None) if multi is not None else None
+        ps = getattr(pane, "pane_state", None)
+        return ps if ps is not None else self.session.state
+
     def refresh(self, reason: str = "full"):
         # Vector field and static color have moved to their own docks
         # (VectorFieldSection / StaticColorSection); ignore those reasons here.
@@ -1242,36 +1278,60 @@ class DisplaySection(_SectionBase):
             return
         self._syncing = True
         try:
-            self._set_combo_data(self.demand_combo, self.session.state.demand)
-            self._populate_component_combo(
-                self.session.state.demand,
-                selected_component=self.session.state.component,
-            )
+            eff = self._effective_state()
+            # Read-only / bounds widgets always sync — they reflect dataset
+            # facts, not user choices.
             gf_count = self.session.gf_subfault_count()
             gf_max = max(gf_count - 1, 0)
             self.gf_subfault_spin.setMaximum(gf_max)
-            self.gf_subfault_spin.setValue(min(self.session.current_display_gf_subfault(), gf_max))
-            self.gf_subfault_spin.setEnabled(self.session.state.demand == "gf")
-            self._set_combo(
-                self.cmap_combo,
-                self.session.state.colormap or colormap_for_component(self.session.state.component),
-            )
-            self.cmap_preview.setColormap(self.cmap_combo.currentText())
             lo, hi = self._field_auto_limits()
             self.auto_lbl.setText(f"{lo:.4g}  /  {hi:.4g}")
             if (self.session.state.user_vmin is None
                     or self.session.state.user_vmax is None):
                 self.session.state.set_user_color_range(lo, hi)
-            # ``_range_user_locked`` is set to True once the user has
-            # typed anything into User min / User max.  While locked we
-            # keep the typed values in the spinboxes regardless of what
-            # the session global says — the user retains full control
-            # over the range until they press "Reset to auto".
-            if not self._range_user_locked:
-                self.vmin_spin.setValue(float(self.session.state.user_vmin))
-                self.vmax_spin.setValue(float(self.session.state.user_vmax))
-            self.clamp_cb.setChecked(self.session.state.clamp_enabled)
-            self._clear_dirty()
+
+            # User-editable widgets: a session-driven refresh while the
+            # user is mid-edit (e.g. picked vel, typed limits, then opened
+            # the Advanced color editor) must NOT wipe their pending
+            # selections back to ``session.state``.  Editable widgets only
+            # sync when the section is clean; the user keeps full control
+            # until they press Apply (which commits and clears dirty) or
+            # Reset to auto.
+            if not self._dirty:
+                self._set_combo_data(self.demand_combo, eff.demand)
+                self._populate_component_combo(
+                    eff.demand,
+                    selected_component=eff.component,
+                )
+                self.gf_subfault_spin.setValue(
+                    min(self.session.current_display_gf_subfault(), gf_max)
+                )
+                self.gf_subfault_spin.setEnabled(eff.demand == "gf")
+                self._set_combo(
+                    self.cmap_combo,
+                    eff.colormap or colormap_for_component(eff.component),
+                )
+                self.cmap_preview.setColormap(self.cmap_combo.currentText())
+                # ``_range_user_locked`` is set to True once the user has
+                # typed anything into User min / User max.  While locked we
+                # keep the typed values in the spinboxes regardless of what
+                # the session global says — the user retains full control
+                # over the range until they press "Reset to auto".
+                if not self._range_user_locked:
+                    user_vmin = eff.user_vmin
+                    user_vmax = eff.user_vmax
+                    if user_vmin is None:
+                        user_vmin = lo
+                    if user_vmax is None:
+                        user_vmax = hi
+                    self.vmin_spin.setValue(float(user_vmin))
+                    self.vmax_spin.setValue(float(user_vmax))
+                self.clamp_cb.setChecked(bool(eff.clamp_enabled))
+            else:
+                # Keep the GF subfault spinbox enable state in sync with the
+                # pending demand selection so the UI stays coherent mid-edit.
+                current_demand = str(self.demand_combo.currentData() or "")
+                self.gf_subfault_spin.setEnabled(current_demand == "gf")
         finally:
             self._syncing = False
 
@@ -1354,6 +1414,18 @@ class DisplaySection(_SectionBase):
         demand = str(self.demand_combo.currentData())
         component = str(self.component_combo.currentData())
         gf_subfault = self.gf_subfault_spin.value()
+
+        # GF subfault is session-global (the HDF5 cache holds one slot
+        # at a time; there is no per-pane override).  Commit it on the
+        # session BEFORE routing the apply so the scene rebuild that
+        # follows reads the new slot — otherwise an Apply-to=Active pane
+        # path would write the pane payload but the scene would still
+        # query subfault 0 and show stale data.
+        if demand == "gf":
+            max_subfault = max(0, self.session.gf_subfault_count() - 1)
+            self.session._display_gf_subfault = min(
+                max(0, int(gf_subfault)), max_subfault
+            )
 
         # ``demand`` MUST be in the pane payload — otherwise an Active
         # pane Apply would keep reading the session global demand and

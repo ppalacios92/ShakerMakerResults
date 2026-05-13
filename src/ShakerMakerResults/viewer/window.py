@@ -190,7 +190,6 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             if index == 2:
                 self.addToolBarBreak(QtCore.Qt.TopToolBarArea)
 
-        self.toolbar = self._toolbars[0] if self._toolbars else None
         # Recording state lives in CaptureToolBar; route playback frame writes.
         self._recording_toolbar = next(
             (tb for tb in self._toolbars if hasattr(tb, "write_frame_if_recording")),
@@ -226,6 +225,28 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                 self.multi_view.on_structure_changed = lambda: pipeline.refresh("full")
             except Exception:
                 pass
+
+        # ── Active-pane → side-panel resync ────────────────────────────────
+        # ``on_active_pane_changed`` is a single-slot callback; the
+        # OverlaysToolBar installed itself during ``build_viewer_toolbars``
+        # (it owns the Stations button sync).  Wrap that callback so the
+        # visible side panels also re-read the new pane's state — without
+        # this, switching from a GF pane back to the main view leaves the
+        # Display dock showing the previous pane's demand / colormap.
+        try:
+            _prev_active_cb = self.multi_view.on_active_pane_changed
+
+            def _on_active_pane_changed_chained(pane, _prev=_prev_active_cb):
+                if _prev is not None:
+                    try:
+                        _prev(pane)
+                    except Exception:
+                        pass
+                self._resync_side_pages_to_active_pane()
+
+            self.multi_view.on_active_pane_changed = _on_active_pane_changed_chained
+        except Exception:
+            pass
 
         # ── Status bar ──────────────────────────────────────────────────────
         self.status_chip_bar = StatusChipBar()
@@ -384,13 +405,17 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
 
         The key encodes what was clicked:
 
-        * ``"root"`` — Active Views top-level → Display target = "All panes".
-        * ``"tab:<i>"`` — a tab → Display target = "Current tab".  Also
-          switches the multi-view to that tab.
-        * ``"pane:<tab>/<pane>"`` — a pane → Display target = "Active
-          pane".  Activates the pane so the toolbar / status bar follow.
+        * ``"root"`` — Active Views top-level → no-op (nothing to focus).
+        * ``"tab:<i>"`` — a tab → switch the multi-view to that tab.
+        * ``"pane:<tab>/<pane>"`` — a pane → activate that pane so the
+          toolbar / status bar follow.
         * Auxiliary keys (stations, selection, gf, geographic) → focus
           the matching Properties tab.
+
+        The Apply-to selector is intentionally NOT touched here.  Users
+        asked for the combo to stay where they put it — default "Active
+        pane" — even when navigating tabs/panes through this tree.  They
+        flip the combo manually when they want a broader scope.
         """
         # ── Properties tab routing (auxiliary nodes) ────────────────────────
         props = self._docks.get("properties")
@@ -410,9 +435,15 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                 pass
             return
 
-        # ── Display "Apply to" target routing ───────────────────────────────
+        # ── Scene navigation (the Apply-to selector is NOT touched here) ───
+        # The user explicitly asked for the Apply-to combo to stay where
+        # they put it (defaulting to "Active pane") even when they switch
+        # tabs or panes through the Scene Browser.  So tree clicks only
+        # navigate — activating the right pane / switching to the right
+        # tab — without touching the toolbar combo.  Users flip the
+        # combo manually when they want a broader scope.
         if node_key == NODE_ROOT:
-            self._set_display_apply_target("all")
+            # Nothing to do — root selection means "show the whole tree".
             return
 
         if node_key.startswith(f"{NODE_TAB}:"):
@@ -423,7 +454,6 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             tabs = getattr(self.multi_view, "_tabs", None)
             if tabs is not None and 0 <= tab_idx < tabs.count():
                 tabs.setCurrentIndex(tab_idx)
-            self._set_display_apply_target("tab")
             return
 
         if node_key.startswith(f"{NODE_PANE}:"):
@@ -441,21 +471,6 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
                         area._set_active_pane(panes[pane_idx])
                     except Exception:
                         pass
-            self._set_display_apply_target("pane")
-
-    def _set_display_apply_target(self, target: str) -> None:
-        """Set the global Apply-to selector and optionally surface Display.
-
-        Originally flipped a combo inside :class:`DisplaySection`; the
-        selector now lives in :class:`ApplyTargetToolBar` so we forward
-        to :meth:`set_apply_target`.  The Display dock is still raised
-        to the front when hidden so the user can see what will change.
-        """
-        self.set_apply_target(target)
-        display_dock = self._docks.get("display")
-        if display_dock is not None and not display_dock.isVisible():
-            display_dock.setVisible(True)
-            display_dock.raise_()
 
     # ── Menu bar ────────────────────────────────────────────────────────────
 
@@ -682,6 +697,35 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             )
         else:
             self._update_status()
+
+    def _resync_side_pages_to_active_pane(self) -> None:
+        """Drop pending edits and resync every visible side page.
+
+        Called when the user activates a different viewport — the editor
+        docks read from the active pane's ``pane_state``, so without a
+        resync the Display / StaticColor / Warp / VectorField docks
+        would still show whatever the user was typing for the previous
+        pane (and ``_dirty=True`` would block the next refresh from
+        picking up the new pane's saved state).
+        """
+        for key, page in self._side_pages.items():
+            dock = self._docks.get(key)
+            if dock is None or not dock.isVisible():
+                continue
+            try:
+                if isinstance(page, _LazyPage):
+                    if page.is_created:
+                        inner = getattr(page, "_widget", None) or page
+                        if hasattr(inner, "resync_to_active_pane"):
+                            inner.resync_to_active_pane()
+                        elif hasattr(inner, "refresh"):
+                            inner.refresh("full")
+                elif hasattr(page, "resync_to_active_pane"):
+                    page.resync_to_active_pane()
+                elif hasattr(page, "refresh"):
+                    page.refresh("full")
+            except Exception:
+                pass
 
     def _refresh_side_pages(self, reason: str) -> None:
         """Refresh every visible side-panel page with *reason*.

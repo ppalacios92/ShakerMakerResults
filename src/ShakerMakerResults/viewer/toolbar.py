@@ -266,9 +266,13 @@ class ApplyTargetToolBar(_ToolBarBase):
         self.addWidget(label)
 
         self._combo = QtWidgets.QComboBox()
-        self._combo.addItem("All panes", "all")
-        self._combo.addItem("Current tab", "tab")
+        # Order matters: the first entry is the visible default on launch.
+        # "Active pane" is the safest starting point for a fresh session —
+        # changes only land on the pane the user explicitly clicked.
+        # Users can flip to Current tab / All panes for broader edits.
         self._combo.addItem("Active pane", "pane")
+        self._combo.addItem("Current tab", "tab")
+        self._combo.addItem("All panes", "all")
         self._combo.setMinimumWidth(140)
         self._combo.currentIndexChanged.connect(
             lambda *_: self.targetChanged.emit(self.target())

@@ -26,5 +26,32 @@ venv/
 Thumbs.db
 
 # folders
-.claude/
 tests/
+
+# AI / Claude assistant artifacts — keep these out of the repo
+.claude/
+.claude*
+CLAUDE.md
+CLAUDE.local.md
+CLAUDE.*.md
+claude.md
+.anthropic/
+.anthropic*
+ANTHROPIC.md
+
+# Other AI coding tools
+.aider*
+.cursor*
+.cursorrules
+.cursorignore
+.copilot*
+.continue/
+.github/copilot*
+.codeium*
+
+# Sessions / transcripts / logs from AI tools
+*.claude.log
+*.ai.log
+.ai-sessions/
+.ai-logs/
+agent_history/

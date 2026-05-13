@@ -63,8 +63,7 @@ def plot_node_response(self,
         ax.legend(loc='upper right')
         if xlim:
             ax.set_xlim(xlim)
-    fig.savefig("node_response.svg", format="svg", bbox_inches="tight")
-    print('hhh')
+    # fig.savefig("node_response.svg", format="svg", bbox_inches="tight")
     plt.tight_layout()
     plt.show()
 
