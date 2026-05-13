@@ -32,10 +32,49 @@ except AttributeError:
     _Signal = QtCore.pyqtSignal  # PyQt5 / PyQt6
 
 try:
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _FigureCanvasBase
 except ImportError:  # pragma: no cover - compatibility fallback
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasBase
 from matplotlib.figure import Figure
+
+
+class _SafeFigureCanvas(_FigureCanvasBase):
+    """:class:`FigureCanvasQTAgg` that survives a deleted C++ peer.
+
+    Background
+    ----------
+    matplotlib's Qt backend posts paint requests through Qt's event
+    loop (``_draw_idle``).  When the panel hosting the canvas is
+    destroyed before that queued event runs, PyQt/PySide reaps the
+    underlying ``QWidget`` C++ object while the Python wrapper survives
+    until the event fires.  At that point :meth:`draw` / :meth:`_draw_idle`
+    cross the binding and raise ``RuntimeError: wrapped C/C++ object of
+    type FigureCanvasQTAgg has been deleted``.
+
+    The error is harmless (the widget is already gone, the paint is
+    redundant) but it spams the log on every panel teardown.  Swallowing
+    the ``RuntimeError`` at the boundary keeps the log clean without
+    touching matplotlib internals or guessing whether ``sip`` is
+    available across Qt bindings.
+    """
+
+    def _draw_idle(self):  # type: ignore[override]
+        try:
+            return super()._draw_idle()
+        except RuntimeError:
+            # Underlying QWidget was destroyed mid-flight; nothing to draw.
+            return None
+
+    def draw(self):  # type: ignore[override]
+        try:
+            return super().draw()
+        except RuntimeError:
+            return None
+
+
+# All four panels in this file resolve ``FigureCanvas`` to the safe
+# variant so we only have to patch one symbol.
+FigureCanvas = _SafeFigureCanvas
 
 
 def _set_grid(ax, visible: bool, *, alpha: float = 0.25) -> None:
