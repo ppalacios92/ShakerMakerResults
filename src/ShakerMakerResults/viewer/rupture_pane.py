@@ -928,10 +928,11 @@ class RuptureOverlay:
         # silently flip "hot_r" into "hot", "magma_r" into "magma", etc.
         # That helper is meant for panels that have a separate "invert"
         # checkbox, which the rupture importer does not.
+        self._active_cmap = self.colormap
         self._actor = plotter.add_mesh(
             self._cloud,
             scalars="active",
-            cmap=self.colormap,
+            cmap=self._active_cmap,
             clim=(vmin0, vmax0),
             point_size=max(_POINT_SIZE - 1, 4),
             render_points_as_spheres=True,
@@ -1136,22 +1137,150 @@ class RuptureOverlay:
         except Exception:
             return 0.0
 
+    # ── Color-mode resolution ────────────────────────────────────────────
+
+    def _resolve_color_mode(self) -> str:
+        """Return the effective coloring mode for this overlay.
+
+        * ``"elevation_z"`` — main view is showing elevation; the fault
+          should also colour by each subfault's Z so the whole scene
+          shares one LUT.
+        * ``"snapshot"`` — fallback to the importer-pane snapshot.  Used
+          when the main view is in its default field-driven mode, or
+          when it's in a mode that doesn't translate to fault subfaults
+          (Newmark Sa, Arias intensity).
+
+        Errors talking to the session collapse to ``"snapshot"`` so the
+        overlay never throws on a routine refresh.
+        """
+        session = getattr(self.pane, "session", None)
+        if session is None:
+            return "snapshot"
+        getter = getattr(session, "current_static_color_by", None)
+        if not callable(getter):
+            return "snapshot"
+        try:
+            mode = getter()
+        except Exception:
+            return "snapshot"
+        if mode == "elevation_z":
+            return "elevation_z"
+        return "snapshot"
+
+    def _ensure_active_cmap(self, cmap_name: str) -> None:
+        """Rebuild the point actor when the requested colormap changes.
+
+        VTK does not let us swap a mapper's colormap in place without
+        rebuilding the lookup table; the cleanest fix is to recreate the
+        actor.  We only do it when the name actually changes, so steady-
+        state playback stays as a scalar/clim update.
+        """
+        cmap_name = str(cmap_name or _DEFAULT_CMAP)
+        if cmap_name == getattr(self, "_active_cmap", None) and self._actor is not None:
+            return
+        plotter = getattr(self.pane, "plotter", None)
+        if plotter is None or self._cloud is None:
+            return
+        if self._actor is not None:
+            try:
+                plotter.remove_actor(self._actor, render=False)
+            except Exception:
+                pass
+            self._actor = None
+        try:
+            self._actor = plotter.add_mesh(
+                self._cloud,
+                scalars="active",
+                cmap=cmap_name,
+                clim=self.color_range,   # rewritten by the next clim apply
+                point_size=max(_POINT_SIZE - 1, 4),
+                render_points_as_spheres=True,
+                show_scalar_bar=False,
+            )
+            self._active_cmap = cmap_name
+        except Exception:
+            self._actor = None
+
+    def _apply_clim(self, vmin: float, vmax: float) -> None:
+        """Push ``(vmin, vmax)`` into the actor's mapper + LUT in place."""
+        mapper = getattr(self._actor, "mapper", None) if self._actor is not None else None
+        if mapper is None:
+            return
+        try:
+            mapper.scalar_range = (float(vmin), float(vmax))
+        except Exception:
+            pass
+        try:
+            lut = mapper.lookup_table
+            lut.SetTableRange(float(vmin), float(vmax))
+        except Exception:
+            pass
+
+    # ── Scalar refresh ───────────────────────────────────────────────────
+
     def _update_scalars(self) -> None:
-        """Refresh the point-cloud scalars using the snapshot's field/flags.
+        """Refresh scalars + colormap to match the current scene mode.
 
-        Mirrors :meth:`RuptureTab._update_scalars` so the overlay animates
-        identically to its source pane:
+        Two cases:
 
-        * ``slip_inst`` ramps up between rupture_time and +rise_time.
-        * Static fields (slip, rupture_time, ...) stay constant in time.
-        * When ``animate`` AND ``mask`` are on, un-ruptured subfaults are
-          set to NaN so VTK draws them transparent (the LUT's NaN colour).
-        * Colour range stays anchored to the unmasked scalars when the
-          user did NOT clamp — so vmax doesn't bounce around as the
-          rupture front sweeps the fault.
+        * **Elevation mode** (main view's "Color by" = Elevation Z):
+          colour every subfault by its display-frame Z, using the static
+          colormap and range published by the session so the fault and
+          the seismic mesh share one LUT.  Mask / animate are ignored —
+          static overlays show the full geometry.
+        * **Snapshot mode** (everything else): render the importer's
+          snapshot field with its own colormap, clamp, mask and animate
+          flags.  Mirrors :meth:`RuptureTab._update_scalars`.
         """
         if self._cloud is None:
             return
+
+        mode = self._resolve_color_mode()
+        if mode == "elevation_z":
+            self._render_elevation_mode()
+        else:
+            self._render_snapshot_mode()
+
+        self._cloud.Modified()
+
+    def _render_elevation_mode(self) -> None:
+        """Colour the fault by per-subfault display-frame Z."""
+        session = self.pane.session
+        # The cloud's third coordinate is already in the display frame
+        # (post Geographic Display Transform), so it shares the seismic
+        # mesh's elevation axis.  Cast to float32 for VTK.
+        try:
+            z = np.asarray(self._cloud.points, dtype=float)[:, 2]
+        except Exception:
+            return
+        scalars = z.astype(np.float32, copy=False)
+
+        try:
+            cmap = session.current_static_colormap()
+        except Exception:
+            cmap = self.colormap
+        # ``current_static_color_limits()`` with no scalars returns the
+        # main-mesh elevation range (clamp-aware), so the fault uses the
+        # exact same colour scale as the seismic mesh.  Falling back to
+        # the fault's own min/max keeps the overlay usable when the
+        # session lacks that getter (older sessions).
+        try:
+            vmin, vmax = session.current_static_color_limits()
+        except Exception:
+            arr = z[np.isfinite(z)]
+            if arr.size == 0:
+                vmin, vmax = 0.0, 1.0
+            else:
+                vmin, vmax = float(arr.min()), float(arr.max())
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+
+        self._ensure_active_cmap(cmap)
+        self._cloud.point_data["active"] = scalars
+        self._apply_clim(vmin, vmax)
+
+    def _render_snapshot_mode(self) -> None:
+        """Render the importer-snapshot field (default path)."""
         t = self._current_time()
         if self.field == "slip_inst":
             scalars = np.asarray(self.source.instantaneous_slip(t), dtype=np.float32)
@@ -1169,21 +1298,9 @@ class RuptureOverlay:
         else:
             displayed = scalars
 
+        self._ensure_active_cmap(self.colormap)
         self._cloud.point_data["active"] = displayed
-
-        mapper = getattr(self._actor, "mapper", None) if self._actor is not None else None
-        if mapper is not None:
-            try:
-                mapper.scalar_range = (vmin, vmax)
-            except Exception:
-                pass
-            try:
-                lut = mapper.lookup_table
-                lut.SetTableRange(vmin, vmax)
-            except Exception:
-                pass
-
-        self._cloud.Modified()
+        self._apply_clim(vmin, vmax)
 
     def on_session_updated(self, reason: str) -> None:
         if reason == "geometry_transform":
@@ -1191,6 +1308,13 @@ class RuptureOverlay:
             # seismic mesh has rebuilt under the new matrix, so the overlay
             # has to refresh its point cloud or it sits in the old frame.
             self._rebuild_geometry()
+            self._update_scalars()
+            return
+        if reason == "static_color":
+            # Main view toggled its "Color by" mode (elevation / Newmark /
+            # Arias / default).  :meth:`_update_scalars` resolves the new
+            # mode and rebuilds the actor when the colormap differs from
+            # the one currently attached.
             self._update_scalars()
             return
         if reason in ("time", "playback", "full", "init", "demand", "component"):
