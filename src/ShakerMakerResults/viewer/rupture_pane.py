@@ -52,8 +52,8 @@ _MASK_OPACITY = 0.05      # un-ruptured subfaults are nearly invisible
 class _FFSPControlPanel(QtWidgets.QWidget):
     """Compact side panel mirroring the Display dock layout."""
 
-    settingsChanged = QtCore.Signal()       # noqa: N815 (Qt-style)
-    projectToMainView = QtCore.Signal(bool) # noqa: N815 (True=attach, False=detach)
+    settingsChanged = QtCore.Signal()        # noqa: N815 (Qt-style)
+    projectToMainView = QtCore.Signal(bool)  # noqa: N815 (True=attach, False=detach)
 
     def __init__(self, source: RuptureSource, parent=None):
         super().__init__(parent)
@@ -249,6 +249,7 @@ class _FFSPControlPanel(QtWidgets.QWidget):
 
     def hypocenter_enabled(self) -> bool:
         return bool(self.hypo_cb.isChecked())
+
 
     def on_field_changed(self) -> None:
         """Recompute auto-range when the field selector changes."""
@@ -670,8 +671,10 @@ class _RuptureProjectionDialog(QtWidgets.QDialog):
 
         strike = float(source.params.get("strike", 0.0))
         intro = QtWidgets.QLabel(
-            "Pegá los dos vectores tal cual los usás en <code>plot_spacial_distribution</code>.<br>"
-            "Todo en <b>km</b>.  Formato: <code>x, y</code> o <code>[x, y]</code>.<br>"
+            "Pegá los dos vectores tal cual los usás en <code>plot_spacial_distribution</code>,<br>"
+            "pero en <b>metros</b> (sin dividir por 1000 — así no se pierden decimales).<br>"
+            "<code>internal_ref</code> sigue la convención de los ejes del plot 2-D:<br>"
+            "<b>primer valor = Along Dip</b>, <b>segundo valor = Along Strike</b>.<br>"
             f"Strike del HDF5: <b>{strike:.3f}°</b> — se aplica automáticamente."
         )
         intro.setWordWrap(True)
@@ -682,19 +685,20 @@ class _RuptureProjectionDialog(QtWidgets.QDialog):
         form.setSpacing(6)
 
         self.internal_edit = QtWidgets.QLineEdit()
-        self.internal_edit.setPlaceholderText("-8, 0")
+        self.internal_edit.setPlaceholderText("-8000, 0   (Along Dip, Along Strike)")
         self.internal_edit.setToolTip(
-            "internal_ref [km]: punto en frame fault-local (0,0 = hipocentro)."
+            "internal_ref [m]: punto en el frame fault-local en convención "
+            "del plot 2-D — (Along Dip, Along Strike).  (0, 0) = hipocentro."
         )
-        form.addRow("internal_ref", self.internal_edit)
+        form.addRow("internal_ref [m]", self.internal_edit)
 
         self.external_edit = QtWidgets.QLineEdit()
-        self.external_edit.setPlaceholderText("utmx/1000, utmy/1000")
+        self.external_edit.setPlaceholderText("utmx, utmy   (e.g. 359958.176, 6294124.525)")
         self.external_edit.setToolTip(
-            "external_coord [km]: UTM (Easting/1000, Northing/1000) donde "
+            "external_coord [m]: UTM (Easting, Northing) en metros donde "
             "debe quedar el internal_ref."
         )
-        form.addRow("external_coord", self.external_edit)
+        form.addRow("external_coord [m]", self.external_edit)
 
         layout.addLayout(form)
 
@@ -718,13 +722,18 @@ class _RuptureProjectionDialog(QtWidgets.QDialog):
         layout.addWidget(adv_btn)
         layout.addWidget(self._adv_box)
 
-        # Restore previous input on re-projection.
+        # Restore previous input on re-projection.  Values are stored in km
+        # internally in ShakerMaker convention (ref_x = Along Strike,
+        # ref_y = Along Dip); the dialog asks in metres in plot-axes
+        # convention (Along Dip, Along Strike), so we multiply by 1000 to
+        # convert AND swap the two components so the user sees the same
+        # values they last typed.
         if previous:
             try:
-                rx, ry = previous["internal_ref_km"]
+                rx, ry = previous["internal_ref_km"]   # (along-strike, along-dip)
                 ex, ey = previous["external_coord_km"]
-                self.internal_edit.setText(f"{rx:g}, {ry:g}")
-                self.external_edit.setText(f"{ex:g}, {ey:g}")
+                self.internal_edit.setText(f"{ry * 1000:g}, {rx * 1000:g}")
+                self.external_edit.setText(f"{ex * 1000:.6f}, {ey * 1000:.6f}")
                 self.strike_spin.setValue(previous.get("strike_deg", strike))
             except Exception:
                 pass
@@ -758,18 +767,29 @@ class _RuptureProjectionDialog(QtWidgets.QDialog):
 
     def _validate_and_accept(self) -> None:
         try:
-            internal = self._parse_vec(self.internal_edit.text())
+            internal_m = self._parse_vec(self.internal_edit.text())
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "internal_ref inválido", str(exc))
             return
         try:
-            external = self._parse_vec(self.external_edit.text())
+            external_m = self._parse_vec(self.external_edit.text())
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "external_coord inválido", str(exc))
             return
+        # The dialog asks the user in metres so every UTM decimal survives
+        # the round-trip.  The overlay's transform expects kilometres, so
+        # we divide by 1000 right at the boundary.
+        #
+        # Convention swap: the user types ``(Along Dip, Along Strike)`` —
+        # i.e. the same order as the 2-D plot axes shown by
+        # ``plot_spacial_distribution`` (X = Along Dip, Y = Along Strike).
+        # ShakerMaker's internal formula expects the OPPOSITE order
+        # ``(ref_x = Along Strike, ref_y = Along Dip)``.  We swap on the
+        # way in so the user can paste their plot-frame values verbatim
+        # and the math still matches the function call.
         self._parsed = {
-            "internal_ref_km":   internal,
-            "external_coord_km": external,
+            "internal_ref_km":   (internal_m[1] / 1000.0, internal_m[0] / 1000.0),
+            "external_coord_km": (external_m[0] / 1000.0, external_m[1] / 1000.0),
             "strike_deg":        float(self.strike_spin.value()),
             "unit_scale":        1e-3,   # HDF5 metres → scene kilometres, always.
         }
@@ -964,7 +984,7 @@ class RuptureOverlay:
         # z stays positive (= depth below surface) at this stage; the
         # Display Transform's ``[0,0,-1]`` row flips it into "below origin"
         # when :meth:`_apply_seismic_frame` runs the matrix multiply.
-        z_utm_km = pts[:, 2] * zs
+        z_utm_km = pts[:, 2].astype(float) * zs
 
         # ShakerMaker stores seismic stations as ``(Northing, Easting, depth)``
         # — geophysics / Liu-Archuleta convention.  The Display Transform
@@ -992,7 +1012,7 @@ class RuptureOverlay:
         ext_x, ext_y = self.external_coord_km
         x_utm_km = x_rot + ext_x - ref_x_rot   # Easting (km)
         y_utm_km = y_rot + ext_y - ref_y_rot   # Northing (km)
-        z_utm_km = z * zs
+        z_utm_km = float(z) * zs
         # Match :meth:`_transform_points`: swap to ``(Northing, Easting, depth)``
         # so the Display Transform produces the same ``(Easting, Northing,
         # -depth)`` ordering as the seismic mesh.
