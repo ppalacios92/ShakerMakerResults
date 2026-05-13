@@ -250,6 +250,24 @@ class _FFSPControlPanel(QtWidgets.QWidget):
     def hypocenter_enabled(self) -> bool:
         return bool(self.hypo_cb.isChecked())
 
+    def snapshot(self) -> dict:
+        """Freeze the current visualisation settings into a plain dict.
+
+        Consumed by :class:`RuptureOverlay` at attach time so the main 3-D
+        view shows the same field, colormap, range, mask and hypocenter
+        choices the user dialed in on this pane.  The snapshot is a copy —
+        later edits in the panel do NOT propagate to overlays already
+        attached.
+        """
+        return {
+            "field": self.current_field_key(),
+            "animate": self.animate_enabled(),
+            "colormap": self.colormap_name(),
+            "color_range": self.color_range(),
+            "clamp": self.clamp_enabled(),
+            "mask": self.mask_enabled(),
+            "hypocenter": self.hypocenter_enabled(),
+        }
 
     def on_field_changed(self) -> None:
         """Recompute auto-range when the field selector changes."""
@@ -586,6 +604,13 @@ class RuptureTab(QtWidgets.QWidget):
             projection = dlg.values()
             self._last_projection = projection
 
+            # Freeze the FFSP-panel state right before the projection so each
+            # overlay rendered in the main view is born with the same field,
+            # colormap and range the user picked here.  Re-projecting after
+            # editing the controls takes a fresh snapshot — overlays already
+            # attached keep the snapshot they were created with.
+            display_settings = self.controls.snapshot()
+
             for pane in targets:
                 try:
                     pane.attach_rupture_overlay(
@@ -594,6 +619,7 @@ class RuptureTab(QtWidgets.QWidget):
                         internal_ref_km=projection["internal_ref_km"],
                         strike_deg=projection["strike_deg"],
                         unit_scale=projection["unit_scale"],
+                        display_settings=display_settings,
                     )
                 except Exception as exc:
                     QtWidgets.QMessageBox.warning(
@@ -846,6 +872,7 @@ class RuptureOverlay:
         strike_deg: float | None = None,
         unit_scale: float = 1e-3,
         z_scale: float | None = None,
+        display_settings: dict | None = None,
     ):
         self.pane = pane
         self.source = source
@@ -862,6 +889,13 @@ class RuptureOverlay:
             strike_deg = float(source.params.get("strike", 0.0))
         self.strike_deg = float(strike_deg)
 
+        # Snapshot of the FFSP-panel state captured at attach time.  This
+        # freezes the user's field / colormap / range / mask / hypocenter /
+        # animate choices so the overlay in the main 3-D view is born with
+        # the same look the importer pane was showing.  No live sync: later
+        # edits in the panel only affect future re-projections.
+        self._init_display_settings(display_settings)
+
         # The seismic scene goes through ``adapter._apply_display_transform_m``
         # to swap axes / flip depth (Geographic → Display Transform, e.g.
         # ``[[0,1,0],[1,0,0],[0,0,-1]]``).  We snapshot the same matrix at
@@ -874,29 +908,97 @@ class RuptureOverlay:
         pts_utm = self._transform_points()
 
         self._cloud = pv.PolyData(pts_utm)
-        self._cloud.point_data["slip"] = np.zeros(source.n_subfaults, dtype=np.float32)
+        self._cloud.point_data["active"] = np.zeros(source.n_subfaults, dtype=np.float32)
 
         plotter = pane.plotter
-        slip_lo, slip_hi = source.field_limits("slip")
-        if slip_hi <= slip_lo:
-            slip_hi = slip_lo + 1.0
 
+        # Initial clim: prefer the user's snapshot range so the overlay
+        # opens with the same scale shown in the importer pane.  When the
+        # user did not clamp, the per-frame update in :meth:`_update_scalars`
+        # will recompute the range from the live data — so this initial
+        # value only matters for the first frame.
+        vmin0, vmax0 = self._snapshot_clim_default()
+
+        cmap_name = effective_colormap_name(self.colormap, inverted=False)
         self._actor = plotter.add_mesh(
             self._cloud,
-            scalars="slip",
-            cmap=_DEFAULT_CMAP,
-            clim=(slip_lo, slip_hi),
+            scalars="active",
+            cmap=cmap_name,
+            clim=(vmin0, vmax0),
             point_size=max(_POINT_SIZE - 1, 4),
             render_points_as_spheres=True,
             show_scalar_bar=False,
         )
 
-        # Hypocentre marker — apply the same transform so it sits at the
-        # right UTM location.  Radius is 1 % of the largest in-plane span
-        # so it stays visible regardless of zoom.
-        hx, hy, hz = self._transform_point(*source.hypocenter_xyz())
-        # ``ndarray.ptp()`` was removed in NumPy 2.0 — use the free function
-        # ``np.ptp`` instead so the overlay works on both old and new NumPy.
+        # Hypocentre marker — only when the user kept "Show hypocenter
+        # marker" on in the importer.  Same coordinate transform as the
+        # point cloud; radius is 1 % of the largest in-plane span so it
+        # stays visible regardless of zoom.
+        self._hypo_actor = None
+        if self.show_hypocenter:
+            self._hypo_actor = self._build_hypocenter_actor(pts_utm)
+
+        self._update_scalars()
+
+    # ── Display-settings snapshot ────────────────────────────────────────
+
+    def _init_display_settings(self, display_settings: dict | None) -> None:
+        """Read the snapshot dict and store the visual flags on ``self``.
+
+        Missing keys fall back to the legacy hard-coded defaults so older
+        callers (or unit tests) that build a :class:`RuptureOverlay`
+        without passing ``display_settings`` still get the original look.
+        """
+        ds = dict(display_settings or {})
+        self.field = str(ds.get("field") or "slip")
+        self.animate = bool(ds.get("animate", True))
+        self.colormap = str(ds.get("colormap") or _DEFAULT_CMAP)
+        rng = ds.get("color_range")
+        if rng is None:
+            lo, hi = self.source.field_limits(
+                "slip" if self.field == "slip_inst" else self.field
+            )
+        else:
+            lo, hi = float(rng[0]), float(rng[1])
+        if hi <= lo:
+            hi = lo + 1.0
+        self.color_range = (float(lo), float(hi))
+        self.clamp = bool(ds.get("clamp", False))
+        self.mask = bool(ds.get("mask", True))
+        self.show_hypocenter = bool(ds.get("hypocenter", True))
+
+    def _snapshot_clim_default(self) -> tuple[float, float]:
+        return self.color_range
+
+    def _effective_color_range(self, scalars: np.ndarray) -> tuple[float, float]:
+        """Mirror :meth:`RuptureTab._effective_color_range`.
+
+        When the user clamped the range, return their (vmin, vmax) verbatim.
+        Otherwise fit to the finite values in ``scalars`` so the colormap
+        rescales with the rupture front instead of clipping.
+        """
+        vmin, vmax = self.color_range
+        if not self.clamp:
+            arr = np.asarray(scalars, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                return float(vmin), float(vmax)
+            data_min = float(arr.min())
+            data_max = float(arr.max())
+            if data_max <= data_min:
+                data_max = data_min + 1.0
+            return data_min, data_max
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        return float(vmin), float(vmax)
+
+    def _build_hypocenter_actor(self, pts_utm: np.ndarray):
+        plotter = getattr(self.pane, "plotter", None)
+        if plotter is None:
+            return None
+        hx, hy, hz = self._transform_point(*self.source.hypocenter_xyz())
+        # ``ndarray.ptp()`` was removed in NumPy 2.0 — use ``np.ptp`` so the
+        # overlay works on both old and new NumPy.
         span = max(
             float(np.ptp(pts_utm[:, 0])),
             float(np.ptp(pts_utm[:, 1])),
@@ -904,14 +1006,12 @@ class RuptureOverlay:
             1.0,
         )
         radius = max(0.01 * span, 1e-6)
-        self._hypo_actor = plotter.add_mesh(
+        return plotter.add_mesh(
             pv.Sphere(radius=radius, center=(hx, hy, hz)),
             color="red",
             opacity=1.0,
             show_scalar_bar=False,
         )
-
-        self._update_scalars()
 
     # ── Coordinate transform helpers ─────────────────────────────────────
 
@@ -1029,13 +1129,52 @@ class RuptureOverlay:
             return 0.0
 
     def _update_scalars(self) -> None:
+        """Refresh the point-cloud scalars using the snapshot's field/flags.
+
+        Mirrors :meth:`RuptureTab._update_scalars` so the overlay animates
+        identically to its source pane:
+
+        * ``slip_inst`` ramps up between rupture_time and +rise_time.
+        * Static fields (slip, rupture_time, ...) stay constant in time.
+        * When ``animate`` AND ``mask`` are on, un-ruptured subfaults are
+          set to NaN so VTK draws them transparent (the LUT's NaN colour).
+        * Colour range stays anchored to the unmasked scalars when the
+          user did NOT clamp — so vmax doesn't bounce around as the
+          rupture front sweeps the fault.
+        """
         if self._cloud is None:
             return
         t = self._current_time()
-        slip = self.source.instantaneous_slip(t)
-        mask = self.source.rupture_mask(t)
-        scalars = np.where(mask, slip, self._MASKED).astype(np.float32)
-        self._cloud.point_data["slip"] = scalars
+        if self.field == "slip_inst":
+            scalars = np.asarray(self.source.instantaneous_slip(t), dtype=np.float32)
+        else:
+            scalars = np.asarray(self.source.field(self.field), dtype=np.float32)
+
+        # Range computed BEFORE masking so the LUT stays stable as the
+        # rupture front sweeps the fault (same contract as the importer
+        # pane).
+        vmin, vmax = self._effective_color_range(scalars)
+
+        if self.animate and self.mask:
+            rmask = self.source.rupture_mask(t)
+            displayed = np.where(rmask, scalars, np.float32(self._MASKED)).astype(np.float32)
+        else:
+            displayed = scalars
+
+        self._cloud.point_data["active"] = displayed
+
+        mapper = getattr(self._actor, "mapper", None) if self._actor is not None else None
+        if mapper is not None:
+            try:
+                mapper.scalar_range = (vmin, vmax)
+            except Exception:
+                pass
+            try:
+                lut = mapper.lookup_table
+                lut.SetTableRange(vmin, vmax)
+            except Exception:
+                pass
+
         self._cloud.Modified()
 
     def on_session_updated(self, reason: str) -> None:
@@ -1076,24 +1215,14 @@ class RuptureOverlay:
             except Exception:
                 pass
             self._hypo_actor = None
-            hx, hy, hz = self._transform_point(*self.source.hypocenter_xyz())
-            # ``ndarray.ptp()`` was removed in NumPy 2.0 — use ``np.ptp``.
-            span = max(
-                float(np.ptp(new_pts[:, 0])),
-                float(np.ptp(new_pts[:, 1])),
-                float(np.ptp(new_pts[:, 2])),
-                1.0,
-            )
-            radius = max(0.01 * span, 1e-6)
-            try:
-                self._hypo_actor = plotter.add_mesh(
-                    pv.Sphere(radius=radius, center=(hx, hy, hz)),
-                    color="red",
-                    opacity=1.0,
-                    show_scalar_bar=False,
-                )
-            except Exception:
-                pass
+            # Only rebuild if the snapshot wanted the marker visible — if
+            # the user had it off at attach time, we don't bring it back
+            # just because the display frame changed.
+            if self.show_hypocenter:
+                try:
+                    self._hypo_actor = self._build_hypocenter_actor(new_pts)
+                except Exception:
+                    self._hypo_actor = None
 
     def detach(self) -> None:
         plotter = getattr(self.pane, "plotter", None)

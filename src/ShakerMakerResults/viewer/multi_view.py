@@ -299,6 +299,7 @@ class ViewPane(QtWidgets.QWidget):
         strike_deg: float | None = None,
         unit_scale: float = 1e-3,
         z_scale: float | None = None,
+        display_settings: dict | None = None,
     ) -> "RuptureOverlay":
         """Render *source* as an extra actor inside this pane's plotter.
 
@@ -332,6 +333,7 @@ class ViewPane(QtWidgets.QWidget):
             strike_deg=strike_deg,
             unit_scale=unit_scale,
             z_scale=z_scale,
+            display_settings=display_settings,
         )
         return self._rupture_overlay
 
