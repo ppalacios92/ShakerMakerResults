@@ -106,6 +106,19 @@ class AppearanceButton(QtWidgets.QToolButton):
         self.axes_grid_checkbox = QtWidgets.QCheckBox("Visible")
         self.axes_grid_checkbox.toggled.connect(session.set_axes_grid_visible)
 
+        self.ghost_warp_checkbox = QtWidgets.QCheckBox("Ghost reference under warp")
+        self.ghost_warp_checkbox.setToolTip(
+            "Overlay a translucent copy of the un-warped domain so it is\n"
+            "easy to compare deformed vs reference geometry."
+        )
+        self.ghost_warp_checkbox.toggled.connect(session.set_ghost_warp_reference)
+
+        self.selection_labels_checkbox = QtWidgets.QCheckBox("Selection labels")
+        self.selection_labels_checkbox.setToolTip(
+            "Draw node IDs as small labels next to every selected node."
+        )
+        self.selection_labels_checkbox.toggled.connect(session.set_selection_labels_enabled)
+
         advanced_row = QtWidgets.QWidget()
         advanced_layout = QtWidgets.QHBoxLayout(advanced_row)
         advanced_layout.setContentsMargins(0, 0, 0, 0)
@@ -122,6 +135,8 @@ class AppearanceButton(QtWidgets.QToolButton):
         form.addRow("Point size", point_size_row)
         form.addRow("Scalar bar", self.scalar_bar_checkbox)
         form.addRow("Axes grid", self.axes_grid_checkbox)
+        form.addRow("Warp ghost", self.ghost_warp_checkbox)
+        form.addRow("Selection", self.selection_labels_checkbox)
         form.addRow("", advanced_row)
 
         menu = QtWidgets.QMenu(self)
@@ -146,6 +161,16 @@ class AppearanceButton(QtWidgets.QToolButton):
         block = self.axes_grid_checkbox.blockSignals(True)
         self.axes_grid_checkbox.setChecked(self.session.state.show_axes_grid)
         self.axes_grid_checkbox.blockSignals(block)
+        block = self.ghost_warp_checkbox.blockSignals(True)
+        self.ghost_warp_checkbox.setChecked(
+            bool(getattr(self.session.state, "ghost_warp_reference", False))
+        )
+        self.ghost_warp_checkbox.blockSignals(block)
+        block = self.selection_labels_checkbox.blockSignals(True)
+        self.selection_labels_checkbox.setChecked(
+            bool(getattr(self.session.state, "selection_labels_enabled", False))
+        )
+        self.selection_labels_checkbox.blockSignals(block)
 
     @staticmethod
     def _set_combo_value(combo, value):

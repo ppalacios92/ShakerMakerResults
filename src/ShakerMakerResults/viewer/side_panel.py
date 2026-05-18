@@ -1253,6 +1253,12 @@ class DisplaySection(_SectionBase):
         self.cmap_preview = ColormapPreview(self.cmap_combo.currentText())
         self.cmap_combo.currentTextChanged.connect(self.cmap_preview.setColormap)
         self.cmap_preview.clicked.connect(self._open_transfer_editor)
+        # Per-stop marker overrides need to reach the scene; without this
+        # the QColorDialog repaints the preview locally but the 3-D
+        # viewport and the per-pane state never see the picked colour.
+        self.cmap_preview.markerColorChanged.connect(
+            self._on_cmap_marker_changed
+        )
         cmap_row = _stack(self.cmap_combo, self.cmap_preview)
 
         self.auto_lbl  = QtWidgets.QLabel("-")
@@ -1418,6 +1424,14 @@ class DisplaySection(_SectionBase):
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         values = dlg.values()
+        custom_cmap = dlg.build_custom_colormap()
+
+        # Step 1 — commit the session-wide transfer-function preferences
+        # (invert / discrete / bins / NaN / below / above / symmetric /
+        # percentile_clip).  These are NOT per-pane attributes so they
+        # always land on the global state.  This also sets
+        # session.state.colormap; the per-pane routing below may
+        # override it again for the active pane.
         self.session.apply_transfer_function_preferences(
             colormap=values.colormap,
             inverted=values.invert,
@@ -1430,7 +1444,81 @@ class DisplaySection(_SectionBase):
             use_above=values.use_above,
             symmetric_range=values.symmetric_range,
             percentile_clip=values.percentile_clip,
-            custom_colormap_object=dlg.build_custom_colormap(),
+            custom_colormap_object=custom_cmap,
+        )
+
+        # Step 2 — honour the Apply-to selector for the colormap itself.
+        # If the active pane has a stale ``colormap`` override left over
+        # from a previous Apply-to=pane, step 1 alone never reaches it,
+        # so the Preset combo + viewport keep showing the old preset.
+        # Routing through ``_route_apply`` clears the per-pane override
+        # for target == "all", or rewrites it for target ∈ {pane, tab}.
+        self._route_apply(
+            pane_payload={
+                "colormap":        values.colormap,
+                "colormap_object": custom_cmap,
+            },
+            global_apply=lambda: None,
+        )
+
+        # Step 3 — reflect the new preset in the local combo + preview
+        # immediately so the user sees the change even when the section
+        # is mid-edit (dirty), which would otherwise suppress the
+        # combo update in ``refresh``.
+        self._syncing = True
+        try:
+            self._set_combo(self.cmap_combo, values.colormap)
+            self.cmap_preview.setColormap(values.colormap)
+        finally:
+            self._syncing = False
+
+    def _on_cmap_marker_changed(self, _idx: int, _hex: str) -> None:
+        """Push per-stop marker overrides from the preview to the scene.
+
+        ``ColormapPreview`` stores marker overrides locally and emits
+        ``markerColorChanged`` after each pick/reset.  Without a listener
+        the gradient repaints in the preview only — the 3-D viewport and
+        ``pane_state`` never see the change.  Building the custom
+        :class:`matplotlib.colors.Colormap` from the preview and routing
+        it through ``_route_apply`` keeps everything in sync, honouring
+        the Apply-to selector.
+        """
+        if self._syncing:
+            return
+        custom_cmap = self.cmap_preview.build_custom_colormap()
+        cmap_name = str(self.cmap_combo.currentText())
+        self._route_apply(
+            pane_payload={
+                "colormap":        cmap_name,
+                "colormap_object": custom_cmap,
+            },
+            global_apply=lambda: self._global_apply_custom_cmap(
+                cmap_name, custom_cmap
+            ),
+        )
+
+    def _global_apply_custom_cmap(self, cmap_name: str, custom_cmap) -> None:
+        """Commit a colormap (+ optional custom palette) to the session.
+
+        Used by the marker-change path when Apply-to is "all":
+        ``apply_transfer_function_preferences`` keeps the rest of the
+        session-wide TF preferences as-is while replacing only the
+        colormap name and the custom palette object.
+        """
+        st = self.session.state
+        self.session.apply_transfer_function_preferences(
+            colormap=cmap_name,
+            inverted=bool(getattr(st, "colormap_inverted", False)),
+            discrete=bool(getattr(st, "colormap_discrete", False)),
+            bins=int(getattr(st, "colormap_bins", 12)),
+            nan_color=getattr(st, "nan_color", "#8c8c8c"),
+            below_color=getattr(st, "below_range_color", "#15304b"),
+            above_color=getattr(st, "above_range_color", "#f3b23f"),
+            use_below=bool(getattr(st, "use_below_range_color", False)),
+            use_above=bool(getattr(st, "use_above_range_color", False)),
+            symmetric_range=bool(getattr(st, "symmetric_color_range", False)),
+            percentile_clip=float(getattr(st, "percentile_clip", 0.0)),
+            custom_colormap_object=custom_cmap,
         )
 
     def _open_legend_editor(self):

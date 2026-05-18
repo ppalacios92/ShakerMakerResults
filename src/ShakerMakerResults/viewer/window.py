@@ -6,7 +6,7 @@ Layout shape (mirrors ParaView's Pipeline / Properties / Information / View):
     │ Camera | View Presets | Overlays | Selection | Capture | Display   │
     ├────────────┬─────────────────────────────────┬─────────────────────┤
     │ Pipeline   │                                  │ Display             │
-    │ Properties │         3-D Render Views          │ Appearance          │
+    │ Properties │         3-D Render Views          │                     │
     │ Information│         (tabbed multi-view)       │                     │
     │ Responses  │                                  │                     │
     │ Green Func.│                                  │                     │
@@ -30,7 +30,6 @@ from __future__ import annotations
 import time
 
 from ._imports import require_viewer_dependencies
-from .appearance_dock import AppearanceDock
 from .busy_dialog import BusyDialog
 from .controls import HeaderBar, StatusChipBar, TimeControls
 from .information_panel import InformationDock
@@ -88,7 +87,6 @@ _DOCK_SPECS: list[tuple[str, str, str, bool]] = [
     ("pipeline",    "Scene Browser",    "left",  True),
     ("properties",  "Properties",       "left",  True),
     ("information", "Information",      "left",  True),
-    ("appearance",  "Appearance",       "left",  True),
     ("responses",   "Responses",        "left",  True),
     ("gf",          "Green Functions",  "left",  False),
     # Right column — visual editors that map scene data → pixels
@@ -125,7 +123,7 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
 
         # Allow nested + tabbed docks (so the user can pin Responses next to
-        # the 3-D view, or tab Display behind Appearance on the right).
+        # the 3-D view, or tab Warp behind Display on the right).
         self.setDockOptions(
             QtWidgets.QMainWindow.AllowNestedDocks
             | QtWidgets.QMainWindow.AllowTabbedDocks
@@ -283,13 +281,12 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         session = self.session
 
         # Native dock classes — fully self-contained widgets that ALSO act as
-        # their own QDockWidget (Pipeline, Properties, Information,
-        # Appearance).  These are returned as full docks and bypass the
-        # generic ``_build_dock`` wrapping.
+        # their own QDockWidget (Pipeline, Properties, Information).
+        # These are returned as full docks and bypass the generic
+        # ``_build_dock`` wrapping.
         self._lazy_dock_factories["pipeline"]    = lambda parent=self: PipelineBrowserDock(session, parent)
         self._lazy_dock_factories["properties"]  = lambda parent=self: PropertiesDock(session, parent)
         self._lazy_dock_factories["information"] = lambda parent=self: InformationDock(session, parent)
-        self._lazy_dock_factories["appearance"]  = lambda parent=self: AppearanceDock(session, parent)
 
         # Sections that live inside a generic dock wrapper.
         self._lazy_dock_factories["display"]      = lambda: DisplaySection(session)
@@ -309,8 +306,8 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         """Return the dock for *key*.
 
         Some factories return a fully-formed ``QDockWidget`` (Pipeline,
-        Properties, Information, Appearance) — we use them directly so each
-        dock keeps its own internal refresh logic.  Generic content widgets
+        Properties, Information) — we use them directly so each dock keeps
+        its own internal refresh logic.  Generic content widgets
         (DisplaySection, lazy panels) are wrapped in a thin ``QDockWidget``
         with a scroll area.
         """
@@ -376,19 +373,15 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
         if display is not None:
             display.raise_()
 
-        # Left side: tab the secondary panels (Appearance, Responses) under
-        # Information so the visible-by-default column doesn't grow taller
-        # than the screen.  Pipeline + Properties stay un-tabbed at top.
-        # Responses is raised to the front of the tab stack so the
-        # analytic plots are discoverable on first launch — Information
-        # is one click away on the adjacent tab.
+        # Left side: tab Responses under Information so the visible-by-default
+        # column doesn't grow taller than the screen.  Pipeline + Properties
+        # stay un-tabbed at top.  Responses is raised to the front of the tab
+        # stack so the analytic plots are discoverable on first launch —
+        # Information is one click away on the adjacent tab.
         information = self._docks.get("information")
-        for key in ("appearance", "responses"):
-            sibling = self._docks.get(key)
-            if information is not None and sibling is not None:
-                self.tabifyDockWidget(information, sibling)
         responses = self._docks.get("responses")
-        if responses is not None:
+        if information is not None and responses is not None:
+            self.tabifyDockWidget(information, responses)
             responses.raise_()
 
         # Set reasonable initial widths so the central view stays dominant.
@@ -657,8 +650,8 @@ class ViewerMainWindow(QtWidgets.QMainWindow):
             pass
 
         # Side panels that bake palette colours into setStyleSheet at
-        # construction time (Information, Appearance) need a "full" refresh
-        # so they read the new active_palette() values.
+        # construction time (Information) need a "full" refresh so they
+        # read the new active_palette() values.
         for key, page in self._side_pages.items():
             if not hasattr(page, "refresh"):
                 continue

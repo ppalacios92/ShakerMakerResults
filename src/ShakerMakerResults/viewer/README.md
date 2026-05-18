@@ -35,7 +35,6 @@ core readers.
 │           ├── ViewerSidePanel              side_panel.py           │
 │           ├── toolbars                     toolbar.py              │
 │           ├── docks                        properties_dock.py,     │
-│           │                                appearance_dock.py,     │
 │           │                                information_panel.py,   │
 │           │                                pipeline_browser.py     │
 │           ├── trace panels                 trace_panel.py          │
