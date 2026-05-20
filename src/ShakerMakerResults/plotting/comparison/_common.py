@@ -16,7 +16,7 @@ def _build_label(obj, node_id):
     Parameters
     ----------
     obj : ShakerMakerData or StationData
-        Used for ``model_name`` and ``dt``.
+        Used for ``name`` and ``dt``.
     node_id : int or {'QA', 'qa'}
 
     Returns
@@ -24,7 +24,7 @@ def _build_label(obj, node_id):
     str
     """
     node_part = "QA" if node_id in ("QA", "qa") else f"N{node_id}"
-    return f"{obj.model_name} | {node_part} | dt={obj.dt:.4f}s"
+    return f"{obj.name} | {node_part} | dt={obj.dt:.4f}s"
 
 
 def _get_node_data(obj, node_id, data_type):

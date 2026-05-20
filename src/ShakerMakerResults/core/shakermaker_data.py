@@ -923,6 +923,41 @@ class ShakerMakerData:
 
         return resample(self, dt)
 
+    def apply_filter(self, mode="all", freqmin=0.25, freqmax=10.0,
+                     corners=4, zerophase=True, apply_gf=False):
+        """Return a *lazy* band-pass filtered copy of this model.
+
+        Parameters
+        ----------
+        mode : {'all', 'vel', 'accel', 'disp'}, default ``'all'``
+            ``'all'`` filters each ``data_type`` independently from disk.
+            ``'vel'`` / ``'accel'`` / ``'disp'`` reads only that base type,
+            filters it and derives the other two by integration /
+            differentiation.
+        freqmin, freqmax : float
+            Band edges in Hz. Validated against the Nyquist frequency.
+        corners : int, default ``4``
+        zerophase : bool, default ``True``
+        apply_gf : bool, default ``False``
+            If ``True``, Green Function tensors are also filtered on read.
+
+        Returns
+        -------
+        ShakerMakerData
+            New instance with ``_filter`` set. No signal data is read at
+            this point; ObsPy is called lazily inside ``get_node_data`` /
+            ``get_qa_data`` (and optionally ``get_gf``).
+
+        Notes
+        -----
+        Delegates to :func:`ShakerMakerResults.core.filter_service.apply_filter`.
+        Composable with :meth:`get_window` and :meth:`resample`.
+        """
+        from .filter_service import apply_filter
+
+        return apply_filter(self, mode, freqmin, freqmax, corners, zerophase,
+                            apply_gf)
+
     # -- plotting trampolines ----------------------------------------
     # All ``plot_*`` and ``create_animation*`` methods forward to the
     # standalone helpers under ``plotting.single_model.*``. We import them

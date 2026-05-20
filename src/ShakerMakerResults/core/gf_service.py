@@ -295,6 +295,12 @@ def get_gf_tensor(model, node_id, subfault_id):
     node_id_num, slot = _resolve_gf_slot(model, node_id, subfault_id)
     tdata_raw, t0 = _read_raw_gf_slot(model, slot)
     tdata, _ = _apply_gf_time_transform(model, tdata_raw, t0)
+
+    filt = getattr(model, "_filter", None)
+    if filt is not None and filt.get("apply_gf", False):
+        from .filter_service import bandpass
+        tdata = bandpass(np.asarray(tdata), float(model.dt), filt, time_axis=0)
+
     time = get_gf_time(model, slot)
     return {
         "node_id_num": node_id_num,

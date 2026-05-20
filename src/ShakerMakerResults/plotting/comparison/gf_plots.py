@@ -109,7 +109,7 @@ def plot_models_gf(
         ecoord_list,
     ):
         if not obj._has_gf or not obj._has_map:
-            print(f"  Warning: {obj.model_name} has no GFs loaded - skipped.")
+            print(f"  Warning: {obj.name} has no GFs loaded - skipped.")
             continue
 
         if tpos is not None:
@@ -147,7 +147,7 @@ def plot_models_gf(
                 gf_data = get_gf_tensor(obj, nid, sid)
                 tdata = gf_data["tdata"]
                 time = gf_data["time"]
-                lbl = f"{obj.model_name} | {nid_label} | S{sid}"
+                lbl = f"{obj.name} | {nid_label} | S{sid}"
 
                 if use_physical:
                     if ffsp is not None:
@@ -225,7 +225,7 @@ def plot_models_tensor_gf(
 
     for obj, nids, tpos in zip(models, nids_list, tpos_list):
         if not obj._gf_loaded:
-            print(f"  Warning: {obj.model_name} has no GFs loaded - skipped.")
+            print(f"  Warning: {obj.name} has no GFs loaded - skipped.")
             continue
 
         if tpos is not None:
@@ -244,8 +244,8 @@ def plot_models_tensor_gf(
                 slot = obj._get_slot(nid_num, sid)
                 donor = obj._pairs_to_compute[slot, 0]
                 if donor != nid_num:
-                    print(f"  {obj.model_name} | {nid_label}/S{sid} -> slot {slot} (donor {donor})")
-                lbl = f"{obj.model_name} | {nid_label} | S{sid}"
+                    print(f"  {obj.name} | {nid_label}/S{sid} -> slot {slot} (donor {donor})")
+                lbl = f"{obj.name} | {nid_label} | S{sid}"
                 gf_data = get_gf_tensor(obj, nid, sid)
                 time = gf_data["time"]
                 tdata = gf_data["tdata"] * factor
