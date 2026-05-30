@@ -433,6 +433,23 @@ class _SectionBase(QtWidgets.QWidget):
                 except Exception:
                     pass
 
+    def _effective_state(self):
+        """Return the state a dock should display: the active pane's overrides
+        falling through to ``session.state``, or ``session.state`` directly
+        when no multi-view / active pane is available.
+
+        Reading from the pane proxy keeps every editor dock in sync with the
+        pane the user is actually editing — otherwise an Apply-to=Active pane
+        workflow commits to ``pane_state`` but the dock keeps showing
+        ``session.state`` (which the user never touched), so Play / any
+        refresh resets the widgets back to the global values.
+        """
+        w = self.window()
+        multi = getattr(w, "multi_view", None) if w is not None else None
+        pane = getattr(multi, "active_pane", None) if multi is not None else None
+        ps = getattr(pane, "pane_state", None)
+        return ps if ps is not None else self.session.state
+
 
 # ── Lightweight section widgets ───────────────────────────────────────────────
 
@@ -743,23 +760,32 @@ class VectorFieldSection(_SectionBase):
     # ── Refresh ────────────────────────────────────────────────────────────
 
     def refresh(self, reason: str = "full") -> None:
-        """Re-sync the vector-field form from the session, unless edits are pending."""
+        """Re-sync the vector-field form from the **active pane's** effective state.
+
+        Reading the active pane's overrides (falling through to the session
+        global) means an Apply-to=Active pane commit is reflected back into the
+        widgets instead of being clobbered by the global defaults.  Editable
+        widgets only sync while the section is clean — once the user has unsaved
+        edits we leave their values alone until they press Apply (which commits
+        and clears the dirty flag).
+        """
         if reason not in self._REFRESH_REASONS and self._dirty:
             return
         self._syncing = True
         try:
-            block = self.enabled_cb.blockSignals(True)
-            self.enabled_cb.setChecked(bool(self.session.state.vector_field_enabled))
-            self.enabled_cb.blockSignals(block)
+            if not self._dirty:
+                eff = self._effective_state()
+                block = self.enabled_cb.blockSignals(True)
+                self.enabled_cb.setChecked(bool(eff.vector_field_enabled))
+                self.enabled_cb.blockSignals(block)
 
-            self._set_combo_data(self.demand_combo, self.session.state.vector_field_demand)
-            self._set_combo(self.cmap_combo, self.session.state.vector_field_colormap)
-            self.cmap_preview.setColormap(self.cmap_combo.currentText())
+                self._set_combo_data(self.demand_combo, eff.vector_field_demand)
+                self._set_combo(self.cmap_combo, eff.vector_field_colormap)
+                self.cmap_preview.setColormap(self.cmap_combo.currentText())
 
-            block = self.scale_spin.blockSignals(True)
-            self.scale_spin.setValue(float(self.session.state.vector_field_scale))
-            self.scale_spin.blockSignals(block)
-            self._clear_dirty()
+                block = self.scale_spin.blockSignals(True)
+                self.scale_spin.setValue(float(eff.vector_field_scale))
+                self.scale_spin.blockSignals(block)
         finally:
             self._syncing = False
 
@@ -1300,23 +1326,6 @@ class DisplaySection(_SectionBase):
 
     # ── Sync from session state ───────────────────────────────────────────
 
-    def _effective_state(self):
-        """Return the state we should display: the active pane's overrides
-        falling through to ``session.state``, or ``session.state`` directly
-        when no multi-view / active pane is available.
-
-        Reading from the pane proxy keeps the dock in sync with the pane
-        the user is actually editing — otherwise an Apply-to=Active pane
-        workflow commits to ``pane_state`` but the dock keeps showing
-        ``session.state`` (which the user never touched), so Play / any
-        refresh resets the combos back to the global demand.
-        """
-        w = self.window()
-        multi = getattr(w, "multi_view", None) if w is not None else None
-        pane = getattr(multi, "active_pane", None) if multi is not None else None
-        ps = getattr(pane, "pane_state", None)
-        return ps if ps is not None else self.session.state
-
     def refresh(self, reason: str = "full"):
         """Re-sync demand / component / colormap / range from the active pane.
 
@@ -1704,11 +1713,6 @@ class WarpSection(_SectionBase):
         srl.setContentsMargins(0, 0, 0, 0)
         srl.setSpacing(4)
         srl.addWidget(QtWidgets.QLabel("Scale:"))
-        for lbl, val in (("×10", 10), ("×100", 100), ("×1k", 1_000), ("×10k", 10_000)):
-            btn = QtWidgets.QPushButton(lbl)
-            btn.setFixedWidth(40)
-            btn.clicked.connect(lambda _c, v=val: self._preset(v))
-            srl.addWidget(btn)
         self.scale_spin = QtWidgets.QDoubleSpinBox()
         self.scale_spin.setDecimals(1)
         self.scale_spin.setRange(1.0, 1_000_000.0)
@@ -1728,35 +1732,37 @@ class WarpSection(_SectionBase):
         self.refresh("init")
 
     def refresh(self, reason: str = "full"):
-        """Pull warp toggle / axes / scale from the session. Skips when edits are pending."""
+        """Re-sync warp toggle / axes / scale from the **active pane's** effective state.
+
+        Reading the active pane's overrides (falling through to the session
+        global) means an Apply-to=Active pane commit is reflected back into the
+        widgets instead of reverting to the global defaults.  Editable widgets
+        only sync while the section is clean so a stray broadcast can't wipe the
+        user's pending edits before they press Apply.
+        """
         if reason not in {"init", "full", "warp"} and self._dirty:
             return
         self._syncing = True
         try:
-            self.warp_cb.setChecked(self.session.state.disp_warp_enabled)
-            self.ghost_cb.setChecked(self.session.state.ghost_warp_reference)
-            ax = self.session.state.warp_axes
-            self.x_cb.setChecked(ax[0])
-            self.y_cb.setChecked(ax[1])
-            self.z_cb.setChecked(ax[2])
-            scale = (
-                float(self.session.state.warp_scale)
-                if self.session.state.warp_scale is not None
-                else float(self.session.suggested_warp_scale())
-            )
-            self.scale_spin.setValue(scale)
-            self._clear_dirty()
+            if not self._dirty:
+                eff = self._effective_state()
+                self.warp_cb.setChecked(bool(eff.disp_warp_enabled))
+                # Ghost reference is a *global* visual hint (committed through
+                # session.set_ghost_warp_reference in _apply, never per pane),
+                # so read it from the session state rather than the pane proxy.
+                self.ghost_cb.setChecked(bool(self.session.state.ghost_warp_reference))
+                ax = eff.warp_axes
+                self.x_cb.setChecked(bool(ax[0]))
+                self.y_cb.setChecked(bool(ax[1]))
+                self.z_cb.setChecked(bool(ax[2]))
+                scale = (
+                    float(eff.warp_scale)
+                    if eff.warp_scale is not None
+                    else float(self.session.suggested_warp_scale())
+                )
+                self.scale_spin.setValue(scale)
         finally:
             self._syncing = False
-
-    def _preset(self, val: float):
-        """Snap the scale spin to a power-of-ten preset (x10 / x100 / x1k / x10k)."""
-        if self._syncing:
-            return
-        b = self.scale_spin.blockSignals(True)
-        self.scale_spin.setValue(float(val))
-        self.scale_spin.blockSignals(b)
-        self._set_dirty(True)
 
     def _auto(self):
         """Fill the scale spin with the adapter's auto-suggested value."""
