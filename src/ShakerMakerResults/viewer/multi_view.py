@@ -358,7 +358,11 @@ class ViewPane(QtWidgets.QWidget):
         """Apply *reason* to this pane's scene and re-render."""
         if reason == "time":
             self.scene.refresh_scalars(render=False)
-            if self.session.state.vector_field_enabled:
+            # Gate on the *pane's* effective flag (scene.state is the pane
+            # overlay, falling through to session.state when there is no
+            # override).  Reading session.state directly froze the arrows for
+            # an Apply-to=Active pane overlay, whose flag lives on pane_state.
+            if self.scene.state.vector_field_enabled:
                 self.scene.update_vector_arrows(render=False)
         elif reason == "selection":
             self.scene.refresh_selection(render=False)

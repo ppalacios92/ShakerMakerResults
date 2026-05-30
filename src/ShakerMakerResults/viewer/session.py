@@ -828,7 +828,7 @@ class ViewerSession:
         self.state.vector_field_colormap = str(colormap) or "viridis"
         self._notify_window("vector_field")
 
-    def current_vector_data(self):
+    def current_vector_data(self, *, state=None):
         """Return ``(points, vectors)`` for the current time step.
 
         ``points`` is an N×3 float array of visible node positions.  When 3-D
@@ -836,10 +836,16 @@ class ViewerSession:
         originates from the displaced node, not from its rest position.
         ``vectors`` is an N×3 float array with columns [E, N, Z] of the active
         vector-field demand.
+
+        The vector-field demand and the warp parameters are *per-pane*, so
+        callers pass their pane overlay via ``state=`` (falling back to the
+        global session state when None).  The animation clock and visibility
+        flags stay global by design.
         """
         import numpy as np
 
-        demand = self.state.vector_field_demand
+        st = state if state is not None else self.state
+        demand = st.vector_field_demand
         t = self.state.time_index
         kwargs = dict(
             show_internal=self.state.show_internal,
@@ -856,8 +862,10 @@ class ViewerSession:
             self.adapter.scalar_snapshot(t, demand, "z"), **kwargs
         )
         # Use warped positions when warp is active so the arrow bases track the
-        # displaced geometry.  Falls back to base positions when warp is off.
-        points = self.current_warped_points()
+        # displaced geometry.  Pass the pane state so a per-pane warp moves the
+        # arrow bases even when the global warp is off.  Falls back to base
+        # positions when warp is off.
+        points = self.current_warped_points(state=st)
         vectors = np.stack([e, n, z], axis=1)
         return points, vectors
 

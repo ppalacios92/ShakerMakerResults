@@ -460,7 +460,7 @@ class ViewerScene:
 
         try:
             import numpy as np
-            points, vectors = self.session.current_vector_data()
+            points, vectors = self.session.current_vector_data(state=self.state)
             if points is None or len(points) == 0:
                 return
 
@@ -532,7 +532,7 @@ class ViewerScene:
             return
         try:
             import numpy as np
-            points, vectors = self.session.current_vector_data()
+            points, vectors = self.session.current_vector_data(state=self.state)
             domain_idx = self._domain_index_array()
             if domain_idx is not None:
                 if len(domain_idx) == 0:
