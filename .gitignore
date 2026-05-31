@@ -11,6 +11,10 @@ dist/
 build/
 .eggs/
 
+# MkDocs build output
+site/
+mkdocs_serve.log
+
 # Environments
 .env
 .venv
@@ -31,7 +35,7 @@ Thumbs.db
 # folders
 tests/
 
-# AI / Claude assistant artifacts — keep these out of the repo
+# AI assistant artifacts — keep these out of the repo
 .claude/
 .claude*
 CLAUDE.md
