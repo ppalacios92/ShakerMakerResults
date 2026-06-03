@@ -52,22 +52,34 @@ def _read_node_zen(model, node_id, data_type):
 
 
 def _read_qa_zen(model, data_type):
-    """Read the QA station ``(3, Nt)`` trace in ``[Z, E, N]`` order, post-mask/resample."""
+    """Read the QA station ``(3, Nt)`` trace in ``[Z, E, N]`` order, post-mask/resample.
+
+    The QA dataset can be longer than the DRM node datasets (e.g. a QA
+    station that was never truncated when the node traces were cut). We
+    therefore build the window mask / resample source grid from the QA's
+    *own* length using the shared ``dt`` / ``tstart``, instead of reusing
+    the node-grid mask in ``model._window_mask`` (which would mismatch).
+    """
     path = f"{model._qa_grp}/{_DATA_PATHS[data_type]}"
     with h5py.File(model.filename, "r") as f:
         data = f[path][:]
-    if hasattr(model, "_window_mask"):
-        data = data[:, model._window_mask]
-    elif hasattr(model, "_resample_cache"):
+    qa_time = np.arange(data.shape[1]) * model._dt_orig + model._tstart
+    if hasattr(model, "_resample_cache"):
         rs = np.zeros((3, len(model.time)))
         for i in range(3):
             rs[i] = interp1d(
-                model._resample_cache["time_orig"],
+                qa_time,
                 data[i],
                 kind="linear",
                 fill_value="extrapolate",
             )(model.time)
         data = rs
+    else:
+        # Base or windowed read: QA shares the node dt grid, so select the
+        # samples falling inside the active time vector's [t0, t1] span.
+        t0, t1 = model.time[0], model.time[-1]
+        mask = (qa_time >= t0) & (qa_time <= t1)
+        data = data[:, mask]
     return data[[2, 0, 1], :]
 
 
