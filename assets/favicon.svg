@@ -1,0 +1,6 @@
+<!-- Favicon — compact waveform glyph. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" aria-label="ShakerMakerResults">
+  <rect width="100" height="100" rx="20" fill="#16335c"/>
+  <path d="M12 50 L26 50 L33 30 L42 50 L50 20 L60 80 L68 42 L75 58 L82 50 L92 50"
+        stroke="#ff7a4d" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
