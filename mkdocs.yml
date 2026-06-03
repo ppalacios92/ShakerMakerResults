@@ -1,0 +1,133 @@
+# MkDocs Material configuration for ShakerMakerResults.
+# Lives at the REPO ROOT (not inside docs/). New docs content is isolated
+# under docs/web/ so any legacy material stays untouched.
+site_name: ShakerMakerResults
+site_description: Reader and visualization toolkit for ShakerMaker HDF5 results
+site_url: https://ppalacios92.github.io/ShakerMakerResults/
+repo_url: https://github.com/ppalacios92/ShakerMakerResults
+repo_name: ppalacios92/ShakerMakerResults
+edit_uri: edit/main/docs/web/
+
+docs_dir: docs/web
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/favicon.svg
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs        # top tabs = the big sections (Guides/Examples/API)
+    - navigation.sections
+    - navigation.top
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+  # API reference auto-generated from docstrings. Requires the package
+  # to be importable at build time (viewer extras included for the viewer page).
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_root_heading: true
+            show_root_full_path: false
+            show_object_full_path: false
+            show_source: true
+            show_if_no_docstring: false
+            members_order: source
+            group_by_category: true
+            show_category_heading: true
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            docstring_section_style: table
+            merge_init_into_class: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_docstring_examples: true
+            filters:
+              - "!^_"
+
+nav:
+  - Home: index.md
+  - Guides:
+      - Getting started: guides/getting_started.md
+      - The data model: guides/data_model.md
+      - Querying data: guides/querying_data.md
+      - Windowing, resampling & filtering: guides/derived_models.md
+      - Single-model plotting: guides/single_model_plotting.md
+      - Multi-model comparison: guides/comparison.md
+      - Common parameters glossary: guides/parameters.md
+      - Analysis helpers: guides/analysis.md
+      - Real station recordings: guides/stations.md
+      - Exporting results: guides/export.md
+      - Interactive viewer: guides/viewer.md
+  - Examples: examples/index.md
+  - API Reference:
+      - Overview: api/index.md
+      - Core readers: api/core.md
+      - Core services: api/services.md
+      - Analysis: api/analysis.md
+      - Plotting: api/plotting.md
+      - Comparison: api/comparison.md
+      - I/O & export: api/io.md
+      - Interactive viewer: api/viewer.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/ppalacios92/ShakerMakerResults
+
+copyright: Copyright &copy; 2026 Patricio Palacios B. &middot; Nicolas Mora Bowen
