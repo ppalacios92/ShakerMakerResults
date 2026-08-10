@@ -815,6 +815,96 @@ class ShakerMakerData:
 
         return get_qa_data(self, data_type)
 
+    def get_node_response(self, node_id, data_type='accel', factor=1.0):
+        """Extract one node response without plotting.
+
+        Parameters
+        ----------
+        node_id : int or {'QA', 'qa'}
+            Node index or the DRM quality-assurance station.
+        data_type : {'accel', 'vel', 'disp'}, default ``'accel'``
+        factor : float, default ``1.0``
+            Multiplicative scale applied once to the returned traces.
+
+        Returns
+        -------
+        dict
+            Trace data and provenance. ``data`` has shape ``(3, Nt)`` and
+            follows the public ``[Z, E, N]`` component convention.
+        """
+        data, label = self._resolve_node(node_id, data_type)
+        factor = float(factor)
+        return {
+            'node_id': node_id,
+            'label': label,
+            'time': np.asarray(self.time).copy(),
+            'components': ('Z', 'E', 'N'),
+            'data': np.asarray(data) * factor,
+            'data_type': data_type,
+            'factor': factor,
+            'dt': float(self.dt),
+            'model': self.name,
+            'filename': self.filename,
+        }
+
+    def get_node_newmark(self, node_id, data_type='accel',
+                         spectral_type='PSa', factor=1.0 / 9.81,
+                         zeta=0.05, max_period=5.01, intervals=0.01):
+        """Compute one node's three-component Newmark spectra without plotting.
+
+        ``factor`` must convert the selected response to the units expected by
+        the analyzer. For acceleration stored in m/s2, the default converts it
+        to g exactly once.
+
+        Returns
+        -------
+        dict
+            Period vector, component spectra and complete extraction metadata.
+        """
+        from ..analysis.newmark import NewmarkSpectrumAnalyzer
+
+        response = self.get_node_response(
+            node_id=node_id,
+            data_type=data_type,
+            factor=factor,
+        )
+        component_spectra = {}
+        T = None
+        for i, component in enumerate(response['components']):
+            spectrum = NewmarkSpectrumAnalyzer.compute(
+                response['data'][i],
+                response['dt'],
+                zeta=float(zeta),
+                max_period=float(max_period),
+                intervals=float(intervals),
+            )
+            if spectral_type not in spectrum:
+                available = ('PSa', 'Sa', 'PSv', 'Sv', 'Sd')
+                raise ValueError(
+                    f"Unknown spectral_type {spectral_type!r}; "
+                    f"expected one of {available}."
+                )
+            if T is None:
+                T = spectrum['T'].copy()
+            component_spectra[component] = spectrum[spectral_type].copy()
+
+        return {
+            'node_id': response['node_id'],
+            'label': response['label'],
+            'T': T,
+            'components': response['components'],
+            'spectra': component_spectra,
+            'spectral_type': spectral_type,
+            'data_type': data_type,
+            'factor': response['factor'],
+            'zeta': float(zeta),
+            'max_period': float(max_period),
+            'intervals': float(intervals),
+            'dt': response['dt'],
+            'model': response['model'],
+            'filename': response['filename'],
+        }
+
     def get_gf(self, node_id, subfault_id, component='z'):
         """Return the Green-Function trace for a single (node, subfault) pair.
 
